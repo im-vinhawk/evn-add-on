@@ -12,7 +12,8 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import EvnAuthenticationError, EvnClient, EvnError
-from .const import CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_PRIMARY_CUSTOMER_CODE, CONF_REFRESH_TOKEN, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE, CONF_REFRESH_TOKEN, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .models import merge_linked_customer_meter_points, normalize_linked_customer_meter_points
 
 
 def _codes(value: str) -> list[str]:
@@ -36,7 +37,11 @@ class EvnVietnamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input:
             try:
-                state = await EvnClient.async_login(async_get_clientsession(self.hass), user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
+                state, roster = await EvnClient.async_login_and_discover(
+                    async_get_clientsession(self.hass),
+                    user_input[CONF_USERNAME],
+                    user_input[CONF_PASSWORD],
+                )
             except EvnAuthenticationError:
                 errors["base"] = "invalid_auth"
             except EvnError:
@@ -45,12 +50,12 @@ class EvnVietnamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(state.primary_customer_code)
                 self._abort_if_unique_id_configured()
                 data = {
-                    CONF_USERNAME: state.username,
                     CONF_ACCESS_TOKEN: state.access_token,
                     CONF_REFRESH_TOKEN: state.refresh_token,
                     CONF_DEVICE_ID: state.device_id,
                     CONF_PRIMARY_CUSTOMER_CODE: state.primary_customer_code,
                     CONF_CURRENT_CUSTOMER_CODE: state.current_customer_code,
+                    CONF_LINKED_CUSTOMERS: roster,
                 }
                 return self.async_create_entry(title=f"EVN {state.primary_customer_code}", data=data)
         schema = vol.Schema({vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str})
@@ -66,7 +71,16 @@ class EvnVietnamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input and self._reauth_entry:
             try:
-                state = await EvnClient.async_login(async_get_clientsession(self.hass), user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
+                previous_roster = merge_linked_customer_meter_points(
+                    normalize_linked_customer_meter_points(self._reauth_entry.data.get(CONF_LINKED_CUSTOMERS)),
+                    {code: "" for code in self._reauth_entry.options.get(CONF_CUSTOMER_CODES, [])},
+                )
+                state, roster = await EvnClient.async_login_and_discover(
+                    async_get_clientsession(self.hass),
+                    user_input[CONF_USERNAME],
+                    user_input[CONF_PASSWORD],
+                    previous_roster,
+                )
             except EvnAuthenticationError:
                 errors["base"] = "invalid_auth"
             except EvnError:
@@ -81,18 +95,18 @@ class EvnVietnamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     )
                 data = {
                     **self._reauth_entry.data,
-                    CONF_USERNAME: state.username,
                     CONF_ACCESS_TOKEN: state.access_token,
                     CONF_REFRESH_TOKEN: state.refresh_token,
                     CONF_DEVICE_ID: state.device_id,
                     CONF_PRIMARY_CUSTOMER_CODE: state.primary_customer_code,
                     CONF_CURRENT_CUSTOMER_CODE: state.current_customer_code,
+                    CONF_LINKED_CUSTOMERS: roster,
                 }
+                data.pop(CONF_USERNAME, None)
                 self.hass.config_entries.async_update_entry(self._reauth_entry, data=data)
                 await self.hass.config_entries.async_reload(self._reauth_entry.entry_id)
                 return self.async_abort(reason="reauth_successful")
-        default_username = self._reauth_entry.data.get(CONF_USERNAME, "") if self._reauth_entry else ""
-        schema = vol.Schema({vol.Required(CONF_USERNAME, default=default_username): str, vol.Required(CONF_PASSWORD): str})
+        schema = vol.Schema({vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str})
         return self.async_show_form(step_id="reauth_confirm", data_schema=schema, errors=errors)
 
     @staticmethod

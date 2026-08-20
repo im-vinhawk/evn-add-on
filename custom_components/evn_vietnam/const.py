@@ -14,6 +14,7 @@ CONF_REFRESH_TOKEN = "refresh_token"
 CONF_DEVICE_ID = "device_id"
 CONF_PRIMARY_CUSTOMER_CODE = "primary_customer_code"
 CONF_CURRENT_CUSTOMER_CODE = "current_customer_code"
+CONF_LINKED_CUSTOMERS = "linked_customers"
 CONF_SCAN_INTERVAL = "scan_interval"
 
 DEFAULT_SCAN_INTERVAL = timedelta(minutes=30)

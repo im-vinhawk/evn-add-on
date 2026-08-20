@@ -16,7 +16,14 @@ from homeassistant.util import dt as dt_util
 
 from .calculation import as_float, calculate_tier_cost, normalize_bills, normalize_daily
 from .const import DAILY_HISTORY_DAYS, DEFAULT_TIMEOUT, NATIONAL_BASE_URL, REGIONAL_GATEWAYS
-from .models import SessionState
+from .models import (
+    SessionState,
+    extract_linked_customer_meter_points,
+    merge_linked_customer_meter_points,
+    normalize_customer_code,
+    normalize_linked_customer_meter_points,
+    normalize_meter_point,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +38,14 @@ class EvnAuthenticationError(EvnError):
 
 class EvnApiError(EvnError):
     """EVN returned an invalid request or server response."""
+
+
+class EvnCustomerSwitchError(EvnApiError):
+    """EVN could not switch to a linked customer without exposing its detail."""
+
+
+class EvnMeterPointError(EvnApiError):
+    """EVN did not provide a verified meter point for a customer."""
 
 
 def _jwt_claims(token: str) -> dict[str, Any]:
@@ -87,10 +102,19 @@ class EvnClient:
     regional gateway.  Tokens are supplied by Home Assistant, never files.
     """
 
-    def __init__(self, session: aiohttp.ClientSession, state: SessionState) -> None:
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        state: SessionState,
+        linked_customer_meter_points: dict[str, str] | None = None,
+    ) -> None:
         self._session = session
         self.state = state
-        self._meter_points: dict[str, str] = {}
+        self._meter_points = {
+            code: meter_point
+            for code, meter_point in normalize_linked_customer_meter_points(linked_customer_meter_points).items()
+            if meter_point
+        }
 
     @staticmethod
     def new_device_id() -> str:
@@ -98,8 +122,13 @@ class EvnClient:
         return str(uuid4())
 
     @classmethod
-    async def async_login(cls, session: aiohttp.ClientSession, username: str, password: str) -> SessionState:
-        """Authenticate once. Password is intentionally not returned or persisted."""
+    async def _async_login_with_roster(
+        cls,
+        session: aiohttp.ClientSession,
+        username: str,
+        password: str,
+    ) -> tuple[SessionState, dict[str, str]]:
+        """Authenticate and extract only privacy-safe roster data from login."""
         device_id = cls.new_device_id()
         headers = cls._headers(None)
         payload = {
@@ -119,19 +148,68 @@ class EvnClient:
         if not token:
             raise EvnAuthenticationError("EVN did not return an access token")
         claims = _jwt_claims(str(token))
-        customer_code = str(
+        customer_code = normalize_customer_code(
             claims.get("makhachhang")
             or claims.get("maKhachHang")
             or content.get("maKhachHang")
             or (username if username.strip().upper().startswith("P") else "")
-        ).upper()
+        )
         if not customer_code:
             raise EvnAuthenticationError("EVN did not return a customer code")
-        return SessionState(
+        state = SessionState(
             username=username.strip(), access_token=str(token),
             refresh_token=content.get("refreshToken") or content.get("refresh_token"),
             device_id=device_id, primary_customer_code=customer_code, current_customer_code=customer_code,
         )
+        return state, extract_linked_customer_meter_points(response)
+
+    @classmethod
+    async def async_login(cls, session: aiohttp.ClientSession, username: str, password: str) -> SessionState:
+        """Authenticate once. Password is intentionally not returned or persisted."""
+        state, _ = await cls._async_login_with_roster(session, username, password)
+        return state
+
+    @classmethod
+    async def async_login_and_discover(
+        cls,
+        session: aiohttp.ClientSession,
+        username: str,
+        password: str,
+        previous_roster: dict[str, str] | None = None,
+    ) -> tuple[SessionState, dict[str, str]]:
+        """Log in, then merge mobile-app linked customers into a safe roster."""
+        state, login_roster = await cls._async_login_with_roster(session, username, password)
+        client = cls(session, state, previous_roster)
+        discovered = await client.async_discover_linked_customers()
+        roster = merge_linked_customer_meter_points(previous_roster, login_roster)
+        roster = merge_linked_customer_meter_points(roster, discovered)
+        return state, merge_linked_customer_meter_points(roster, {state.primary_customer_code: ""})
+
+    @property
+    def linked_customer_meter_points(self) -> dict[str, str]:
+        """Return the cache in a config-entry safe form."""
+        return dict(self._meter_points)
+
+    async def async_discover_linked_customers(self) -> dict[str, str]:
+        """Probe the mobile-app roster endpoints without retaining profile data."""
+        discovered: dict[str, str] = {}
+        for endpoint, body in (
+            ("customer/suggest/khachhang", {"keyword": self.state.username}),
+            ("customer/list/share", {}),
+            ("user/info", {}),
+        ):
+            try:
+                payload = await self._async_request("POST", f"{NATIONAL_BASE_URL}/{endpoint}", body)
+            except EvnAuthenticationError:
+                raise
+            except EvnApiError:
+                # A disabled endpoint must not clear a previously stored roster.
+                _LOGGER.debug("EVN linked-customer discovery endpoint unavailable")
+                continue
+            discovered = merge_linked_customer_meter_points(
+                discovered, extract_linked_customer_meter_points(payload)
+            )
+        return discovered
 
     @staticmethod
     def _headers(token: str | None) -> dict[str, str]:
@@ -195,14 +273,19 @@ class EvnClient:
 
     async def _async_switch_customer(self, customer_code: str) -> None:
         """Switch only real codes; an aggregate is computed locally, never sent."""
-        customer_code = customer_code.strip().upper()
+        customer_code = normalize_customer_code(customer_code)
         if not customer_code or customer_code == self.state.current_customer_code:
             return
-        payload = await self._async_request("GET", f"{NATIONAL_BASE_URL}/user/switch/{customer_code}")
+        try:
+            payload = await self._async_request("GET", f"{NATIONAL_BASE_URL}/user/switch/{customer_code}")
+        except EvnAuthenticationError:
+            raise
+        except EvnApiError as err:
+            raise EvnCustomerSwitchError("EVN customer switch is unavailable") from err
         content = payload.get("data", payload) if isinstance(payload, dict) else {}
         token = content.get("token") or content.get("accessToken")
         if not token:
-            raise EvnApiError("EVN did not return a switched customer token")
+            raise EvnCustomerSwitchError("EVN customer switch is unavailable")
         self.state.access_token = str(token)
         self.state.refresh_token = content.get("refreshToken") or content.get("refresh_token") or self.state.refresh_token
         self.state.current_customer_code = customer_code
@@ -214,9 +297,12 @@ class EvnClient:
 
     async def _async_meter_point(self, customer_code: str) -> str:
         """Return the EVN-provided meter point for one configured customer."""
+        customer_code = normalize_customer_code(customer_code)
+        if not customer_code:
+            raise EvnMeterPointError("EVN meter point is unavailable for configured customer")
+        await self._async_switch_customer(customer_code)
         if customer_code in self._meter_points:
             return self._meter_points[customer_code]
-        await self._async_switch_customer(customer_code)
         try:
             query = urlencode({"MA_KHANG": customer_code, "maKhachHang": customer_code})
             payload = await self._async_request(
@@ -240,14 +326,16 @@ class EvnClient:
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                point = str(row.get("MA_DDO") or row.get("maDdo") or "")
+                point = normalize_meter_point(row.get("MA_DDO") or row.get("maDdo"))
                 if point:
                     self._meter_points[customer_code] = point
                     return point
-        except EvnApiError:
-            _LOGGER.warning("EVN meter point is unavailable for configured customer")
+        except EvnAuthenticationError:
             raise
-        raise EvnApiError("EVN did not return a meter point for configured customer")
+        except EvnApiError as err:
+            _LOGGER.warning("EVN meter point is unavailable for configured customer")
+            raise EvnMeterPointError("EVN meter point is unavailable for configured customer") from err
+        raise EvnMeterPointError("EVN did not return a meter point for configured customer")
 
     async def async_daily(self, customer_code: str, start: date, end: date) -> list[dict[str, Any]]:
         customer_code = customer_code.strip().upper()
