@@ -21,6 +21,13 @@ _ROSTER_CONTAINER_KEYS = (
 _EVN_REGION_PREFIXES = "PA|PB|PC|PD|PE|PH|PK|PM|PN|PP|PQ|PT|HN"
 _CUSTOMER_CODE_PATTERN = re.compile(rf"^(?:{_EVN_REGION_PREFIXES})[0-9]{{4,}}$")
 _METER_POINT_PATTERN = re.compile(rf"^(?:{_EVN_REGION_PREFIXES})[0-9]{{7,}}$")
+_SENSOR_UNIQUE_ID_METRICS = (
+    "today_consumption",
+    "yesterday_consumption",
+    "current_month_consumption",
+    "current_month_amount",
+    "latest_index",
+)
 
 
 def _normalized_ascii_identifier(value: Any) -> str:
@@ -94,6 +101,37 @@ def merge_linked_customer_meter_points(previous: Any, discovered: Any) -> dict[s
         if code not in merged or meter_point:
             merged[code] = meter_point
     return merged
+
+
+def extract_customer_codes_from_entity_unique_ids(
+    entry_id: str,
+    unique_ids: Any,
+) -> set[str]:
+    """Recover only valid customer codes from this entry's own legacy sensors.
+
+    Older integration versions created one stable entity group per configured
+    customer.  A config-entry reset could lose the roster while those entities
+    remained registered.  This helper makes that migration explicit without
+    reading old sessions, names, addresses, or meter-point guesses.
+    """
+    prefix = f"{entry_id}_"
+    recovered: set[str] = set()
+    if not isinstance(unique_ids, (list, tuple, set)):
+        return recovered
+    for raw_unique_id in unique_ids:
+        unique_id = str(raw_unique_id or "")
+        if not unique_id.startswith(prefix):
+            continue
+        suffix = unique_id.removeprefix(prefix)
+        for metric in _SENSOR_UNIQUE_ID_METRICS:
+            metric_suffix = f"_{metric}"
+            if not suffix.endswith(metric_suffix):
+                continue
+            code = normalize_customer_code(suffix.removesuffix(metric_suffix))
+            if code:
+                recovered.add(code)
+            break
+    return recovered
 
 
 @dataclass(slots=True)

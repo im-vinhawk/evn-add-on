@@ -9,19 +9,40 @@ class EvnVietnamEnergyCard extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._config = null;
     this._hass = null;
+    this._selectedViewId = null;
   }
 
   setConfig(config) {
     const providedConfig = config && typeof config === 'object' ? config : {};
     const entity = typeof providedConfig.entity === 'string' ? providedConfig.entity.trim() : '';
+
+    let views = [];
+    if (Array.isArray(providedConfig.customer_views)) {
+      views = providedConfig.customer_views
+        .filter((v) => v && typeof v === 'object')
+        .map((v, index) => ({
+          id: typeof v.id === 'string' && v.id.trim() ? v.id.trim() : (index === 0 ? 'aggregate' : `view_${index}`),
+          label: typeof v.label === 'string' && v.label.trim() ? v.label.trim() : (index === 0 ? 'Tổng' : `Khách hàng ${index}`),
+          entity: typeof v.entity === 'string' ? v.entity.trim() : '',
+          cost_entity: typeof v.cost_entity === 'string' ? v.cost_entity.trim() : '',
+          today_entity: typeof v.today_entity === 'string' ? v.today_entity.trim() : '',
+          yesterday_entity: typeof v.yesterday_entity === 'string' ? v.yesterday_entity.trim() : '',
+        }))
+        .filter((v) => Boolean(v.entity));
+    }
+
     this._config = {
       title: 'Điện năng EVN',
       color_scheme: 'auto',
       ...providedConfig,
+      customer_views: views.length > 0 ? views : providedConfig.customer_views,
     };
-    this._configError = entity
+
+    const hasEntity = entity || (views.length > 0 && views.some((v) => Boolean(v.entity)));
+    this._configError = hasEntity
       ? null
       : 'Chọn entity sản lượng tháng của EVN để hiển thị thẻ này.';
+
     if (this._hass) {
       this.render();
     }
@@ -46,16 +67,32 @@ class EvnVietnamEnergyCard extends HTMLElement {
 
   _shouldUpdate(oldHass, newHass) {
     if (!this._config || !oldHass || !oldHass.states || !newHass || !newHass.states) return true;
-    const entities = [
+    const entities = new Set();
+    [
       this._config.entity,
       this._config.cost_entity,
       this._config.today_entity,
       this._config.yesterday_entity,
-    ].filter((id) => typeof id === 'string' && id.trim() !== '');
+    ].forEach((id) => {
+      if (typeof id === 'string' && id.trim() !== '') entities.add(id.trim());
+    });
 
-    return entities.some(
-      (entityId) => oldHass.states[entityId] !== newHass.states[entityId]
-    );
+    if (Array.isArray(this._config.customer_views)) {
+      this._config.customer_views.forEach((v) => {
+        if (v && typeof v === 'object') {
+          [v.entity, v.cost_entity, v.today_entity, v.yesterday_entity].forEach((id) => {
+            if (typeof id === 'string' && id.trim() !== '') entities.add(id.trim());
+          });
+        }
+      });
+    }
+
+    for (const entityId of entities) {
+      if (oldHass.states[entityId] !== newHass.states[entityId]) {
+        return true;
+      }
+    }
+    return false;
   }
 
   getCardSize() {
@@ -119,8 +156,42 @@ class EvnVietnamEnergyCard extends HTMLElement {
     const cardContent = document.createElement('div');
     cardContent.className = 'card-content';
 
-    if (this._configError) {
-      cardEl.appendChild(this._createErrorBox(this._configError));
+    // Normalize customer_views
+    const rawViews = Array.isArray(this._config.customer_views) ? this._config.customer_views : [];
+    const views = rawViews
+      .filter((v) => v && typeof v === 'object')
+      .map((v, index) => ({
+        id: typeof v.id === 'string' && v.id.trim() ? v.id.trim() : (index === 0 ? 'aggregate' : `view_${index}`),
+        label: typeof v.label === 'string' && v.label.trim() ? v.label.trim() : (index === 0 ? 'Tổng' : `Mã KH ${index}`),
+        entity: typeof v.entity === 'string' ? v.entity.trim() : '',
+        cost_entity: typeof v.cost_entity === 'string' ? v.cost_entity.trim() : '',
+        today_entity: typeof v.today_entity === 'string' ? v.today_entity.trim() : '',
+        yesterday_entity: typeof v.yesterday_entity === 'string' ? v.yesterday_entity.trim() : '',
+      }))
+      .filter((v) => Boolean(v.entity));
+
+    let activeView = null;
+    if (views.length > 0) {
+      if (this._selectedViewId) {
+        activeView = views.find((v) => v.id === this._selectedViewId) || views[0];
+      } else {
+        activeView = views[0];
+      }
+    } else {
+      activeView = {
+        id: 'aggregate',
+        label: 'Tổng',
+        entity: typeof this._config.entity === 'string' ? this._config.entity.trim() : '',
+        cost_entity: typeof this._config.cost_entity === 'string' ? this._config.cost_entity.trim() : '',
+        today_entity: typeof this._config.today_entity === 'string' ? this._config.today_entity.trim() : '',
+        yesterday_entity: typeof this._config.yesterday_entity === 'string' ? this._config.yesterday_entity.trim() : '',
+      };
+    }
+
+    const currentViewId = activeView ? activeView.id : 'aggregate';
+
+    if (this._configError || !activeView || !activeView.entity) {
+      cardEl.appendChild(this._createErrorBox(this._configError || 'Chọn entity sản lượng tháng của EVN để hiển thị thẻ này.'));
       this.shadowRoot.appendChild(cardEl);
       return;
     }
@@ -131,19 +202,28 @@ class EvnVietnamEnergyCard extends HTMLElement {
       return;
     }
 
-    const mainEntity = this._hass.states[this._config.entity];
+    const activeEntityId = activeView.entity;
+    const mainEntity = this._hass.states[activeEntityId];
     if (!mainEntity) {
-      cardEl.appendChild(
-        this._createErrorBox(`Không tìm thấy entity: ${this._config.entity}`)
+      if (views.length > 1) {
+        cardContent.appendChild(this._renderHeader('—', [], false, views, currentViewId));
+      }
+      cardContent.appendChild(
+        this._createErrorBox(`Không tìm thấy entity: ${activeEntityId}`)
       );
+      cardEl.appendChild(cardContent);
       this.shadowRoot.appendChild(cardEl);
       return;
     }
 
     if (mainEntity.state === 'unavailable' || mainEntity.state === 'unknown') {
-      cardEl.appendChild(
-        this._createStateBox(`Thực thể ${this._config.entity} đang ở trạng thái: ${mainEntity.state}`)
+      if (views.length > 1) {
+        cardContent.appendChild(this._renderHeader('—', [], false, views, currentViewId));
+      }
+      cardContent.appendChild(
+        this._createStateBox(`Thực thể ${activeEntityId} đang ở trạng thái: ${mainEntity.state}`)
       );
+      cardEl.appendChild(cardContent);
       this.shadowRoot.appendChild(cardEl);
       return;
     }
@@ -161,13 +241,14 @@ class EvnVietnamEnergyCard extends HTMLElement {
     // Safely process optional Cost Entity with proven scope equality
     let costStateValue = null;
     let costBills = [];
+    const activeCostEntity = activeView.cost_entity;
     if (
-      this._config.cost_entity &&
+      activeCostEntity &&
       this._hass &&
       this._hass.states &&
-      this._hass.states[this._config.cost_entity]
+      this._hass.states[activeCostEntity]
     ) {
-      const costEntity = this._hass.states[this._config.cost_entity];
+      const costEntity = this._hass.states[activeCostEntity];
       if (
         costEntity &&
         costEntity.state !== 'unavailable' &&
@@ -193,7 +274,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       : costBills;
 
     // 1. Header Section
-    cardContent.appendChild(this._renderHeader(customerCode, selectedCodes, isPartial));
+    cardContent.appendChild(this._renderHeader(customerCode, selectedCodes, isPartial, views, currentViewId));
 
     // 2. Partial Warning & Error Banners
     if (isPartial) {
@@ -205,7 +286,15 @@ class EvnVietnamEnergyCard extends HTMLElement {
     }
 
     // 3. Summary Grid (4 Summary Values)
-    cardContent.appendChild(this._renderSummaryGrid(mainEntity.state, costStateValue, dailyHistory));
+    cardContent.appendChild(
+      this._renderSummaryGrid(
+        mainEntity.state,
+        costStateValue,
+        dailyHistory,
+        activeView.today_entity,
+        activeView.yesterday_entity
+      )
+    );
 
     // 4. Daily Energy Chart
     cardContent.appendChild(this._renderChartSection(dailyHistory));
@@ -280,7 +369,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     return true;
   }
 
-  _renderHeader(customerCode, selectedCodes, isPartial) {
+  _renderHeader(customerCode, selectedCodes, isPartial, views, activeViewId) {
     const header = document.createElement('div');
     header.className = 'card-header';
 
@@ -292,25 +381,58 @@ class EvnVietnamEnergyCard extends HTMLElement {
     titleEl.textContent = (this._config && this._config.title) || 'Điện năng EVN';
     titleBox.appendChild(titleEl);
 
-    // Customer Code / Aggregate badge
-    const badgeEl = document.createElement('span');
-    badgeEl.className = 'customer-badge';
+    // Customer Code / Aggregate badge (when no multi-view selector)
+    if (!Array.isArray(views) || views.length <= 1) {
+      const badgeEl = document.createElement('span');
+      badgeEl.className = 'customer-badge';
 
-    if (customerCode === '__aggregate__' || selectedCodes.length > 1) {
-      const count = selectedCodes.length || 'nhiều';
-      badgeEl.textContent = `Tổng hợp (${count} mã KH)`;
-    } else {
-      badgeEl.textContent = customerCode !== '—' ? `Mã KH: ${customerCode}` : 'EVN Vietnam';
+      if (customerCode === '__aggregate__' || (Array.isArray(selectedCodes) && selectedCodes.length > 1)) {
+        const count = selectedCodes.length || 'nhiều';
+        badgeEl.textContent = `Tổng hợp (${count} mã KH)`;
+      } else {
+        badgeEl.textContent = customerCode !== '—' ? `Mã KH: ${customerCode}` : 'EVN Vietnam';
+      }
+      titleBox.appendChild(badgeEl);
     }
-    titleBox.appendChild(badgeEl);
 
     header.appendChild(titleBox);
+
+    const controlsBox = document.createElement('div');
+    controlsBox.className = 'header-controls';
+
+    if (Array.isArray(views) && views.length > 1) {
+      const select = document.createElement('select');
+      select.className = 'view-selector';
+      select.setAttribute('aria-label', 'Chọn chế độ xem điện năng');
+
+      views.forEach((v) => {
+        const option = document.createElement('option');
+        option.value = v.id;
+        option.textContent = v.label || v.id;
+        if (v.id === activeViewId) {
+          option.selected = true;
+        }
+        select.appendChild(option);
+      });
+
+      select.addEventListener('change', (e) => {
+        const val = e && e.target ? e.target.value : select.value;
+        this._selectedViewId = val;
+        this.render();
+      });
+
+      controlsBox.appendChild(select);
+    }
 
     if (isPartial) {
       const warningPill = document.createElement('span');
       warningPill.className = 'status-warning';
       warningPill.textContent = '⚠️ Một phần';
-      header.appendChild(warningPill);
+      controlsBox.appendChild(warningPill);
+    }
+
+    if (controlsBox.children.length > 0) {
+      header.appendChild(controlsBox);
     }
 
     return header;
@@ -341,19 +463,20 @@ class EvnVietnamEnergyCard extends HTMLElement {
     return banner;
   }
 
-  _renderSummaryGrid(currentMonthState, costStateValue, dailyHistory) {
+  _renderSummaryGrid(currentMonthState, costStateValue, dailyHistory, todayEntityId, yesterdayEntityId) {
     const grid = document.createElement('div');
     grid.className = 'metrics-grid';
 
     // 1. Today Value
     let todayVal = null;
+    const targetTodayEntity = todayEntityId || (this._config && this._config.today_entity);
     if (
-      this._config.today_entity &&
+      targetTodayEntity &&
       this._hass &&
       this._hass.states &&
-      this._hass.states[this._config.today_entity]
+      this._hass.states[targetTodayEntity]
     ) {
-      const st = this._hass.states[this._config.today_entity].state;
+      const st = this._hass.states[targetTodayEntity].state;
       if (st !== 'unavailable' && st !== 'unknown') {
         const num = Number(st);
         if (Number.isFinite(num)) {
@@ -380,13 +503,14 @@ class EvnVietnamEnergyCard extends HTMLElement {
 
     // 2. Yesterday Value
     let yesterdayVal = null;
+    const targetYesterdayEntity = yesterdayEntityId || (this._config && this._config.yesterday_entity);
     if (
-      this._config.yesterday_entity &&
+      targetYesterdayEntity &&
       this._hass &&
       this._hass.states &&
-      this._hass.states[this._config.yesterday_entity]
+      this._hass.states[targetYesterdayEntity]
     ) {
-      const st = this._hass.states[this._config.yesterday_entity].state;
+      const st = this._hass.states[targetYesterdayEntity].state;
       if (st !== 'unavailable' && st !== 'unknown') {
         const num = Number(st);
         if (Number.isFinite(num)) {
@@ -766,6 +890,28 @@ class EvnVietnamEnergyCard extends HTMLElement {
         padding: 2px 6px;
         border-radius: 4px;
         border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.08));
+      }
+      .header-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .view-selector {
+        font-family: inherit;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--primary-text-color, #111827);
+        background: var(--card-background-color, var(--ha-card-background, #ffffff));
+        border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.15));
+        border-radius: 6px;
+        padding: 3px 8px;
+        cursor: pointer;
+        outline: none;
+      }
+      .view-selector:focus {
+        border-color: var(--evn-accent, #1976d2);
+        box-shadow: 0 0 0 1px var(--evn-accent, #1976d2);
       }
       .status-warning {
         font-size: 11px;

@@ -106,6 +106,25 @@ def test_roster_merge_keeps_previous_codes_when_discovery_is_empty(modules) -> N
     ) == {"PB000001": "PB000001009", "PB000002": ""}
 
 
+def test_registry_migration_recovers_only_this_entrys_valid_legacy_customer_codes(modules) -> None:
+    """Stale HA sensors can restore a lost roster without importing other entries."""
+    models, _ = modules
+
+    recovered = models.extract_customer_codes_from_entity_unique_ids(
+        "entry-a",
+        [
+            "entry-a_PB000001_current_month_consumption",
+            "entry-a_PB000002_latest_index",
+            "entry-a_aggregate_current_month_consumption",
+            "entry-a_PrivateName_current_month_consumption",
+            "entry-b_PB000003_current_month_consumption",
+            "entry-a_PB000004_unknown_metric",
+        ],
+    )
+
+    assert recovered == {"PB000001", "PB000002"}
+
+
 def test_client_discovers_all_mobile_roster_endpoints_and_skips_failed_probe(modules) -> None:
     """One unavailable optional endpoint must not discard other linked customers."""
     _, api = modules
