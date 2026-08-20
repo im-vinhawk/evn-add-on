@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "username": "Tên đăng nhập hoặc mã khách hàng EVN",
+          "password": "Mật khẩu ứng dụng EVN"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Không thể kết nối EVN",
+      "invalid_auth": "Thông tin đăng nhập EVN không hợp lệ",
+      "wrong_account": "Tài khoản này không khớp mã khách hàng của cấu hình hiện tại."
+    },
+    "error": {
+      "invalid_customer_code": "Chỉ nhập các mã khách hàng EVN, phân cách bằng dấu phẩy."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "customer_codes": "Mã khách hàng bổ sung đã liên kết trong ứng dụng EVN (phân cách bằng dấu phẩy)",
+          "scan_interval": "Chu kỳ cập nhật (phút)"
+        }
+      }
+    }
+  }
+}

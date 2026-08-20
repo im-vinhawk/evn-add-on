@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "username": "EVN username or customer code",
+          "password": "EVN app password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to EVN",
+      "invalid_auth": "Invalid EVN credentials",
+      "wrong_account": "This account does not match the configured customer code."
+    },
+    "error": {
+      "invalid_customer_code": "Enter only comma-separated EVN customer codes."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "customer_codes": "Additional customer codes already linked in the EVN app (comma separated)",
+          "scan_interval": "Update interval (minutes)"
+        }
+      }
+    }
+  }
+}

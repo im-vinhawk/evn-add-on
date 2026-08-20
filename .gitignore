@@ -1,0 +1,26 @@
+# Secrets & Authentication Cache
+.evn_session.json
+.evn_linked_contracts.json
+*.session
+*.token
+*.env
+.env*
+secrets.yaml
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Scratch & Temporary Logs
+scratch/
+*.log
+
+# APK & Binaries
+apk/
+*.xapk
+*.apk
+extracted/
