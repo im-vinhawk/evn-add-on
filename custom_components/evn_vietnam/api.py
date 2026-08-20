@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 from typing import Any
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import aiohttp
@@ -137,7 +138,19 @@ class EvnClient:
         if not self.state.refresh_token:
             raise EvnAuthenticationError("EVN session expired")
         body = {"refreshToken": self.state.refresh_token, "deviceId": self.state.device_id}
-        payload = await self._request_raw(self._session, "POST", f"{NATIONAL_BASE_URL}/auth/refresh", self._headers(self.state.access_token), body)
+        try:
+            payload = await self._request_raw(
+                self._session,
+                "POST",
+                f"{NATIONAL_BASE_URL}/auth/refresh",
+                self._headers(self.state.access_token),
+                body,
+            )
+        except EvnApiError as err:
+            # EVN uses non-401 statuses (observed 417) for expired refresh
+            # tokens. Keep upstream detail out of HA entity attributes/logs and
+            # let the coordinator trigger its normal config-entry reauth flow.
+            raise EvnAuthenticationError("EVN session expired; reauthenticate this integration") from err
         content = payload.get("data", payload) if isinstance(payload, dict) else {}
         token = content.get("token") or content.get("accessToken")
         if not token:
@@ -172,16 +185,34 @@ class EvnClient:
         return f"{base.rstrip('/')}/api/evn/{endpoint}"
 
     async def _async_meter_point(self, customer_code: str) -> str:
+        """Return the EVN-provided meter point for one configured customer."""
         if customer_code in self._meter_points:
             return self._meter_points[customer_code]
         await self._async_switch_customer(customer_code)
         try:
+            query = urlencode({"MA_KHANG": customer_code, "maKhachHang": customer_code})
             payload = await self._async_request(
-                "GET", self._regional_url(customer_code, f"customers/diemdo?MA_KHANG={customer_code}")
+                "GET", self._regional_url(customer_code, f"customers/diemdo?{query}")
             )
-            rows = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
-            if rows and isinstance(rows[0], dict):
-                point = str(rows[0].get("MA_DDO") or rows[0].get("maDdo") or "")
+            rows: list[Any]
+            if isinstance(payload, list):
+                rows = payload
+            elif isinstance(payload, dict):
+                candidate = payload.get("data") or payload.get("items") or payload.get("danhSachDiemDo")
+                if isinstance(candidate, list):
+                    rows = candidate
+                elif isinstance(candidate, dict):
+                    rows = [candidate]
+                elif any(key in payload for key in ("MA_DDO", "maDdo")):
+                    rows = [payload]
+                else:
+                    rows = []
+            else:
+                rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                point = str(row.get("MA_DDO") or row.get("maDdo") or "")
                 if point:
                     self._meter_points[customer_code] = point
                     return point
