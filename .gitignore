@@ -19,6 +19,9 @@ ENV/
 scratch/
 *.log
 
+# Local session plans (may include HA diagnostics; keep off GitHub)
+plans/
+
 # APK & Binaries
 apk/
 *.xapk
