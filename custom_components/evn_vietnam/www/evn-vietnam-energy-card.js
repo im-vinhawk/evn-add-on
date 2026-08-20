@@ -10,6 +10,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     this._config = null;
     this._hass = null;
     this._selectedViewId = null;
+    this._selectedRangeDays = 30;
   }
 
   setConfig(config) {
@@ -548,7 +549,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     grid.appendChild(this._createMetricTile('Hôm nay', this._formatKwh(todayVal)));
     grid.appendChild(this._createMetricTile('Hôm qua', this._formatKwh(yesterdayVal)));
     grid.appendChild(this._createMetricTile('Tháng này', this._formatKwh(monthVal), true));
-    grid.appendChild(this._createMetricTile('Tạm tính', this._formatVnd(costVal), true));
+    grid.appendChild(this._createMetricTile('Chi phí ước tính', this._formatVnd(costVal), true));
 
     return grid;
   }
@@ -578,15 +579,42 @@ class EvnVietnamEnergyCard extends HTMLElement {
     const header = document.createElement('div');
     header.className = 'chart-header';
 
+    const titleBox = document.createElement('div');
+    titleBox.className = 'chart-title-box';
+
     const titleEl = document.createElement('span');
+    titleEl.className = 'chart-title';
     titleEl.textContent = 'Sản lượng theo ngày (kWh)';
+    titleBox.appendChild(titleEl);
+
+    // Range segmented controls (7, 14, 30 days)
+    const rangeControls = document.createElement('div');
+    rangeControls.className = 'range-controls';
+
+    const currentRange = this._selectedRangeDays || 30;
+    [7, 14, 30].forEach((days) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `range-btn${days === currentRange ? ' active' : ''}`;
+      btn.textContent = `${days} ngày`;
+      btn.setAttribute('aria-label', `Xem ${days} ngày`);
+      btn.addEventListener('click', (e) => {
+        if (e && typeof e.stopPropagation === 'function') {
+          e.stopPropagation();
+        }
+        this._selectedRangeDays = days;
+        this.render();
+      });
+      rangeControls.appendChild(btn);
+    });
+    titleBox.appendChild(rangeControls);
+    header.appendChild(titleBox);
 
     const tooltipEl = document.createElement('span');
     tooltipEl.className = 'chart-tooltip';
     tooltipEl.textContent = 'Chạm/Rê chuột để xem';
-
-    header.appendChild(titleEl);
     header.appendChild(tooltipEl);
+
     section.appendChild(header);
 
     const validData = Array.isArray(dailyHistory)
@@ -601,8 +629,18 @@ class EvnVietnamEnergyCard extends HTMLElement {
       return section;
     }
 
-    // Sort history by date ascending
+    // Sort history by date ascending and apply selected range
     const sortedData = [...validData].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const rangeDays = this._selectedRangeDays || 30;
+    const filteredData = sortedData.slice(-rangeDays);
+
+    if (filteredData.length === 0) {
+      const emptyMsg = document.createElement('div');
+      emptyMsg.className = 'empty-state';
+      emptyMsg.textContent = 'Không có dữ liệu sản lượng hàng ngày';
+      section.appendChild(emptyMsg);
+      return section;
+    }
 
     const svgNS = 'http://www.w3.org/2000/svg';
     const width = 500;
@@ -624,7 +662,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       return num;
     };
 
-    const vals = sortedData.map(getVal);
+    const vals = filteredData.map(getVal);
     const rawMax = vals.length > 0 ? Math.max(...vals) : 0;
     const maxVal = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 1.0;
     const yMax = maxVal * 1.15;
@@ -664,14 +702,38 @@ class EvnVietnamEnergyCard extends HTMLElement {
       }
     });
 
+    // Amber dashed average line across visible range
+    const totalVal = vals.reduce((sum, v) => sum + v, 0);
+    const avgVal = vals.length > 0 ? totalVal / vals.length : 0;
+    if (avgVal > 0 && Number.isFinite(avgVal)) {
+      const yAvg = paddingTop + chartH - (avgVal / yMax) * chartH;
+      if (Number.isFinite(yAvg)) {
+        const avgLine = document.createElementNS(svgNS, 'line');
+        avgLine.setAttribute('class', 'avg-line');
+        avgLine.setAttribute('x1', paddingLeft);
+        avgLine.setAttribute('x2', width - paddingRight);
+        avgLine.setAttribute('y1', yAvg);
+        avgLine.setAttribute('y2', yAvg);
+        avgLine.setAttribute('stroke', '#f59e0b');
+        avgLine.setAttribute('stroke-width', '1.5');
+        avgLine.setAttribute('stroke-dasharray', '4,4');
+
+        const avgTitle = document.createElementNS(svgNS, 'title');
+        avgTitle.textContent = `Trung bình: ${this._formatKwh(avgVal)}`;
+        avgLine.appendChild(avgTitle);
+
+        svg.appendChild(avgLine);
+      }
+    }
+
     // Bars
-    const itemCount = sortedData.length;
+    const itemCount = filteredData.length;
     if (itemCount === 0) return section;
 
     const step = chartW / itemCount;
     const barWidth = Math.max(step * 0.65, 2);
 
-    sortedData.forEach((item, idx) => {
+    filteredData.forEach((item, idx) => {
       const val = getVal(item);
       const barH = Math.max((val / yMax) * chartH, 1);
       const xPos = paddingLeft + idx * step + (step - barWidth) / 2;
@@ -981,10 +1043,54 @@ class EvnVietnamEnergyCard extends HTMLElement {
         display: flex;
         justify-content: space-between;
         align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
         font-size: 12px;
         font-weight: 500;
         color: var(--secondary-text-color, #4b5563);
         margin-bottom: 8px;
+      }
+      .chart-title-box {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .chart-title {
+        font-weight: 600;
+      }
+      .range-controls {
+        display: inline-flex;
+        background: var(--secondary-background-color, rgba(0, 0, 0, 0.05));
+        border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.08));
+        border-radius: 6px;
+        padding: 2px;
+        gap: 2px;
+      }
+      .range-btn {
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 500;
+        border: none;
+        background: transparent;
+        color: var(--secondary-text-color, #6b7280);
+        padding: 2px 6px;
+        border-radius: 4px;
+        cursor: pointer;
+        outline: none;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+      .range-btn:hover {
+        color: var(--primary-text-color, #111827);
+      }
+      .range-btn.active {
+        background: var(--card-background-color, var(--ha-card-background, #ffffff));
+        color: var(--evn-accent, #1976d2);
+        font-weight: 600;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+      }
+      .range-btn:focus-visible {
+        outline: 1px solid var(--evn-accent, #1976d2);
       }
       .chart-tooltip {
         font-variant-numeric: tabular-nums;
@@ -997,6 +1103,12 @@ class EvnVietnamEnergyCard extends HTMLElement {
         height: auto;
         display: block;
         overflow: visible;
+      }
+      .avg-line {
+        stroke: var(--warning-color, #f59e0b);
+        stroke-width: 1.5;
+        stroke-dasharray: 4,4;
+        opacity: 0.9;
       }
       .bar {
         fill: var(--evn-accent);

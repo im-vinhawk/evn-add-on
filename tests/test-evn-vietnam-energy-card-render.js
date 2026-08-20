@@ -30,6 +30,9 @@ class FakeNode {
 
   setAttribute(name, value) {
     this.attributes[name] = String(value);
+    if (name === 'class') {
+      this.className = String(value);
+    }
   }
 
   addEventListener(type, handler) {
@@ -38,6 +41,8 @@ class FakeNode {
   }
 
   dispatchEvent(event) {
+    if (!event.stopPropagation) event.stopPropagation = () => {};
+    if (!event.preventDefault) event.preventDefault = () => {};
     const handlers = this._listeners[event.type] || [];
     handlers.forEach((h) => h(event));
   }
@@ -221,6 +226,15 @@ const switchedTexts = collectTextContents(multiViewCard.shadowRoot).join(' ');
 assert.ok(switchedTexts.includes('45,5 kWh') || switchedTexts.includes('45.5'), 'switched view must display kh01 consumption');
 assert.ok(switchedTexts.includes('Chưa thanh toán'), 'switched view must display kh01 unpaid bill status');
 
+function findAllNodes(node, predicate) {
+  const matches = [];
+  if (predicate(node)) matches.push(node);
+  for (const child of node.children) {
+    matches.push(...findAllNodes(child, predicate));
+  }
+  return matches;
+}
+
 // Switch to missing entity view (should show local error, keep select, not throw)
 select.value = 'kh_missing';
 select.dispatchEvent({ type: 'change', target: { value: 'kh_missing' } });
@@ -228,3 +242,51 @@ const missingTexts = collectTextContents(multiViewCard.shadowRoot).join(' ');
 assert.ok(missingTexts.includes('Không tìm thấy entity: sensor.kh_missing'), 'missing view entity must show explanatory message');
 const selectAfterMissing = findNode(multiViewCard.shadowRoot, (n) => n.tagName === 'select');
 assert.ok(selectAfterMissing, 'view selector must remain accessible even when an entity is missing');
+
+// 5. Daily chart range controls (7/14/30 days) and average line
+const historyCard = new Card();
+const thirtyDaysHistory = Array.from({ length: 30 }, (_, i) => ({
+  date: `2026-08-${String(i + 1).padStart(2, '0')}`,
+  consumption: 1.0 + (i % 5),
+}));
+
+const historyHass = {
+  states: {
+    'sensor.history_month': {
+      state: '75.0',
+      attributes: {
+        customer_code: 'TEST01',
+        daily_history: thirtyDaysHistory,
+      },
+    },
+  },
+};
+
+historyCard.setConfig({
+  type: 'custom:evn-vietnam-energy-card',
+  entity: 'sensor.history_month',
+});
+historyCard.hass = historyHass;
+
+const rangeButtons = findAllNodes(historyCard.shadowRoot, (n) => n.tagName === 'button' && n.className && n.className.includes('range-btn'));
+assert.equal(rangeButtons.length, 3, 'chart header must render 3 range control buttons (7, 14, 30 days)');
+
+// Initial default range is 30 days -> 30 bars
+let bars = findAllNodes(historyCard.shadowRoot, (n) => n.tagName === 'rect' && n.className === 'bar');
+assert.equal(bars.length, 30, 'initial 30-day view must render 30 chart bars');
+
+// Average line must be rendered
+const avgLine = findNode(historyCard.shadowRoot, (n) => n.tagName === 'line' && (n.className === 'avg-line' || n.attributes['class'] === 'avg-line'));
+assert.ok(avgLine, 'chart must render an amber dashed average line for non-empty history');
+
+// Click 7-day range button
+const btn7 = rangeButtons.find((b) => b.textContent && b.textContent.includes('7'));
+assert.ok(btn7, '7-day range button must exist');
+btn7.dispatchEvent({ type: 'click' });
+
+bars = findAllNodes(historyCard.shadowRoot, (n) => n.tagName === 'rect' && n.className === 'bar');
+assert.equal(bars.length, 7, 'clicking 7-day range button must filter visible chart bars to 7');
+
+// Check KPI label for Chi phí ước tính
+const allTexts = collectTextContents(historyCard.shadowRoot).join(' ');
+assert.ok(allTexts.includes('Chi phí ước tính'), 'card must render Chi phí ước tính KPI label');
