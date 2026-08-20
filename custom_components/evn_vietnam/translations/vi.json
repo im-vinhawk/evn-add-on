@@ -29,6 +29,7 @@
       "init": {
         "data": {
           "customer_codes": "Mã khách hàng bổ sung đã liên kết trong ứng dụng EVN (phân cách bằng dấu phẩy)",
+          "selected_customer_codes": "Mã khách hàng trong tổng hợp (luôn gồm mã tài khoản chính)",
           "scan_interval": "Chu kỳ cập nhật (phút)"
         }
       }

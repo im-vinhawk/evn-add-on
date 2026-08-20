@@ -12,7 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import ATTRIBUTION, DOMAIN
-from .coordinator import EvnDataUpdateCoordinator, configured_customer_codes
+from .coordinator import EvnDataUpdateCoordinator, aggregate_customer_codes, configured_customer_codes
 
 _METRICS: tuple[tuple[str, str, SensorDeviceClass | None, str | None, SensorStateClass | None], ...] = (
     ("today_consumption", "Today's consumption", SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.MEASUREMENT),
@@ -28,7 +28,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     coordinator: EvnDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     codes = configured_customer_codes(entry)
     entities = [EvnSensor(coordinator, entry, code, metric) for code in codes for metric in _METRICS]
-    if len(codes) > 1:
+    if len(aggregate_customer_codes(entry)) > 1:
         entities.extend(EvnSensor(coordinator, entry, "__aggregate__", metric) for metric in _METRICS if metric[0] != "latest_index")
     async_add_entities(entities)
 
@@ -69,6 +69,7 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
         if self._metric == "current_month_consumption":
             attrs["daily_history"] = item.get("daily_history", [])
             attrs["monthly_history"] = item.get("monthly_history", [])
+            attrs["latest_reading"] = item.get("latest_index")
         if self._metric == "current_month_amount":
             attrs["bills"] = item.get("bills", [])
         if self._customer_code == "__aggregate__":

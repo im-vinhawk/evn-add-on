@@ -88,12 +88,36 @@ def test_roster_parser_rejects_ascii_display_names_in_identifier_fields(modules)
     }) == {}
 
 
-def test_session_serialization_does_not_persist_login_identifier(modules) -> None:
-    """A phone-number login must remain in memory only, like the password."""
+def test_session_serialization_persists_username_but_never_password(modules) -> None:
+    """Silent reauthentication needs the login identifier but never a password dump."""
     models, _ = modules
-    state = models.SessionState("0900000000", "token", "refresh", "device", "PB000001", "PB000001")
+    state = models.SessionState("user", "token", "refresh", "device", "PB000001", "PB000001")
 
-    assert "username" not in state.as_dict()
+    persisted = state.as_dict()
+    assert persisted["username"] == "user"
+    assert "password" not in persisted
+
+
+def test_diagnostics_redacts_credentials_and_tokens(modules) -> None:
+    """A config-entry diagnostics dump must never contain login secrets."""
+    helpers = types.ModuleType("homeassistant.helpers")
+    redact = types.ModuleType("homeassistant.helpers.redact")
+
+    def redact_data(data, keys):
+        return {key: "**REDACTED**" if key in keys else value for key, value in data.items()}
+
+    redact.async_redact_data = redact_data
+    sys.modules["homeassistant.helpers"] = helpers
+    sys.modules["homeassistant.helpers.redact"] = redact
+    diagnostics = _load_module("diagnostics")
+    entry = types.SimpleNamespace(data={
+        "username": "login-value", "password": "secret-pass", "access_token": "access-value", "refresh_token": "refresh-value",
+    })
+
+    result = asyncio.run(diagnostics.async_get_config_entry_diagnostics(None, entry))
+    rendered = repr(result)
+    for secret in ("login-value", "secret-pass", "access-value", "refresh-value"):
+        assert secret not in rendered
 
 
 def test_roster_merge_keeps_previous_codes_when_discovery_is_empty(modules) -> None:
@@ -123,6 +147,17 @@ def test_registry_migration_recovers_only_this_entrys_valid_legacy_customer_code
     )
 
     assert recovered == {"PB000001", "PB000002"}
+
+
+def test_selected_customer_codes_preserves_legacy_full_roster_and_validates_saved_scope(modules) -> None:
+    """The aggregate scope is persisted separately and always owns its primary."""
+    models, _ = modules
+    configured = ["PB000001", "PB000002", "PB000003"]
+
+    assert models.selected_customer_codes(configured, None, "PB000001") == configured
+    assert models.selected_customer_codes(
+        configured, ["PB000003", "not-a-customer"], "PB000001"
+    ) == ["PB000001", "PB000003"]
 
 
 def test_client_discovers_all_mobile_roster_endpoints_and_skips_failed_probe(modules) -> None:

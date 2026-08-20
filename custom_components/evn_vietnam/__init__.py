@@ -10,7 +10,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
-from .const import CONF_LINKED_CUSTOMERS, DOMAIN
+from .const import CARD_MODULE_URL, CONF_LINKED_CUSTOMERS, DOMAIN
 from .coordinator import EvnDataUpdateCoordinator
 from .models import (
     extract_customer_codes_from_entity_unique_ids,
@@ -21,7 +21,9 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Register the optional Lovelace card once for the integration domain."""
+    """Serve and register the Lovelace card for every dashboard mode."""
+    from homeassistant.components.frontend import add_extra_js_url
+
     await hass.http.async_register_static_paths([
         StaticPathConfig(
             url_path=f"/{DOMAIN}",
@@ -29,6 +31,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             cache_headers=False,
         )
     ])
+    # YAML lovelace.resources is ignored while the default dashboard is
+    # storage-mode. extra_module_url loads the card without a UI resource.
+    add_extra_js_url(hass, CARD_MODULE_URL)
     return True
 
 
@@ -37,6 +42,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _restore_roster_from_legacy_entities(hass, entry)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     coordinator = EvnDataUpdateCoordinator(hass, entry)
+    entry.async_on_unload(coordinator.async_shutdown)
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

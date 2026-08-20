@@ -77,17 +77,17 @@ def test_meter_point_uses_both_contract_parameters_and_normalizes_response(api_m
     ]
 
 
-def test_failed_refresh_is_an_authentication_error_without_upstream_detail(api_module) -> None:
-    """An EVN 417 refresh failure must start HA reauth, not a partial update."""
+def test_failed_refresh_is_distinct_and_without_upstream_detail(api_module) -> None:
+    """An exhausted refresh is recoverable by one silent password login."""
     state = api_module.SessionState("user", "token", "refresh", "device", "PB000001", "PB000001")
     client = api_module.EvnClient(object(), state)
 
     async def failed_request(*_args, **_kwargs):
-        raise api_module.EvnApiError("HTTP 417: internal upstream detail")
+        raise api_module.EvnApiError("HTTP 417: internal upstream detail", status=417)
 
     client._request_raw = failed_request
 
-    with pytest.raises(api_module.EvnAuthenticationError, match="EVN session expired") as raised:
+    with pytest.raises(api_module.EvnRefreshExpiredError, match="refresh credential expired") as raised:
         asyncio.run(client._async_refresh())
     assert "internal upstream detail" not in str(raised.value)
 

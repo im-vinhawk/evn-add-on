@@ -29,6 +29,7 @@
       "init": {
         "data": {
           "customer_codes": "Additional customer codes already linked in the EVN app (comma separated)",
+          "selected_customer_codes": "Customer codes included in the total (primary account is always included)",
           "scan_interval": "Update interval (minutes)"
         }
       }

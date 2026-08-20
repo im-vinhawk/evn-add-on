@@ -97,7 +97,64 @@ class EvnVietnamEnergyCard extends HTMLElement {
   }
 
   getCardSize() {
-    return 4;
+    return 8;
+  }
+
+  _chartValue(item) {
+    if (!item || typeof item !== 'object') return 0;
+    const raw = item.consumption !== undefined && item.consumption !== null ? item.consumption : item.kwh;
+    if (raw === null || raw === undefined || raw === '') return 0;
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num < 0) return 0;
+    return num;
+  }
+
+  _isoDate(value) {
+    const raw = String(value || '').slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : '';
+  }
+
+  _shiftIsoDate(iso, days) {
+    const [year, month, day] = iso.split('-').map(Number);
+    const date = new Date(year, month - 1, day);
+    date.setDate(date.getDate() + days);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  }
+
+  _calendarBars(dailyHistory, rangeDays) {
+    const byDate = new Map();
+    const rows = Array.isArray(dailyHistory) ? dailyHistory : [];
+    for (const item of rows) {
+      const iso = this._isoDate(item && item.date);
+      if (!iso) continue;
+      byDate.set(iso, item);
+    }
+    const known = [...byDate.keys()].sort();
+    if (known.length === 0) return [];
+    const days = Math.max(1, Number(rangeDays) || 30);
+    const end = known[known.length - 1];
+    const start = this._shiftIsoDate(end, -(days - 1));
+    const series = [];
+    for (let iso = start; iso <= end; iso = this._shiftIsoDate(iso, 1)) {
+      const source = byDate.get(iso);
+      const consumption = source ? this._chartValue(source) : 0;
+      series.push({
+        date: iso,
+        consumption,
+        kwh: consumption,
+        missing: !source,
+      });
+    }
+    return series;
+  }
+
+  _formatAxisDateLabel(series, idx) {
+    const item = series[idx];
+    const fullLabel = this._formatDateLabel(item && item.date);
+    if (series.length <= 7 || idx === 0 || idx === series.length - 1) return fullLabel;
+    const previous = series[idx - 1];
+    if (!previous || previous.date.slice(5, 7) !== item.date.slice(5, 7)) return fullLabel;
+    return fullLabel.slice(0, 2);
   }
 
   // --- Formatting Helpers ---
@@ -207,7 +264,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     const mainEntity = this._hass.states[activeEntityId];
     if (!mainEntity) {
       if (views.length > 1) {
-        cardContent.appendChild(this._renderHeader('—', [], false, views, currentViewId));
+        cardContent.appendChild(this._renderHeader('—', [], [], null, false, views, currentViewId));
       }
       cardContent.appendChild(
         this._createErrorBox(`Không tìm thấy entity: ${activeEntityId}`)
@@ -219,7 +276,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
 
     if (mainEntity.state === 'unavailable' || mainEntity.state === 'unknown') {
       if (views.length > 1) {
-        cardContent.appendChild(this._renderHeader('—', [], false, views, currentViewId));
+        cardContent.appendChild(this._renderHeader('—', [], [], null, false, views, currentViewId));
       }
       cardContent.appendChild(
         this._createStateBox(`Thực thể ${activeEntityId} đang ở trạng thái: ${mainEntity.state}`)
@@ -235,6 +292,8 @@ class EvnVietnamEnergyCard extends HTMLElement {
       : {};
     const customerCode = attrs.customer_code || '—';
     const selectedCodes = Array.isArray(attrs.selected_customer_codes) ? attrs.selected_customer_codes : [];
+    const successfulCodes = Array.isArray(attrs.successful_customer_codes) ? attrs.successful_customer_codes : [];
+    const latestReading = attrs.latest_reading !== undefined && attrs.latest_reading !== null ? attrs.latest_reading : null;
     const isPartial = Boolean(attrs.is_partial);
     const partialErrors = (attrs.partial_errors && typeof attrs.partial_errors === 'object') ? attrs.partial_errors : null;
     const dailyHistory = Array.isArray(attrs.daily_history) ? attrs.daily_history : [];
@@ -275,7 +334,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       : costBills;
 
     // 1. Header Section
-    cardContent.appendChild(this._renderHeader(customerCode, selectedCodes, isPartial, views, currentViewId));
+    cardContent.appendChild(this._renderHeader(customerCode, selectedCodes, successfulCodes, latestReading, isPartial, views, currentViewId));
 
     // 2. Partial Warning & Error Banners
     if (isPartial) {
@@ -370,7 +429,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     return true;
   }
 
-  _renderHeader(customerCode, selectedCodes, isPartial, views, activeViewId) {
+  _renderHeader(customerCode, selectedCodes, successfulCodes, latestReading, isPartial, views, activeViewId) {
     const header = document.createElement('div');
     header.className = 'card-header';
 
@@ -382,18 +441,32 @@ class EvnVietnamEnergyCard extends HTMLElement {
     titleEl.textContent = (this._config && this._config.title) || 'Điện năng EVN';
     titleBox.appendChild(titleEl);
 
-    // Customer Code / Aggregate badge (when no multi-view selector)
-    if (!Array.isArray(views) || views.length <= 1) {
-      const badgeEl = document.createElement('span');
-      badgeEl.className = 'customer-badge';
+    // Customer Code / Aggregate badge
+    const badgeEl = document.createElement('span');
+    badgeEl.className = 'customer-badge';
 
-      if (customerCode === '__aggregate__' || (Array.isArray(selectedCodes) && selectedCodes.length > 1)) {
-        const count = selectedCodes.length || 'nhiều';
-        badgeEl.textContent = `Tổng hợp (${count} mã KH)`;
+    if (customerCode === '__aggregate__' || (Array.isArray(selectedCodes) && selectedCodes.length > 1)) {
+      let countStr = '';
+      if (successfulCodes.length > 0 && selectedCodes.length > 0 && successfulCodes.length !== selectedCodes.length) {
+        countStr = `${successfulCodes.length}/${selectedCodes.length}`;
       } else {
-        badgeEl.textContent = customerCode !== '—' ? `Mã KH: ${customerCode}` : 'EVN Vietnam';
+        countStr = String(selectedCodes.length || 'nhiều');
       }
-      titleBox.appendChild(badgeEl);
+      badgeEl.textContent = `Tổng hợp (${countStr} mã KH)`;
+    } else {
+      badgeEl.textContent = customerCode !== '—' ? `Mã KH: ${customerCode}` : 'EVN Vietnam';
+    }
+    titleBox.appendChild(badgeEl);
+
+    // Latest Reading badge
+    if (latestReading !== null && latestReading !== undefined && latestReading !== '') {
+      const numRead = Number(latestReading);
+      if (Number.isFinite(numRead)) {
+        const readingBadge = document.createElement('span');
+        readingBadge.className = 'reading-badge';
+        readingBadge.textContent = `Chỉ số: ${this._formatKwh(numRead)}`;
+        titleBox.appendChild(readingBadge);
+      }
     }
 
     header.appendChild(titleBox);
@@ -617,22 +690,8 @@ class EvnVietnamEnergyCard extends HTMLElement {
 
     section.appendChild(header);
 
-    const validData = Array.isArray(dailyHistory)
-      ? dailyHistory.filter((item) => item && typeof item === 'object' && item.date)
-      : [];
-
-    if (validData.length === 0) {
-      const emptyMsg = document.createElement('div');
-      emptyMsg.className = 'empty-state';
-      emptyMsg.textContent = 'Không có dữ liệu sản lượng hàng ngày';
-      section.appendChild(emptyMsg);
-      return section;
-    }
-
-    // Sort history by date ascending and apply selected range
-    const sortedData = [...validData].sort((a, b) => String(a.date).localeCompare(String(b.date)));
     const rangeDays = this._selectedRangeDays || 30;
-    const filteredData = sortedData.slice(-rangeDays);
+    const filteredData = this._calendarBars(dailyHistory, rangeDays);
 
     if (filteredData.length === 0) {
       const emptyMsg = document.createElement('div');
@@ -643,26 +702,16 @@ class EvnVietnamEnergyCard extends HTMLElement {
     }
 
     const svgNS = 'http://www.w3.org/2000/svg';
-    const width = 500;
-    const height = 150;
-    const paddingLeft = 35;
-    const paddingRight = 10;
-    const paddingTop = 15;
-    const paddingBottom = 25;
+    const width = 720;
+    const height = 236;
+    const paddingLeft = 40;
+    const paddingRight = 12;
+    const paddingTop = 16;
+    const paddingBottom = 52;
 
     const chartW = width - paddingLeft - paddingRight;
     const chartH = height - paddingTop - paddingBottom;
-
-    const getVal = (d) => {
-      if (!d || typeof d !== 'object') return 0;
-      const raw = d.consumption !== undefined && d.consumption !== null ? d.consumption : d.kwh;
-      if (raw === null || raw === undefined || raw === '') return 0;
-      const num = Number(raw);
-      if (!Number.isFinite(num) || num < 0) return 0;
-      return num;
-    };
-
-    const vals = filteredData.map(getVal);
+    const vals = filteredData.map((item) => this._chartValue(item));
     const rawMax = vals.length > 0 ? Math.max(...vals) : 0;
     const maxVal = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 1.0;
     const yMax = maxVal * 1.15;
@@ -726,16 +775,16 @@ class EvnVietnamEnergyCard extends HTMLElement {
       }
     }
 
-    // Bars
+    // One calendar day per column, including days EVN has not reported yet.
     const itemCount = filteredData.length;
     if (itemCount === 0) return section;
 
     const step = chartW / itemCount;
-    const barWidth = Math.max(step * 0.65, 2);
+    const barWidth = Math.max(Math.min(step * 0.72, 22), 3);
 
     filteredData.forEach((item, idx) => {
-      const val = getVal(item);
-      const barH = Math.max((val / yMax) * chartH, 1);
+      const val = this._chartValue(item);
+      const barH = val > 0 ? Math.max((val / yMax) * chartH, 2) : Math.max(chartH * 0.015, 1);
       const xPos = paddingLeft + idx * step + (step - barWidth) / 2;
       const yPos = paddingTop + chartH - barH;
 
@@ -744,7 +793,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       }
 
       const rect = document.createElementNS(svgNS, 'rect');
-      rect.setAttribute('class', 'bar');
+      rect.setAttribute('class', item.missing || val === 0 ? 'bar bar-empty' : 'bar');
       rect.setAttribute('x', xPos);
       rect.setAttribute('y', yPos);
       rect.setAttribute('width', barWidth);
@@ -775,27 +824,19 @@ class EvnVietnamEnergyCard extends HTMLElement {
 
       svg.appendChild(rect);
 
-      // X-axis date labels (show for first, middle, last, or every 5th)
-      const shouldShowLabel =
-        itemCount <= 10 ||
-        idx === 0 ||
-        idx === itemCount - 1 ||
-        idx === Math.floor(itemCount / 2) ||
-        idx % 5 === 0;
-
-      if (shouldShowLabel) {
-        const textX = xPos + barWidth / 2;
-        const textY = height - 6;
-        if (Number.isFinite(textX) && Number.isFinite(textY)) {
-          const text = document.createElementNS(svgNS, 'text');
-          text.setAttribute('x', textX);
-          text.setAttribute('y', textY);
-          text.setAttribute('text-anchor', 'middle');
-          text.setAttribute('font-size', '9');
-          text.setAttribute('fill', 'var(--secondary-text-color, #6b7280)');
-          text.textContent = this._formatDateLabel(item.date);
-          svg.appendChild(text);
-        }
+      // Every bar is one calendar day, so every slot receives its own label.
+      const textX = paddingLeft + idx * step + step / 2;
+      const textY = height - 14;
+      if (Number.isFinite(textX) && Number.isFinite(textY)) {
+        const text = document.createElementNS(svgNS, 'text');
+        text.setAttribute('class', 'axis-label');
+        text.setAttribute('x', textX);
+        text.setAttribute('y', textY);
+        text.setAttribute('text-anchor', 'middle');
+        text.setAttribute('font-size', itemCount > 14 ? '8' : '10');
+        text.setAttribute('fill', 'var(--secondary-text-color, #6b7280)');
+        text.textContent = this._formatAxisDateLabel(filteredData, idx);
+        svg.appendChild(text);
       }
     });
 
@@ -907,11 +948,14 @@ class EvnVietnamEnergyCard extends HTMLElement {
     return `
       :host {
         display: block;
+        width: 100%;
         --evn-accent: ${accent};
         --evn-accent-strong: ${accentStrong};
       }
       ha-card {
-        padding: 16px;
+        width: 100%;
+        max-width: 100%;
+        padding: 20px;
         background: var(--card-background-color, var(--ha-card-background, #ffffff));
         color: var(--primary-text-color, #212121);
         border-radius: var(--ha-card-border-radius, 12px);
@@ -952,6 +996,15 @@ class EvnVietnamEnergyCard extends HTMLElement {
         padding: 2px 6px;
         border-radius: 4px;
         border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.08));
+      }
+      .reading-badge {
+        font-size: 11px;
+        background: var(--secondary-background-color, rgba(0, 0, 0, 0.05));
+        color: var(--secondary-text-color, #6b7280);
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.08));
+        font-variant-numeric: tabular-nums;
       }
       .header-controls {
         display: flex;
@@ -1003,9 +1056,9 @@ class EvnVietnamEnergyCard extends HTMLElement {
       .metrics-grid {
         display: grid;
         grid-template-columns: repeat(4, 1fr);
-        gap: 8px;
+        gap: 12px;
       }
-      @media (max-width: 520px) {
+      @media (max-width: 720px) {
         .metrics-grid {
           grid-template-columns: repeat(2, 1fr);
         }
@@ -1013,19 +1066,19 @@ class EvnVietnamEnergyCard extends HTMLElement {
       .metric-card {
         background: var(--secondary-background-color, rgba(0, 0, 0, 0.03));
         border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.08));
-        border-radius: 6px;
-        padding: 8px 10px;
+        border-radius: 8px;
+        padding: 12px 14px;
         display: flex;
         flex-direction: column;
       }
       .metric-label {
-        font-size: 11px;
+        font-size: 12px;
         color: var(--secondary-text-color, #6b7280);
-        margin-bottom: 4px;
+        margin-bottom: 6px;
         white-space: nowrap;
       }
       .metric-value {
-        font-size: 15px;
+        font-size: 18px;
         font-weight: 600;
         font-variant-numeric: tabular-nums;
         color: var(--primary-text-color, #111827);
@@ -1036,8 +1089,8 @@ class EvnVietnamEnergyCard extends HTMLElement {
       .chart-container {
         background: var(--secondary-background-color, rgba(0, 0, 0, 0.02));
         border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.08));
-        border-radius: 6px;
-        padding: 10px 12px;
+        border-radius: 8px;
+        padding: 14px 16px;
       }
       .chart-header {
         display: flex;
@@ -1100,6 +1153,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       }
       .chart-svg {
         width: 100%;
+        min-height: 220px;
         height: auto;
         display: block;
         overflow: visible;
@@ -1112,14 +1166,31 @@ class EvnVietnamEnergyCard extends HTMLElement {
       }
       .bar {
         fill: var(--evn-accent);
-        opacity: 0.85;
+        opacity: 0.9;
         transition: opacity 0.15s ease, fill 0.15s ease;
         cursor: pointer;
+      }
+      .bar-empty {
+        opacity: 0.28;
       }
       .bar:hover, .bar:focus {
         opacity: 1;
         fill: var(--evn-accent-strong);
         outline: none;
+      }
+      @media (min-width: 900px) {
+        ha-card {
+          padding: 24px 28px;
+        }
+        .card-title {
+          font-size: 18px;
+        }
+        .metric-value {
+          font-size: 22px;
+        }
+        .chart-svg {
+          min-height: 260px;
+        }
       }
       .table-container {
         overflow-x: auto;

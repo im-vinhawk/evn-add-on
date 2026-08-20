@@ -91,6 +91,29 @@ def aggregate_overviews(overviews: Iterable[Mapping[str, Any]], codes: list[str]
     }
 
 
+def aggregate_selected_overviews(
+    meters: Mapping[str, Mapping[str, Any]],
+    selected_codes: list[str],
+    partial_errors: Mapping[str, str],
+) -> dict[str, Any] | None:
+    """Aggregate only the selected successful meters with scoped provenance."""
+    if len(selected_codes) < 2:
+        return None
+    successful_codes = [code for code in selected_codes if code in meters]
+    aggregate = aggregate_overviews((meters[code] for code in successful_codes), selected_codes)
+    aggregate["successful_customer_codes"] = successful_codes
+    aggregate["bills"] = aggregate_bills(meters[code].get("bills", []) for code in successful_codes)
+    aggregate["monthly_history"] = aggregate["bills"]
+    aggregate["daily_history"] = aggregate_daily(
+        (code, meters[code].get("daily_history", [])) for code in successful_codes
+    )
+    aggregate["partial_errors"] = {
+        code: error for code, error in partial_errors.items() if code in selected_codes
+    }
+    aggregate["is_partial"] = bool(aggregate["partial_errors"])
+    return aggregate
+
+
 def aggregate_daily(daily_series: Iterable[tuple[str, Iterable[Mapping[str, Any]]]]) -> list[dict[str, Any]]:
     """Outer-join daily meter values by calendar date for a native HA chart."""
     by_date: dict[str, dict[str, Any]] = {}

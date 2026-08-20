@@ -39,6 +39,14 @@ class EvnAuthenticationError(EvnError):
 class EvnApiError(EvnError):
     """EVN returned an invalid request or server response."""
 
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class EvnRefreshExpiredError(EvnError):
+    """The refresh credential is rejected and needs one password login."""
+
 
 class EvnCustomerSwitchError(EvnApiError):
     """EVN could not switch to a linked customer without exposing its detail."""
@@ -107,6 +115,7 @@ class EvnClient:
         session: aiohttp.ClientSession,
         state: SessionState,
         linked_customer_meter_points: dict[str, str] | None = None,
+        password: str | None = None,
     ) -> None:
         self._session = session
         self.state = state
@@ -115,6 +124,7 @@ class EvnClient:
             for code, meter_point in normalize_linked_customer_meter_points(linked_customer_meter_points).items()
             if meter_point
         }
+        self._password = password
 
     @staticmethod
     def new_device_id() -> str:
@@ -127,9 +137,10 @@ class EvnClient:
         session: aiohttp.ClientSession,
         username: str,
         password: str,
+        device_id: str | None = None,
     ) -> tuple[SessionState, dict[str, str]]:
         """Authenticate and extract only privacy-safe roster data from login."""
-        device_id = cls.new_device_id()
+        device_id = device_id or cls.new_device_id()
         headers = cls._headers(None)
         payload = {
             "username": username.strip(),
@@ -164,9 +175,11 @@ class EvnClient:
         return state, extract_linked_customer_meter_points(response)
 
     @classmethod
-    async def async_login(cls, session: aiohttp.ClientSession, username: str, password: str) -> SessionState:
-        """Authenticate once. Password is intentionally not returned or persisted."""
-        state, _ = await cls._async_login_with_roster(session, username, password)
+    async def async_login(
+        cls, session: aiohttp.ClientSession, username: str, password: str, device_id: str | None = None,
+    ) -> SessionState:
+        """Authenticate once while retaining a known device id when supplied."""
+        state, _ = await cls._async_login_with_roster(session, username, password, device_id)
         return state
 
     @classmethod
@@ -176,9 +189,10 @@ class EvnClient:
         username: str,
         password: str,
         previous_roster: dict[str, str] | None = None,
+        device_id: str | None = None,
     ) -> tuple[SessionState, dict[str, str]]:
         """Log in, then merge mobile-app linked customers into a safe roster."""
-        state, login_roster = await cls._async_login_with_roster(session, username, password)
+        state, login_roster = await cls._async_login_with_roster(session, username, password, device_id)
         client = cls(session, state, previous_roster)
         discovered = await client.async_discover_linked_customers()
         roster = merge_linked_customer_meter_points(previous_roster, login_roster)
@@ -236,7 +250,7 @@ class EvnClient:
                     return payload or {}
                 if response.status == 401:
                     raise EvnAuthenticationError("EVN session expired")
-                raise EvnApiError(_error_message(payload, response.status))
+                raise EvnApiError(_error_message(payload, response.status), status=response.status)
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise EvnApiError("Cannot connect to EVN") from err
 
@@ -249,26 +263,69 @@ class EvnClient:
                 self._session,
                 "POST",
                 f"{NATIONAL_BASE_URL}/auth/refresh",
-                self._headers(self.state.access_token),
+                self._headers(None),
                 body,
             )
+        except EvnAuthenticationError as err:
+            raise EvnRefreshExpiredError("EVN refresh credential expired") from err
         except EvnApiError as err:
-            # EVN uses non-401 statuses (observed 417) for expired refresh
-            # tokens. Keep upstream detail out of HA entity attributes/logs and
-            # let the coordinator trigger its normal config-entry reauth flow.
-            raise EvnAuthenticationError("EVN session expired; reauthenticate this integration") from err
+            if err.status is not None:
+                _LOGGER.debug("EVN refresh request failed with HTTP status %s", err.status)
+            if err.status in (401, 417):
+                raise EvnRefreshExpiredError("EVN refresh credential expired") from err
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise EvnApiError("Cannot connect to EVN") from err
         content = payload.get("data", payload) if isinstance(payload, dict) else {}
         token = content.get("token") or content.get("accessToken")
         if not token:
-            raise EvnAuthenticationError("EVN refresh did not return an access token")
+            raise EvnRefreshExpiredError("EVN refresh credential expired")
         self.state.access_token = str(token)
         self.state.refresh_token = content.get("refreshToken") or content.get("refresh_token") or self.state.refresh_token
 
+    def _needs_proactive_refresh(self) -> bool:
+        """Refresh shortly before expiry without trusting JWT contents otherwise."""
+        expiry = _jwt_claims(self.state.access_token).get("exp")
+        try:
+            return float(expiry) <= dt_util.now().timestamp() + 120
+        except (TypeError, ValueError):
+            return False
+
+    def _replace_state(self, state: SessionState) -> None:
+        """Keep the coordinator's state object current after a silent login."""
+        self.state.username = state.username
+        self.state.access_token = state.access_token
+        self.state.refresh_token = state.refresh_token
+        self.state.device_id = state.device_id
+        self.state.primary_customer_code = state.primary_customer_code
+        self.state.current_customer_code = state.current_customer_code
+
+    async def _async_silent_login(self) -> None:
+        """Restore a dead refresh session once, retaining roster and device id."""
+        if not self._password or not self.state.username:
+            raise EvnAuthenticationError("EVN session expired")
+        try:
+            state, login_roster = await self._async_login_with_roster(
+                self._session, self.state.username, self._password, self.state.device_id,
+            )
+        except EvnAuthenticationError:
+            raise
+        self._replace_state(state)
+        self._meter_points = merge_linked_customer_meter_points(self._meter_points, login_roster)
+
+    async def _async_restore_after_auth_failure(self) -> None:
+        try:
+            await self._async_refresh()
+        except EvnRefreshExpiredError:
+            await self._async_silent_login()
+
     async def _async_request(self, method: str, url: str, body: dict[str, Any] | None = None) -> Any:
+        if self._needs_proactive_refresh():
+            await self._async_restore_after_auth_failure()
         try:
             return await self._request_raw(self._session, method, url, self._headers(self.state.access_token), body)
         except EvnAuthenticationError:
-            await self._async_refresh()
+            await self._async_restore_after_auth_failure()
             return await self._request_raw(self._session, method, url, self._headers(self.state.access_token), body)
 
     async def _async_switch_customer(self, customer_code: str) -> None:

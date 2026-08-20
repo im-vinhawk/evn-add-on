@@ -65,6 +65,37 @@ def normalize_linked_customer_meter_points(value: Any) -> dict[str, str]:
     return normalized
 
 
+def selected_customer_codes(
+    configured_codes: list[str],
+    selected_codes: Any,
+    primary_customer_code: Any,
+) -> list[str]:
+    """Return the persisted aggregate scope, safely bounded to the roster.
+
+    Existing entries have no selection option, so their established full-roster
+    total remains in place until a user saves an explicit selection. The
+    primary account is always included once a selection is explicit; this keeps
+    the account that owns the EVN session in every aggregate product scope.
+    """
+    configured: list[str] = []
+    for raw_code in configured_codes:
+        code = normalize_customer_code(raw_code)
+        if code and code not in configured:
+            configured.append(code)
+    if not configured:
+        return []
+    primary = normalize_customer_code(primary_customer_code)
+    if not isinstance(selected_codes, (list, tuple, set)):
+        return configured
+    selected = {
+        code for raw_code in selected_codes
+        if (code := normalize_customer_code(raw_code)) in configured
+    }
+    if primary in configured:
+        selected.add(primary)
+    return [code for code in configured if code in selected]
+
+
 def extract_linked_customer_meter_points(payload: Any) -> dict[str, str]:
     """Extract code/meter pairs from EVN's root, data and nested list shapes.
 
@@ -136,7 +167,7 @@ def extract_customer_codes_from_entity_unique_ids(
 
 @dataclass(slots=True)
 class SessionState:
-    """The token-only authentication state persisted by Home Assistant."""
+    """Authentication state persisted by Home Assistant, excluding passwords."""
 
     username: str
     access_token: str
@@ -159,6 +190,7 @@ class SessionState:
     def as_dict(self) -> dict[str, str | None]:
         """Return token state suitable for the Home Assistant config entry store."""
         return {
+            "username": self.username,
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "device_id": self.device_id,

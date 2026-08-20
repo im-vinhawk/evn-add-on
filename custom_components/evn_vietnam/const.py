@@ -8,6 +8,7 @@ DOMAIN = "evn_vietnam"
 NAME = "EVN Vietnam"
 
 CONF_CUSTOMER_CODES = "customer_codes"
+CONF_SELECTED_CUSTOMER_CODES = "selected_customer_codes"
 CONF_USERNAME = "username"
 CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"
@@ -18,8 +19,10 @@ CONF_LINKED_CUSTOMERS = "linked_customers"
 CONF_SCAN_INTERVAL = "scan_interval"
 
 DEFAULT_SCAN_INTERVAL = timedelta(minutes=30)
+SESSION_KEEPALIVE_INTERVAL = timedelta(minutes=8)
 DEFAULT_TIMEOUT = 20
 DAILY_HISTORY_DAYS = 31
+CARD_MODULE_URL = f"/{DOMAIN}/evn-vietnam-energy-card.js"
 
 NATIONAL_BASE_URL = "https://cskh.evn.com.vn/cskh/v1"
 REGIONAL_GATEWAYS: dict[str, str] = {
