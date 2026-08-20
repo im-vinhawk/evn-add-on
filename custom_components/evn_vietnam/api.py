@@ -51,6 +51,34 @@ def _error_message(payload: Any, status: int) -> str:
     return f"HTTP {status}"
 
 
+def _extract_rows(
+    payload: Any,
+    envelope_keys: tuple[str, ...],
+    root_row_fields: tuple[tuple[str, ...], ...],
+) -> list[Any]:
+    """Unwrap EVN list envelopes and retain only a plausible root-level row."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    saw_envelope = False
+    for key in envelope_keys:
+        if key not in payload:
+            continue
+        saw_envelope = True
+        candidate = payload[key]
+        if not candidate:
+            continue
+        if isinstance(candidate, list):
+            return candidate
+        if isinstance(candidate, dict):
+            return [candidate]
+        return []
+    if saw_envelope:
+        return []
+    return [payload] if all(any(key in payload for key in fields) for fields in root_row_fields) else []
+
+
 class EvnClient:
     """National-auth plus regional-meter-query EVN client.
 
@@ -226,7 +254,14 @@ class EvnClient:
         meter_point = await self._async_meter_point(customer_code)
         body = {"MA_KHANG": customer_code, "MA_DDO": meter_point, "TU_NGAY": start.strftime("%d/%m/%Y"), "DEN_NGAY": end.strftime("%d/%m/%Y")}
         payload = await self._async_request("POST", self._regional_url(customer_code, "tracuu/diennangngay"), body)
-        rows = payload if isinstance(payload, list) else payload.get("data", payload.get("items", [])) if isinstance(payload, dict) else []
+        rows = _extract_rows(
+            payload,
+            ("data", "danhSachSanLuong", "danhSachDienNang", "items", "sanLuong"),
+            (
+                ("NGAY", "NGAY_HTHI", "ngay", "ngayGhi", "date", "ngayDoc"),
+                ("DIEN_TTHU", "dienTthu", "sanLuong", "consumption"),
+            ),
+        )
         return normalize_daily(row for row in rows if isinstance(row, dict))
 
     async def _async_readings(self, customer_code: str, start: date, end: date, meter_point: str) -> list[dict[str, Any]]:
@@ -237,7 +272,14 @@ class EvnClient:
     async def _async_monthly_fallback(self, customer_code: str, month: int, year: int, meter_point: str) -> float:
         body = {"MA_KHANG": customer_code, "MA_DDO": meter_point, "TU_THANG_NAM": f"01/{year}", "DEN_THANG_NAM": f"{month:02d}/{year}"}
         payload = await self._async_request("POST", self._regional_url(customer_code, "tracuu/diennangthang"), body)
-        rows = payload if isinstance(payload, list) else payload.get("data", payload.get("items", [])) if isinstance(payload, dict) else []
+        rows = _extract_rows(
+            payload,
+            ("data", "danhSachSanLuong", "danhSachDienNang", "items", "sanLuong"),
+            (
+                ("THANG", "thang"),
+                ("DIEN_TTHU", "dienTthu", "sanLuong", "consumption"),
+            ),
+        )
         for row in rows:
             if isinstance(row, dict) and int(as_float(row.get("THANG", row.get("thang", 0)))) == month:
                 return as_float(row.get("DIEN_TTHU", row.get("sanLuong", 0)))
@@ -276,5 +318,13 @@ class EvnClient:
         await self._async_switch_customer(customer_code)
         body = {"MA_KHANG": customer_code, "TU_THANG_NAM": f"01/{year}", "DEN_THANG_NAM": f"12/{year}"}
         payload = await self._async_request("POST", self._regional_url(customer_code, "tracuu/lichsu-hoadon"), body)
-        rows = payload if isinstance(payload, list) else payload.get("data", payload.get("items", [])) if isinstance(payload, dict) else []
+        rows = _extract_rows(
+            payload,
+            ("data", "danhSachHoaDon", "bills", "items"),
+            (
+                ("THANG", "thang", "month"),
+                ("NAM", "nam", "year"),
+                ("TONG_TIEN", "totalAmount"),
+            ),
+        )
         return normalize_bills(row for row in rows if isinstance(row, dict))
