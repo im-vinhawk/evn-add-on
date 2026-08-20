@@ -1,0 +1,27 @@
+title: EVN Energy
+views:
+  - title: EVN Energy
+    path: evn-energy
+    type: panel
+    cards:
+      - type: custom:evn-vietnam-energy-card
+        title: EVN Energy
+        # Replace these placeholders with entity IDs from Developer Tools → States.
+        entity: sensor.evn_total_current_month_consumption
+        cost_entity: sensor.evn_total_estimated_current_month_cost
+        today_entity: sensor.evn_total_today_s_consumption
+        yesterday_entity: sensor.evn_total_yesterday_s_consumption
+        color_scheme: auto
+        customer_views:
+          - id: aggregate
+            label: Total
+            entity: sensor.evn_total_current_month_consumption
+            cost_entity: sensor.evn_total_estimated_current_month_cost
+            today_entity: sensor.evn_total_today_s_consumption
+            yesterday_entity: sensor.evn_total_yesterday_s_consumption
+          - id: meter_one
+            label: Customer 1
+            entity: sensor.evn_pb000001_current_month_consumption
+            cost_entity: sensor.evn_pb000001_estimated_current_month_cost
+            today_entity: sensor.evn_pb000001_today_s_consumption
+            yesterday_entity: sensor.evn_pb000001_yesterday_s_consumption
