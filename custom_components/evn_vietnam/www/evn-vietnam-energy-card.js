@@ -11,13 +11,6 @@ class EvnVietnamEnergyCard extends HTMLElement {
     this._hass = null;
   }
 
-  static get properties() {
-    return {
-      hass: {},
-      config: {},
-    };
-  }
-
   setConfig(config) {
     const providedConfig = config && typeof config === 'object' ? config : {};
     const entity = typeof providedConfig.entity === 'string' ? providedConfig.entity.trim() : '';
@@ -41,6 +34,14 @@ class EvnVietnamEnergyCard extends HTMLElement {
     if (!oldHass || this._shouldUpdate(oldHass, hass)) {
       this.render();
     }
+  }
+
+  get hass() {
+    return this._hass;
+  }
+
+  get config() {
+    return this._config;
   }
 
   _shouldUpdate(oldHass, newHass) {
@@ -927,8 +928,10 @@ if (!customElements.get('evn-vietnam-energy-card')) {
 
 // Register with Home Assistant Card Picker
 window.customCards = window.customCards || [];
-window.customCards.push({
-  type: 'evn-vietnam-energy-card',
-  name: 'EVN Vietnam Energy Card',
-  description: 'Thẻ theo dõi sản lượng và tiền điện EVN Việt Nam dành cho Home Assistant.',
-});
+if (!window.customCards.some((card) => card.type === 'evn-vietnam-energy-card')) {
+  window.customCards.push({
+    type: 'evn-vietnam-energy-card',
+    name: 'EVN Vietnam Energy Card',
+    description: 'Thẻ theo dõi sản lượng và tiền điện EVN Việt Nam dành cho Home Assistant.',
+  });
+}

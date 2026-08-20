@@ -69,6 +69,11 @@ vm.runInNewContext(
 
 const Card = registered.get('evn-vietnam-energy-card');
 assert.ok(Card, 'the custom card must register itself');
+assert.equal(
+  Object.getOwnPropertyDescriptor(Card, 'properties'),
+  undefined,
+  'a vanilla HTMLElement card must not advertise Lit reactive properties',
+);
 
 const incompleteCard = new Card();
 assert.doesNotThrow(
@@ -82,33 +87,36 @@ assert.ok(
 );
 
 const validCard = new Card();
+const validHass = {
+  states: {
+    'sensor.aggregate_month': {
+      state: '4.2',
+      attributes: {
+        customer_code: '__aggregate__',
+        selected_customer_codes: ['a', 'b'],
+        daily_history: [{ date: '2026-08-20', consumption: 4.2 }],
+      },
+    },
+    'sensor.aggregate_cost': {
+      state: '10000',
+      attributes: {
+        customer_code: '__aggregate__',
+        selected_customer_codes: ['a', 'b'],
+        bills: [],
+      },
+    },
+  },
+};
 assert.doesNotThrow(() => {
   validCard.setConfig({
     type: 'custom:evn-vietnam-energy-card',
     entity: 'sensor.aggregate_month',
     cost_entity: 'sensor.aggregate_cost',
   });
-  validCard.hass = {
-    states: {
-      'sensor.aggregate_month': {
-        state: '4.2',
-        attributes: {
-          customer_code: '__aggregate__',
-          selected_customer_codes: ['a', 'b'],
-          daily_history: [{ date: '2026-08-20', consumption: 4.2 }],
-        },
-      },
-      'sensor.aggregate_cost': {
-        state: '10000',
-        attributes: {
-          customer_code: '__aggregate__',
-          selected_customer_codes: ['a', 'b'],
-          bills: [],
-        },
-      },
-    },
-  };
+  validCard.hass = validHass;
 }, 'a valid aggregate configuration must render without throwing');
+assert.equal(validCard.hass, validHass, 'Home Assistant wrappers must be able to read back hass');
+assert.equal(validCard.config.entity, 'sensor.aggregate_month', 'Home Assistant wrappers must be able to read back config');
 
 function containsTag(node, tagName) {
   return node.children.some((child) => child.tagName === tagName || containsTag(child, tagName));
