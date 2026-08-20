@@ -19,17 +19,16 @@ class EvnVietnamEnergyCard extends HTMLElement {
   }
 
   setConfig(config) {
-    if (!config) {
-      throw new Error('Cấu hình card không hợp lệ.');
-    }
-    if (!config.entity || typeof config.entity !== 'string' || !config.entity.trim()) {
-      throw new Error('Bạn cần khai báo "entity" (sensor sản lượng tháng) trong cấu hình card.');
-    }
+    const providedConfig = config && typeof config === 'object' ? config : {};
+    const entity = typeof providedConfig.entity === 'string' ? providedConfig.entity.trim() : '';
     this._config = {
       title: 'Điện năng EVN',
       color_scheme: 'auto',
-      ...config,
+      ...providedConfig,
     };
+    this._configError = entity
+      ? null
+      : 'Chọn entity sản lượng tháng của EVN để hiển thị thẻ này.';
     if (this._hass) {
       this.render();
     }
@@ -118,6 +117,12 @@ class EvnVietnamEnergyCard extends HTMLElement {
     const cardEl = document.createElement('ha-card');
     const cardContent = document.createElement('div');
     cardContent.className = 'card-content';
+
+    if (this._configError) {
+      cardEl.appendChild(this._createErrorBox(this._configError));
+      this.shadowRoot.appendChild(cardEl);
+      return;
+    }
 
     if (!this._hass || !this._hass.states) {
       cardEl.appendChild(this._createStateBox('Đang kết nối với Home Assistant...'));
