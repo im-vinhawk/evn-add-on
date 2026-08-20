@@ -30,6 +30,9 @@
         "data": {
           "customer_codes": "Additional customer codes already linked in the EVN app (comma separated)",
           "scan_interval": "Update interval (minutes)"
+        },
+        "error": {
+          "invalid_customer_code": "Enter only comma-separated EVN customer codes."
         }
       }
     }
