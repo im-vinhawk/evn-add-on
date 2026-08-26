@@ -10,7 +10,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
-from .const import CARD_MODULE_URL, CONF_LINKED_CUSTOMERS, DOMAIN
+from .const import CARD_FILENAME, CARD_MODULE_URL, CONF_LINKED_CUSTOMERS, DOMAIN
 from .coordinator import EvnDataUpdateCoordinator
 from .models import (
     extract_customer_codes_from_entity_unique_ids,
@@ -24,17 +24,34 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Serve and register the Lovelace card for every dashboard mode."""
     from homeassistant.components.frontend import add_extra_js_url
 
+    card_dir = Path(__file__).parent / "www"
     await hass.http.async_register_static_paths([
         StaticPathConfig(
             url_path=f"/{DOMAIN}",
-            path=str(Path(__file__).parent / "www"),
+            path=str(card_dir),
             cache_headers=False,
         )
     ])
     # YAML lovelace.resources is ignored while the default dashboard is
     # storage-mode. extra_module_url loads the card without a UI resource.
-    add_extra_js_url(hass, CARD_MODULE_URL)
+    #
+    # The URL carries the card file's mtime so that shipping a new card always
+    # produces a URL the browser has never seen. A fixed URL lets a browser
+    # keep serving a cached older build until someone hard-reloads, and this
+    # must be the integration's only registration of the card: a second
+    # registration under a different query string is a second module instance
+    # with its own cache entry, which reintroduces the same staleness.
+    stamp = await hass.async_add_executor_job(_card_version, card_dir)
+    add_extra_js_url(hass, f"{CARD_MODULE_URL}?v={stamp}")
     return True
+
+
+def _card_version(card_dir: Path) -> int:
+    """Return the card bundle's mtime, or 0 when it cannot be read."""
+    try:
+        return int((card_dir / CARD_FILENAME).stat().st_mtime)
+    except OSError:
+        return 0
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

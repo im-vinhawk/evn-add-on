@@ -14,11 +14,20 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import ATTRIBUTION, DOMAIN
 from .coordinator import EvnDataUpdateCoordinator, aggregate_customer_codes, configured_customer_codes
 
+# State classes are constrained by the device class: `energy` accepts only
+# `total`/`total_increasing`, `monetary` only `total`. `measurement` is rejected
+# outright, which both floods the log and blocks long-term statistics.
+#
+# Today's and the current month's consumption are meters that fall back to zero
+# at each period boundary, which is exactly what `total_increasing` models.
+# Yesterday's consumption is a look-back figure, not a meter -- it can move
+# down as well as up -- so it carries no state class and is kept as plain state
+# history.
 _METRICS: tuple[tuple[str, str, SensorDeviceClass | None, str | None, SensorStateClass | None], ...] = (
-    ("today_consumption", "Today's consumption", SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.MEASUREMENT),
-    ("yesterday_consumption", "Yesterday's consumption", SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.MEASUREMENT),
-    ("current_month_consumption", "Current month consumption", SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.MEASUREMENT),
-    ("current_month_amount", "Estimated current month cost", SensorDeviceClass.MONETARY, "VND", SensorStateClass.MEASUREMENT),
+    ("today_consumption", "Today's consumption", SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.TOTAL_INCREASING),
+    ("yesterday_consumption", "Yesterday's consumption", SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, None),
+    ("current_month_consumption", "Current month consumption", SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.TOTAL_INCREASING),
+    ("current_month_amount", "Estimated current month cost", SensorDeviceClass.MONETARY, "VND", SensorStateClass.TOTAL),
     ("latest_index", "Latest meter index", None, None, None),
 )
 
