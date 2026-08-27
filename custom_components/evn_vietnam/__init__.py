@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from homeassistant.components.http import StaticPathConfig
@@ -57,7 +58,16 @@ def _card_version(card_dir: Path) -> int:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up EVN sensors from a config entry."""
     _restore_roster_from_legacy_entities(hass, entry)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # The coordinator persists refreshed tokens and the linked-customer roster
+    # into entry.data on nearly every update cycle (see coordinator.py
+    # _persist_changed_tokens), and add_update_listener fires for any entry
+    # write, options or data. Binding the listener to a snapshot of options
+    # taken here keeps that frequent data-only churn from reloading the
+    # integration; only an actual options change (customer codes, scan
+    # interval) still triggers a reload.
+    entry.async_on_unload(
+        entry.add_update_listener(_create_options_update_listener(dict(entry.options)))
+    )
     coordinator = EvnDataUpdateCoordinator(hass, entry)
     entry.async_on_unload(coordinator.async_shutdown)
     await coordinator.async_config_entry_first_refresh()
@@ -93,9 +103,25 @@ def _restore_roster_from_legacy_entities(hass: HomeAssistant, entry: ConfigEntry
         )
 
 
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload when options add or remove customer codes."""
-    await hass.config_entries.async_reload(entry.entry_id)
+def _create_options_update_listener(
+    options_snapshot: dict,
+) -> Callable[[HomeAssistant, ConfigEntry], Awaitable[None]]:
+    """Build an update listener that reloads only when options actually changed.
+
+    entry.data is rewritten frequently (session tokens, linked-customer
+    roster) and add_update_listener has no way to tell data writes apart
+    from options writes. Comparing against the options captured at setup
+    time restores that distinction: a data-only write is a no-op here, while
+    adding/removing a customer code or changing scan_interval in the UI
+    still reloads the integration as before.
+    """
+
+    async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+        if dict(entry.options) == options_snapshot:
+            return
+        await hass.config_entries.async_reload(entry.entry_id)
+
+    return _async_update_listener
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
