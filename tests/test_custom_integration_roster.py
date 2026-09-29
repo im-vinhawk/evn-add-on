@@ -110,11 +110,14 @@ def test_diagnostics_redacts_credentials_and_tokens(modules) -> None:
     sys.modules["homeassistant.helpers"] = helpers
     sys.modules["homeassistant.helpers.redact"] = redact
     diagnostics = _load_module("diagnostics")
-    entry = types.SimpleNamespace(data={
+    entry = types.SimpleNamespace(entry_id="entry-1", data={
         "username": "login-value", "password": "secret-pass", "access_token": "access-value", "refresh_token": "refresh-value",
     })
+    coordinator = types.SimpleNamespace(shapes={"bills": {"THANG": "int/1d"}})
+    hass = types.SimpleNamespace(data={"evn_vietnam": {"entry-1": coordinator}})
 
-    result = asyncio.run(diagnostics.async_get_config_entry_diagnostics(None, entry))
+    result = asyncio.run(diagnostics.async_get_config_entry_diagnostics(hass, entry))
+    assert result["shapes"] == {"bills": {"THANG": "int/1d"}}
     rendered = repr(result)
     for secret in ("login-value", "secret-pass", "access-value", "refresh-value"):
         assert secret not in rendered

@@ -14,7 +14,7 @@ from uuid import uuid4
 import aiohttp
 from homeassistant.util import dt as dt_util
 
-from .calculation import as_float, calculate_tier_cost, normalize_bills, normalize_daily
+from .calculation import as_float, calculate_tier_cost, describe_shape, normalize_bills, normalize_daily
 from .const import DAILY_HISTORY_DAYS, DEFAULT_TIMEOUT, NATIONAL_BASE_URL, REGIONAL_GATEWAYS
 from .models import (
     SessionState,
@@ -125,6 +125,8 @@ class EvnClient:
             if meter_point
         }
         self._password = password
+        # Key/type-only description of the latest raw rows, for diagnostics.
+        self.last_shapes: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def new_device_id() -> str:
@@ -394,6 +396,11 @@ class EvnClient:
             raise EvnMeterPointError("EVN meter point is unavailable for configured customer") from err
         raise EvnMeterPointError("EVN did not return a meter point for configured customer")
 
+    def _record_shape(self, endpoint: str, rows: list[Any]) -> None:
+        first = next((row for row in rows if isinstance(row, dict)), None)
+        if first is not None:
+            self.last_shapes[endpoint] = describe_shape(first)
+
     async def async_daily(self, customer_code: str, start: date, end: date) -> list[dict[str, Any]]:
         customer_code = customer_code.strip().upper()
         meter_point = await self._async_meter_point(customer_code)
@@ -407,6 +414,7 @@ class EvnClient:
                 ("DIEN_TTHU", "dienTthu", "sanLuong", "consumption"),
             ),
         )
+        self._record_shape("daily", rows)
         return normalize_daily(row for row in rows if isinstance(row, dict))
 
     async def _async_readings(self, customer_code: str, start: date, end: date, meter_point: str) -> list[dict[str, Any]]:
@@ -472,4 +480,5 @@ class EvnClient:
                 ("TONG_TIEN", "totalAmount"),
             ),
         )
+        self._record_shape("bills", rows)
         return normalize_bills(row for row in rows if isinstance(row, dict))

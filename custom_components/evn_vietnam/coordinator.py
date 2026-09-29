@@ -82,6 +82,11 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass, self._async_keepalive_session, SESSION_KEEPALIVE_INTERVAL
         )
 
+    @property
+    def shapes(self) -> dict[str, dict[str, Any]]:
+        """Key/type-only description of the latest raw EVN rows."""
+        return self._client.last_shapes
+
     async def _async_update_data(self) -> dict[str, Any]:
         # Customer switching mutates the EVN JWT. Keep all update paths strictly
         # serial even when HA receives simultaneous refresh requests.

@@ -165,3 +165,31 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
 def _period_sort_key(period: str) -> tuple[int, int]:
     match = _PERIOD_RE.search(period)
     return (int(match.group(2)), int(match.group(1))) if match else (0, 0)
+
+
+_DATE_DMY = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+_DATE_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _describe_value(value: Any) -> Any:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return f"{type(value).__name__}/{len(str(int(abs(value))))}d"
+    if isinstance(value, str):
+        kind = "/date-dmy" if _DATE_DMY.match(value) else "/date-iso" if _DATE_ISO.match(value) else ""
+        return f"str/len{len(value)}{kind}"
+    if isinstance(value, (list, tuple)):
+        return f"list/{len(value)}"
+    if isinstance(value, Mapping):
+        return describe_shape(value)
+    return type(value).__name__
+
+
+def describe_shape(row: Any) -> dict[str, Any]:
+    """Describe key names and value types of a raw EVN row, never the values."""
+    if not isinstance(row, Mapping):
+        return {}
+    return {str(key): _describe_value(value) for key, value in row.items()}
