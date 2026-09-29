@@ -56,7 +56,7 @@ The card uses the selected month sensor's `daily_history`. Check that sensor fir
 
 - Never commit or share passwords, tokens, JWTs, Home Assistant backups, raw EVN responses, customer names, phones, or customer rosters.
 - Use Home Assistant's authenticated UI and API for inspection; do not expose the card path through an unauthenticated public reverse proxy.
-- Diagnostics redact credentials and session tokens.
+- Diagnostics redact credentials, session tokens and the device id, and replace every customer code with an alias (`customer_1`, …), so the file is safe to attach to an issue.
 
 ## Calculation contract
 

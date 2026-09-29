@@ -56,7 +56,7 @@ Card đọc `daily_history` từ month sensor đang chọn. Nếu biểu đồ t
 
 - Không commit hoặc chia sẻ mật khẩu, token, JWT, Home Assistant backup, raw EVN response, tên khách hàng, số điện thoại hoặc danh sách mã khách hàng.
 - Chỉ kiểm tra qua UI/API đã xác thực của Home Assistant; không đưa đường dẫn card ra reverse proxy công khai chưa có xác thực.
-- Diagnostics đã che thông tin đăng nhập và token phiên.
+- Diagnostics đã che thông tin đăng nhập, token phiên và device id; mọi mã khách hàng được thay bằng bí danh (`customer_1`, …) nên có thể đính kèm khi báo lỗi.
 
 ## Hợp đồng tính toán
 

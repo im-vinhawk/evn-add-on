@@ -222,3 +222,30 @@ def normalize_aliases(value: Any, valid_codes: Iterable[str]) -> dict[str, str]:
         if code in valid and alias:
             aliases[code] = alias
     return aliases
+
+
+def anonymize_customer_codes(data: Any) -> dict[str, Any]:
+    """Return a copy of config-entry data with each customer code replaced by a stable alias.
+
+    Diagnostics get attached to public issues. `async_redact_data` only blanks
+    values, but `linked_customers` uses codes as keys and each meter point
+    starts with its code, so codes are swapped for `customer_N` everywhere.
+    The meter-point suffix is kept so roster problems stay diagnosable.
+    """
+    out = dict(data) if isinstance(data, dict) else {}
+    linked = normalize_linked_customer_meter_points(out.get("linked_customers"))
+    primary = normalize_customer_code(out.get("primary_customer_code"))
+    current = normalize_customer_code(out.get("current_customer_code"))
+    ordered = [code for code in (primary, *linked, current) if code]
+    aliases = {code: f"customer_{index}" for index, code in enumerate(dict.fromkeys(ordered), start=1)}
+    for key in ("primary_customer_code", "current_customer_code"):
+        if out.get(key):
+            out[key] = aliases.get(normalize_customer_code(out[key]), "**REDACTED**")
+    if "linked_customers" in out:
+        out["linked_customers"] = {
+            aliases[code]: (
+                f"{aliases[code]}+{meter_point[len(code):]}" if meter_point.startswith(code) else "**REDACTED**"
+            )
+            for code, meter_point in linked.items()
+        }
+    return out

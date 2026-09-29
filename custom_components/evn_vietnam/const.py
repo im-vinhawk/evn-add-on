@@ -18,6 +18,11 @@ CONF_CURRENT_CUSTOMER_CODE = "current_customer_code"
 CONF_LINKED_CUSTOMERS = "linked_customers"
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_CUSTOMER_ALIASES = "customer_aliases"
+# Keys blanked in diagnostics. Customer codes are aliased separately
+# (models.anonymize_customer_codes) because they also appear as dict keys.
+DIAGNOSTICS_TO_REDACT = frozenset(
+    {CONF_USERNAME, "password", CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_DEVICE_ID}
+)
 
 DEFAULT_SCAN_INTERVAL = timedelta(minutes=30)
 SESSION_KEEPALIVE_INTERVAL = timedelta(minutes=8)
