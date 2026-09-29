@@ -172,6 +172,25 @@ class EvnVietnamEnergyCard extends HTMLElement {
     }
   }
 
+  _codeLabel(alias, code) {
+    // Full customer code is the identity; a nickname is a prefix, never a replacement.
+    const nick = typeof alias === 'string' ? alias.trim() : '';
+    const id = typeof code === 'string' ? code.trim() : '';
+    if (nick && id) return `${nick} (${id})`;
+    return nick || id;
+  }
+
+  _viewLabel(view) {
+    // Priority: hand-written label (not a generic "Mã KH n") > nickname (code) > full code.
+    const generic = /^\s*(Mã\s*KH|Khách\s*hàng)\s*\d*\s*$/i;
+    if (view.label && !generic.test(view.label)) return view.label;
+    const state = this._hass && this._hass.states ? this._hass.states[view.entity] : null;
+    const attrs = state && typeof state.attributes === 'object' && state.attributes !== null ? state.attributes : null;
+    if (!attrs || typeof attrs.customer_code !== 'string' || !attrs.customer_code.trim()) return view.label;
+    if (attrs.customer_code === '__aggregate__') return 'Tổng';
+    return this._codeLabel(attrs.customer_alias, attrs.customer_code) || view.label;
+  }
+
   _formatKwh(val) {
     if (val === null || val === undefined || val === '') return '—';
     const num = Number(val);
@@ -291,6 +310,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       ? mainEntity.attributes
       : {};
     const customerCode = attrs.customer_code || '—';
+    const customerAlias = typeof attrs.customer_alias === 'string' ? attrs.customer_alias : '';
     const selectedCodes = Array.isArray(attrs.selected_customer_codes) ? attrs.selected_customer_codes : [];
     const successfulCodes = Array.isArray(attrs.successful_customer_codes) ? attrs.successful_customer_codes : [];
     const latestReading = attrs.latest_reading !== undefined && attrs.latest_reading !== null ? attrs.latest_reading : null;
@@ -334,7 +354,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       : costBills;
 
     // 1. Header Section
-    cardContent.appendChild(this._renderHeader(customerCode, selectedCodes, successfulCodes, latestReading, isPartial, views, currentViewId));
+    cardContent.appendChild(this._renderHeader(customerCode, selectedCodes, successfulCodes, latestReading, isPartial, views, currentViewId, customerAlias));
 
     // 2. Partial Warning & Error Banners
     if (isPartial) {
@@ -429,7 +449,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     return true;
   }
 
-  _renderHeader(customerCode, selectedCodes, successfulCodes, latestReading, isPartial, views, activeViewId) {
+  _renderHeader(customerCode, selectedCodes, successfulCodes, latestReading, isPartial, views, activeViewId, customerAlias = '') {
     const header = document.createElement('div');
     header.className = 'card-header';
 
@@ -454,7 +474,9 @@ class EvnVietnamEnergyCard extends HTMLElement {
       }
       badgeEl.textContent = `Tổng hợp (${countStr} mã KH)`;
     } else {
-      badgeEl.textContent = customerCode !== '—' ? `Mã KH: ${customerCode}` : 'EVN Vietnam';
+      badgeEl.textContent = customerCode === '—'
+        ? 'EVN Vietnam'
+        : (customerAlias.trim() ? this._codeLabel(customerAlias, customerCode) : `Mã KH: ${customerCode}`);
     }
     titleBox.appendChild(badgeEl);
 
@@ -482,7 +504,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       views.forEach((v) => {
         const option = document.createElement('option');
         option.value = v.id;
-        option.textContent = v.label || v.id;
+        option.textContent = this._viewLabel(v) || v.id;
         if (v.id === activeViewId) {
           option.selected = true;
         }

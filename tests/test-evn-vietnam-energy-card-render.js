@@ -394,3 +394,85 @@ const sparseSeries = sparseCard._calendarBars(sparseHistory, 30);
 sparseAxisLabels.forEach((label, idx) => {
   assert.equal(label.textContent, expectedAxisLabel(sparseCard, sparseSeries, idx), `sparse label ${idx} must describe its own calendar column`);
 });
+
+// 5. Dropdown labels: manual label > nickname (code) > full customer code
+function optionLabels(card) {
+  const select = findNode(card.shadowRoot, (n) => n.className === 'view-selector');
+  assert.ok(select, 'a multi-view card must render the selector');
+  return select.children.map((o) => o.textContent);
+}
+function codeState(code, alias) {
+  const attributes = { customer_code: code, daily_history: [] };
+  if (alias !== undefined) attributes.customer_alias = alias;
+  return { state: '1', attributes };
+}
+const labelCard = new Card();
+labelCard.setConfig({
+  type: 'custom:evn-vietnam-energy-card',
+  entity: 'sensor.agg',
+  customer_views: [
+    { id: 'aggregate', entity: 'sensor.agg' },
+    { id: 'a', label: 'Mã KH 1', entity: 'sensor.a' },
+    { id: 'b', label: 'Khách hàng 2', entity: 'sensor.b' },
+    { id: 'c', label: 'Nhà kho', entity: 'sensor.c' },
+    { id: 'd', label: 'Mã KH 4', entity: 'sensor.missing' },
+  ],
+});
+labelCard.hass = {
+  states: {
+    'sensor.agg': { state: '1', attributes: { customer_code: '__aggregate__', selected_customer_codes: ['PB000001'], daily_history: [] } },
+    'sensor.a': codeState('PB000001', 'Nhà chính'),
+    'sensor.b': codeState('PB000002', ''),
+    'sensor.c': codeState('PB000003', 'Bị ghi đè'),
+  },
+};
+assert.deepEqual(
+  optionLabels(labelCard),
+  ['Tổng', 'Nhà chính (PB000001)', 'PB000002', 'Nhà kho', 'Mã KH 4'],
+  'generic label + nickname -> "nickname (code)"; no nickname -> full code; manual label wins; missing entity keeps the old fallback',
+);
+
+// Labels follow later hass updates (alias edited in Options)
+labelCard.hass = {
+  states: {
+    ...labelCard.hass.states,
+    'sensor.a': codeState('PB000001', 'Nhà phụ'),
+  },
+};
+assert.equal(optionLabels(labelCard)[1], 'Nhà phụ (PB000001)', 'labels must be recomputed on each hass update');
+
+// Header badge shows nickname + full code
+const badgeCard = new Card();
+badgeCard.setConfig({ type: 'custom:evn-vietnam-energy-card', entity: 'sensor.a' });
+badgeCard.hass = { states: { 'sensor.a': codeState('PB000001', 'Nhà chính') } };
+assert.ok(
+  collectTextContents(badgeCard.shadowRoot).includes('Nhà chính (PB000001)'),
+  'header badge must show nickname with the full customer code',
+);
+const plainBadgeCard = new Card();
+plainBadgeCard.setConfig({ type: 'custom:evn-vietnam-energy-card', entity: 'sensor.a' });
+plainBadgeCard.hass = { states: { 'sensor.a': codeState('PB000001') } };
+assert.ok(
+  collectTextContents(plainBadgeCard.shadowRoot).includes('Mã KH: PB000001'),
+  'header badge without nickname keeps the code-only form',
+);
+
+// Bill table: missing kWh renders the placeholder, not 0
+const billCard = new Card();
+billCard.setConfig({ type: 'custom:evn-vietnam-energy-card', entity: 'sensor.a' });
+billCard.hass = {
+  states: {
+    'sensor.a': {
+      state: '1',
+      attributes: {
+        customer_code: 'PB000001',
+        daily_history: [],
+        monthly_history: [{ period: 'Tháng 8/2026', total_kwh: null, total_amount: 123000 }],
+      },
+    },
+  },
+};
+assert.ok(
+  !collectTextContents(billCard.shadowRoot).includes('0,0 kWh') && collectTextContents(billCard.shadowRoot).includes('—'),
+  'a bill without kWh must show the placeholder',
+);
