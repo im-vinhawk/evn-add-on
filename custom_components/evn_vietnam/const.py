@@ -17,6 +17,7 @@ CONF_PRIMARY_CUSTOMER_CODE = "primary_customer_code"
 CONF_CURRENT_CUSTOMER_CODE = "current_customer_code"
 CONF_LINKED_CUSTOMERS = "linked_customers"
 CONF_SCAN_INTERVAL = "scan_interval"
+CONF_CUSTOMER_ALIASES = "customer_aliases"
 
 DEFAULT_SCAN_INTERVAL = timedelta(minutes=30)
 SESSION_KEEPALIVE_INTERVAL = timedelta(minutes=8)

@@ -12,9 +12,10 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import EvnAuthenticationError, EvnClient, EvnError
-from .const import CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE, CONF_REFRESH_TOKEN, CONF_SELECTED_CUSTOMER_CODES, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_ALIASES, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE, CONF_REFRESH_TOKEN, CONF_SELECTED_CUSTOMER_CODES, DEFAULT_SCAN_INTERVAL, DOMAIN
 from .models import (
     merge_linked_customer_meter_points,
+    normalize_aliases,
     normalize_customer_code,
     normalize_linked_customer_meter_points,
     selected_customer_codes,
@@ -151,11 +152,13 @@ class EvnVietnamOptionsFlow(config_entries.OptionsFlow):
                     else CONF_CUSTOMER_CODES
                 ] = "invalid_customer_code"
             else:
-                return self.async_create_entry(title="", data={
+                self._pending = {
                     CONF_CUSTOMER_CODES: codes,
                     CONF_SELECTED_CUSTOMER_CODES: selection,
                     CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
-                })
+                }
+                self._alias_codes = configured_codes
+                return await self.async_step_aliases()
         options = self.config_entry.options
         configured_codes = list(normalize_linked_customer_meter_points(
             self.config_entry.data.get(CONF_LINKED_CUSTOMERS)
@@ -173,3 +176,13 @@ class EvnVietnamOptionsFlow(config_entries.OptionsFlow):
             vol.Required(CONF_SCAN_INTERVAL, default=options.get(CONF_SCAN_INTERVAL, int(DEFAULT_SCAN_INTERVAL.total_seconds() / 60))): vol.All(vol.Coerce(int), vol.Range(min=5, max=1440)),
         })
         return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
+
+    async def async_step_aliases(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
+        """Optional nickname per customer code; blank clears it. Stored locally only."""
+        codes = self._alias_codes
+        if user_input is not None:
+            aliases = normalize_aliases(user_input, codes)
+            return self.async_create_entry(title="", data={**self._pending, CONF_CUSTOMER_ALIASES: aliases})
+        current = normalize_aliases(self.config_entry.options.get(CONF_CUSTOMER_ALIASES), codes)
+        schema = vol.Schema({vol.Optional(code, default=current.get(code, "")): str for code in codes})
+        return self.async_show_form(step_id="aliases", data_schema=schema)

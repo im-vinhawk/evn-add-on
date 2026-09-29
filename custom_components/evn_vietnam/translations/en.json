@@ -35,6 +35,10 @@
         "error": {
           "invalid_customer_code": "Enter only comma-separated EVN customer codes."
         }
+      },
+      "aliases": {
+        "title": "Nicknames",
+        "description": "Nickname per customer code (optional, shown in the card; leave blank for none)"
       }
     }
   }

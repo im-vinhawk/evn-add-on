@@ -11,7 +11,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import ATTRIBUTION, DOMAIN
+from .const import ATTRIBUTION, CONF_CUSTOMER_ALIASES, DOMAIN
+from .models import normalize_aliases
 from .coordinator import EvnDataUpdateCoordinator, aggregate_customer_codes, configured_customer_codes
 
 # State classes are constrained by the device class: `energy` accepts only
@@ -75,6 +76,11 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
         if not item:
             return {"attribution": ATTRIBUTION}
         attrs: dict[str, Any] = {"attribution": ATTRIBUTION, "customer_code": self._customer_code}
+        if self._customer_code != "__aggregate__":
+            aliases = normalize_aliases(
+                self.coordinator.config_entry.options.get(CONF_CUSTOMER_ALIASES), [self._customer_code]
+            )
+            attrs["customer_alias"] = aliases.get(self._customer_code, "")
         if self._metric == "current_month_consumption":
             attrs["daily_history"] = item.get("daily_history", [])
             attrs["monthly_history"] = item.get("monthly_history", [])

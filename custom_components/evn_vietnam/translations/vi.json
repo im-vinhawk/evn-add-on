@@ -32,6 +32,10 @@
           "selected_customer_codes": "Mã khách hàng trong tổng hợp (luôn gồm mã tài khoản chính)",
           "scan_interval": "Chu kỳ cập nhật (phút)"
         }
+      },
+      "aliases": {
+        "title": "Biệt danh",
+        "description": "Biệt danh cho từng mã khách hàng (tùy chọn, hiển thị trên card; để trống nếu không dùng)"
       }
     }
   }

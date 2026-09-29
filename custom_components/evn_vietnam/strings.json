@@ -32,6 +32,10 @@
           "selected_customer_codes": "Customer codes included in the total (primary account is always included)",
           "scan_interval": "Update interval (minutes)"
         }
+      },
+      "aliases": {
+        "title": "Nicknames",
+        "description": "Nickname per customer code (optional, shown in the card; leave blank for none)"
       }
     }
   }

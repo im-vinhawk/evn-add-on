@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any
+from typing import Any, Iterable
 
 
 _CUSTOMER_CODE_KEYS = ("maKhachHang", "MA_KHANG", "customerCode", "makhachhang")
@@ -197,3 +197,28 @@ class SessionState:
             "primary_customer_code": self.primary_customer_code,
             "current_customer_code": self.current_customer_code,
         }
+
+
+ALIAS_MAX_LENGTH = 30
+_ALIAS_DROPPED = re.compile(r"[\x00-\x1f\x7f<>]")
+
+
+def normalize_alias(value: Any) -> str:
+    """Return a display nickname: no control chars or angle brackets, trimmed, max 30 chars."""
+    if not isinstance(value, str):
+        return ""
+    return _ALIAS_DROPPED.sub("", value).strip()[:ALIAS_MAX_LENGTH].strip()
+
+
+def normalize_aliases(value: Any, valid_codes: Iterable[str]) -> dict[str, str]:
+    """Keep only non-blank nicknames for known customer codes."""
+    if not isinstance(value, dict):
+        return {}
+    valid = {str(code).strip().upper() for code in valid_codes}
+    aliases: dict[str, str] = {}
+    for raw_code, raw_alias in value.items():
+        code = str(raw_code).strip().upper()
+        alias = normalize_alias(raw_alias)
+        if code in valid and alias:
+            aliases[code] = alias
+    return aliases
