@@ -17,7 +17,7 @@ from .api import EvnApiError
 from .const import BACKFILL_MONTHS_PER_CYCLE, BACKFILL_PAUSE_SECONDS, DOMAIN, MAX_BACKFILL_MONTHS
 from .daily_store import (
     STORE_VERSION, backfill_meta, code_days, earliest_day, mark_previous_month_refreshed, merge_daily,
-    needs_previous_month_refresh, next_backfill_month, normalize_store, record_backfill_month,
+    needs_previous_month_refresh, next_backfill_month, normalize_store, record_backfill_month, record_failure,
 )
 from .pricing import PriceModel
 from .statistics_import import SeriesSpec, async_import_series, build_series, series_to_clear
@@ -82,8 +82,9 @@ class DailyHistory:
             return
         await self._step("merge", self._async_merge, meters)
         live = [code for code in codes if code in meters]
-        await self._step("previous month", self._async_refresh_previous_month, live)
         if allow_backfill:
+            # The first refresh after a restart only merges and imports, so setup is not held up by requests.
+            await self._step("previous month", self._async_refresh_previous_month, live)
             await self._step("backfill", self._async_backfill, live)
         await self._step("import", self._async_import, codes, selected, aliases)
         if self._dirty:
@@ -125,10 +126,14 @@ class DailyHistory:
         month_end = month_start.replace(day=calendar.monthrange(month_start.year, month_start.month)[1])
         return await self._client.async_daily(code, month_start, month_end)
 
+    def _by_failures(self, live: Sequence[str]) -> list[str]:
+        """Codes in roster order, but those whose last request failed go behind the others."""
+        return sorted(live, key=lambda code: backfill_meta(self._data, code)["failures"])
+
     async def _async_refresh_previous_month(self, live: Sequence[str]) -> None:
         """EVN can still correct last month during its first days; look again once a day."""
         today = self._today()
-        for code in live:
+        for code in self._by_failures(live):
             meta = backfill_meta(self._data, code)
             if not needs_previous_month_refresh(today, meta):
                 continue
@@ -137,6 +142,8 @@ class DailyHistory:
                 rows = await self._async_fetch_month(code, previous)
             except EvnApiError:
                 _LOGGER.debug("EVN previous-month refresh skipped because EVN is unavailable")
+                record_failure(meta)
+                self._dirty = True
                 return
             merge_daily(self._data, code, rows, self._unreported_from())
             mark_previous_month_refreshed(meta, today)
@@ -145,7 +152,7 @@ class DailyHistory:
     async def _async_backfill(self, live: Sequence[str]) -> None:
         """Walk one code back month by month; at most one code with requests per cycle."""
         today = self._today()
-        for code in live:
+        for code in self._by_failures(live):
             meta = backfill_meta(self._data, code)
             if meta["done"]:
                 continue
@@ -160,6 +167,8 @@ class DailyHistory:
                     rows = await self._async_fetch_month(code, month)
                 except EvnApiError:
                     _LOGGER.debug("EVN backfill paused because EVN is unavailable")
+                    record_failure(meta)
+                    self._dirty = True
                     return
                 fetched = True
                 dated = [row for row in rows if row.get("date")]
@@ -175,20 +184,23 @@ class DailyHistory:
         days_by_code = {code: code_days(self._data, code) for code in codes if code in self._data["daily"]}
         specs = build_series(days_by_code, self._models, selected, aliases, self._tz())
         changed = [spec for spec in specs if spec.rows and self._imported.get(spec.statistic_id) != _signature(spec)]
-        clear = series_to_clear(specs, self._data["series_start"])
+        clear = series_to_clear(specs, self._data["series"])
         if not changed and not clear:
             return
         await self._importer(changed, clear)
         for statistic_id in clear:
-            self._data["series_start"].pop(statistic_id, None)
+            self._data["series"].pop(statistic_id, None)
+            self._imported.pop(statistic_id, None)
         for spec in changed:
             self._imported[spec.statistic_id] = _signature(spec)
-            self._data["series_start"][spec.statistic_id] = spec.rows[0]["start"].date().isoformat()
+            self._data["series"][spec.statistic_id] = {
+                "start": spec.rows[0]["start"].date().isoformat(), "count": len(spec.rows), "scope": spec.scope,
+            }
         self._dirty = True
 
 
 def _signature(spec: SeriesSpec) -> tuple:
-    return spec.name, tuple((row["start"], row["sum"]) for row in spec.rows)
+    return spec.name, spec.scope, tuple((row["start"], row["sum"]) for row in spec.rows)
 
 
 def create_daily_history(hass: Any, entry_id: str, client: Any) -> DailyHistory:

@@ -140,6 +140,8 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 meters, aggregate_codes, partial_errors, self._last_good_history(partial_errors, meters)
             )
             await self._async_update_history(meters, codes, aggregate_codes)
+            # The backfill can switch customer or refresh the session, so persist those tokens now.
+            self._persist_changed_tokens()
             return {"meters": meters, "aggregate": aggregate, "partial_errors": partial_errors}
 
     async def _async_update_history(

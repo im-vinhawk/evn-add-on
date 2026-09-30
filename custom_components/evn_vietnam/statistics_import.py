@@ -22,8 +22,6 @@ COST_UNIT = "VND"
 TOTAL_ENERGY_ID = f"{DOMAIN}:total_daily_energy"
 TOTAL_COST_ID = f"{DOMAIN}:total_daily_cost"
 
-_UNPRICED = PriceModel(None, "tiered", None)
-
 # (kWh so far in the month, first day of the month, last day of the month) -> month amount in VND.
 PriceFunction = Callable[[float, date, date], "int | None"]
 
@@ -37,6 +35,8 @@ class SeriesSpec:
     unit: str
     unit_class: str | None
     rows: list[dict[str, Any]]
+    # What the rows were built from besides days (the codes a total covers); a change means stale rows.
+    scope: str = ""
 
 
 def energy_statistic_id(customer_code: str) -> str:
@@ -125,40 +125,50 @@ def build_series(
     specs: list[SeriesSpec] = []
     costs_by_code: dict[str, dict[str, int]] = {}
     for code, days in days_by_code.items():
-        model = models.get(code, _UNPRICED)
-        costs_by_code[code] = daily_cost_rows(days, lambda kwh, start, end, m=model: month_amount(kwh, start, end, m))
         label = statistic_label(code, aliases)
         specs.append(SeriesSpec(
             energy_statistic_id(code), f"EVN {label} daily energy", ENERGY_UNIT, "energy", cumulative_series(days, tz),
         ))
+        model = models.get(code)
+        if model is None:
+            continue  # no price model yet (e.g. its live call failed since the restart): no cost rather than a wrong one
+        costs_by_code[code] = daily_cost_rows(days, lambda kwh, start, end, m=model: month_amount(kwh, start, end, m))
         specs.append(SeriesSpec(
             cost_statistic_id(code), f"EVN {label} daily cost (estimate)", COST_UNIT, None,
             cumulative_series(costs_by_code[code], tz),
         ))
     chosen = [code for code in selected if code in days_by_code] if len(selected) > 1 else []
+    scope = ",".join(sorted(chosen))
     specs.append(SeriesSpec(
         TOTAL_ENERGY_ID, "EVN total daily energy", ENERGY_UNIT, "energy",
-        cumulative_series(sum_by_day(days_by_code[code] for code in chosen), tz),
+        cumulative_series(sum_by_day(days_by_code[code] for code in chosen), tz), scope,
     ))
-    specs.append(SeriesSpec(
-        TOTAL_COST_ID, "EVN total daily cost (estimate)", COST_UNIT, None,
-        cumulative_series(sum_by_day(costs_by_code[code] for code in chosen), tz),
-    ))
-    return specs
+    if all(code in costs_by_code for code in chosen):
+        specs.append(SeriesSpec(
+            TOTAL_COST_ID, "EVN total daily cost (estimate)", COST_UNIT, None,
+            cumulative_series(sum_by_day(costs_by_code[code] for code in chosen), tz), scope,
+        ))
+    return specs  # a total cost missing a code's cost would look complete, so it is left out
 
 
-def series_to_clear(specs: Iterable[SeriesSpec], imported_starts: Mapping[str, str]) -> list[str]:
-    """Statistics whose stored rows would outlive the new series: it starts later, or is gone.
+def series_to_clear(specs: Iterable[SeriesSpec], imported: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """Statistics whose stored rows would outlive the new series.
 
-    Importing only upserts, so rows before a later start (a smaller selection, a
-    price model that stopped pricing early months) would keep a stale sum.
+    Importing only upserts, so a stored row the new series no longer has keeps its
+    old sum.  That happens when the series starts later, has fewer rows, covers
+    other codes, or is gone.
     """
     clear = []
     for spec in specs:
-        recorded = imported_starts.get(spec.statistic_id)
+        recorded = imported.get(spec.statistic_id)
         if recorded is None:
             continue
-        if not spec.rows or spec.rows[0]["start"].date().isoformat() > recorded:
+        if (
+            not spec.rows
+            or spec.rows[0]["start"].date().isoformat() > recorded["start"]
+            or len(spec.rows) < recorded["count"]
+            or spec.scope != recorded["scope"]
+        ):
             clear.append(spec.statistic_id)
     return clear
 
@@ -169,18 +179,27 @@ async def async_import_series(hass: Any, specs: Iterable[SeriesSpec], to_clear: 
     from homeassistant.components.recorder.statistics import async_add_external_statistics
 
     try:
-        from homeassistant.components.recorder.models import StatisticMeanType
+        from homeassistant.components.recorder.models import StatisticMetaData
 
-        mean: dict[str, Any] = {"mean_type": StatisticMeanType.NONE}
-    except ImportError:  # older Home Assistant
-        mean = {"has_mean": False}
+        known = set(getattr(StatisticMetaData, "__annotations__", {}))
+    except ImportError:
+        known = set()
     if to_clear:
         get_instance(hass).async_clear_statistics(list(to_clear))
     for spec in specs:
-        metadata = {
-            **mean, "has_sum": True, "name": spec.name, "source": DOMAIN, "statistic_id": spec.statistic_id,
-            "unit_of_measurement": spec.unit, "unit_class": spec.unit_class,
+        metadata: dict[str, Any] = {
+            "has_sum": True, "name": spec.name, "source": DOMAIN, "statistic_id": spec.statistic_id,
+            "unit_of_measurement": spec.unit,
         }
+        # Older Home Assistant rejects keys it does not know, so send only what its metadata type lists.
+        if "mean_type" in known:
+            from homeassistant.components.recorder.models import StatisticMeanType
+
+            metadata["mean_type"] = StatisticMeanType.NONE
+        else:
+            metadata["has_mean"] = False
+        if "unit_class" in known:
+            metadata["unit_class"] = spec.unit_class
         async_add_external_statistics(
             hass, metadata, [{"start": row["start"], "state": row["state"], "sum": row["sum"]} for row in spec.rows]
         )

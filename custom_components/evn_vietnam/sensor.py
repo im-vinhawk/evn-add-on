@@ -13,6 +13,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import ATTRIBUTION, CONF_CUSTOMER_ALIASES, DOMAIN
 from .models import normalize_aliases
+from .pricing import ESTIMATE_TIERED
 from .statistics_import import (
     TOTAL_COST_ID, TOTAL_ENERGY_ID, cost_statistic_id, energy_statistic_id,
 )
@@ -94,7 +95,7 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
         if self._metric == "current_month_amount":
             attrs["bills"] = item.get("bills", [])
             attrs["tariff_verified"] = item.get("tariff_verified")
-            attrs["estimate_method"] = item.get("estimate_method", "tiered")
+            attrs["estimate_method"] = item.get("estimate_method", ESTIMATE_TIERED)
         if self._customer_code == "__aggregate__":
             attrs["selected_customer_codes"] = item.get("selected_customer_codes", [])
             attrs["successful_customer_codes"] = item.get("successful_customer_codes", [])

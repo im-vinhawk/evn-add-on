@@ -66,7 +66,7 @@ Sensor `current_month_consumption` ghi các id này trong thuộc tính `statist
 Cách lịch sử được bổ sung:
 
 - Các ngày của tháng hiện tại được gộp vào mỗi lần làm mới. Trong năm ngày đầu của tháng, tháng trước được lấy lại mỗi ngày một lần vì EVN vẫn có thể hiệu chỉnh.
-- Sau khi khởi động lại, các ngày cũ hơn được lấy ngầm: mỗi lần làm mới chỉ một mã khách hàng, tối đa sáu tháng, nghỉ ít nhất hai giây trước mỗi yêu cầu. Lùi tối đa 36 tháng, dừng khi gặp hai tháng trống liên tiếp, tạm dừng khi EVN báo bất kỳ lỗi nào rồi tiếp tục ở lần làm mới sau. Lần làm mới đầu tiên sau khi khởi động không bổ sung lịch sử.
+- Sau khi khởi động lại, các ngày cũ hơn được lấy trong các lần làm mới thường lệ, có thể làm lần đó chậm thêm tới khoảng một phút: mỗi lần làm mới chỉ một mã khách hàng, tối đa sáu tháng, nghỉ ít nhất hai giây trước mỗi yêu cầu. Lùi tối đa 36 tháng, dừng khi gặp hai tháng trống liên tiếp, tạm dừng khi EVN báo bất kỳ lỗi nào rồi tiếp tục ở lần làm mới sau; mã có yêu cầu bị lỗi được xếp sau các mã khác. Lần làm mới đầu tiên sau khi khởi động không bổ sung lịch sử và không xem lại tháng trước, nên quá trình khởi động không bị chậm.
 - Diagnostics liệt kê ngày cũ nhất đã lưu của từng mã (mã đã được che) và việc bổ sung đã xong hay chưa.
 
 Giới hạn:

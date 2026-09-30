@@ -443,3 +443,20 @@ def test_coordinator_exposes_the_backfill_status_masked_later_by_diagnostics(mod
     assert instance.backfill_status == {}
     instance._history = types.SimpleNamespace(backfill_status=lambda: {"PB000001": {"earliest": "2024-01-01", "done": True}})
     assert instance.backfill_status == {"PB000001": {"earliest": "2024-01-01", "done": True}}
+
+
+def test_tokens_are_persisted_again_after_the_daily_history_step(modules) -> None:
+    """The backfill can switch customer or refresh the session; those tokens must not wait a cycle."""
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+    instance = _two_code_coordinator(modules, client)
+    events: list[str] = []
+    instance._persist_changed_tokens = lambda: events.append("persist")
+
+    class History:
+        async def async_update(self, **_kwargs):
+            events.append("history")
+
+    instance._history = History()
+    instance.data = None
+    asyncio.run(instance._async_update_data())
+    assert events == ["persist", "history", "persist"]

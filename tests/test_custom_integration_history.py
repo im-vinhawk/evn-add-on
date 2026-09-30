@@ -29,6 +29,9 @@ def _load_module(name: str):
     return module
 
 
+_DEFAULT_MODEL: dict = {}
+
+
 @pytest.fixture(scope="module")
 def modules():
     sys.modules[PACKAGE] = types.ModuleType(PACKAGE)
@@ -50,6 +53,7 @@ def modules():
     store = _load_module("daily_store")
     statistics = _load_module("statistics_import")
     history = _load_module("history")
+    _DEFAULT_MODEL["model"] = pricing.PriceModel(True, "tiered", None)
     return types.SimpleNamespace(
         const=const, calculation=calculation, api=api, pricing=pricing, store=store, statistics=statistics,
         history=history,
@@ -100,8 +104,16 @@ def test_store_round_trips_through_json_and_survives_garbage(modules) -> None:
     assert again == store
     for garbage in (None, [], "x", {"daily": "x", "meta": 3}, {"daily": {"PB000001": {"bad": "x", "2026-03-01": "y"}}}):
         cleaned = modules.store.normalize_store(garbage)
-        assert set(cleaned) >= {"daily", "meta", "series_start"}
+        assert set(cleaned) >= {"daily", "meta", "series"}
         assert modules.store.code_days(cleaned, "PB000001") == {}
+
+
+def test_non_finite_kwh_is_never_stored_or_loaded(modules) -> None:
+    store = modules.store.empty_store()
+    modules.store.merge_daily(store, "PB000001", _rows(("2026-03-01", float("nan")), ("2026-03-02", float("inf")), ("2026-03-03", 2.0)))
+    assert modules.store.code_days(store, "PB000001") == {"2026-03-03": 2.0}
+    loaded = modules.store.normalize_store({"daily": {"PB000001": {"2026-03-01": float("nan"), "2026-03-02": float("-inf"), "2026-03-03": 2.0}}})
+    assert modules.store.code_days(loaded, "PB000001") == {"2026-03-03": 2.0}
 
 
 def test_earliest_day_is_the_oldest_stored_date(modules) -> None:
@@ -281,11 +293,10 @@ def _days(code_days):
 
 def _build(modules, days_by_code, *, selected=None, aliases=None, models=None):
     codes = list(days_by_code)
+    models = models if models is not None else {code: modules.pricing.PriceModel(True, "tiered", None) for code in codes}
     return {
         spec.statistic_id: spec
-        for spec in modules.statistics.build_series(
-            days_by_code, models or {}, selected or codes, aliases or {}, ICT,
-        )
+        for spec in modules.statistics.build_series(days_by_code, models, selected or codes, aliases or {}, ICT)
     }
 
 
@@ -340,19 +351,60 @@ def test_names_use_the_nickname_or_the_masked_last_four_never_the_full_code(modu
         assert "PB0" not in spec.name and "pb0" not in spec.name.lower()
 
 
-def test_series_to_clear_lists_series_that_start_later_or_vanished(modules) -> None:
+def _spec(modules, name, days, scope=""):
     stats = modules.statistics
+    return stats.SeriesSpec(f"evn_vietnam:{name}", name, "kWh", "energy", stats.cumulative_series(days, ICT), scope)
+
+
+def test_series_to_clear_lists_series_that_start_later_lose_rows_change_scope_or_vanished(modules) -> None:
+    stats = modules.statistics
+
+    def old(start, count, scope=""):
+        return {"start": start, "count": count, "scope": scope}
+
     specs = [
-        stats.SeriesSpec("evn_vietnam:a", "a", "kWh", "energy", stats.cumulative_series({"2026-03-05": 1.0}, ICT)),
-        stats.SeriesSpec("evn_vietnam:b", "b", "kWh", "energy", stats.cumulative_series({"2026-03-01": 1.0}, ICT)),
-        stats.SeriesSpec("evn_vietnam:c", "c", "kWh", "energy", []),
-        stats.SeriesSpec("evn_vietnam:d", "d", "kWh", "energy", []),
-        stats.SeriesSpec("evn_vietnam:e", "e", "kWh", "energy", stats.cumulative_series({"2026-03-01": 1.0}, ICT)),
+        _spec(modules, "later", {"2026-03-05": 1.0}),
+        _spec(modules, "same", {"2026-03-01": 1.0}),
+        stats.SeriesSpec("evn_vietnam:gone", "gone", "kWh", "energy", []),
+        stats.SeriesSpec("evn_vietnam:never", "never", "kWh", "energy", []),
+        _spec(modules, "new", {"2026-03-01": 1.0}),
+        _spec(modules, "lost_middle", {"2026-03-01": 1.0, "2026-03-03": 1.0}),
+        _spec(modules, "grown", {"2026-03-01": 1.0, "2026-03-02": 1.0}),
+        _spec(modules, "rescoped", {"2026-03-01": 1.0}, scope="a,c"),
     ]
     imported = {
-        "evn_vietnam:a": "2026-03-01", "evn_vietnam:b": "2026-03-01", "evn_vietnam:c": "2026-03-01",
+        "evn_vietnam:later": old("2026-03-01", 1), "evn_vietnam:same": old("2026-03-01", 1),
+        "evn_vietnam:gone": old("2026-03-01", 1), "evn_vietnam:lost_middle": old("2026-03-01", 3),
+        "evn_vietnam:grown": old("2026-03-01", 1), "evn_vietnam:rescoped": old("2026-03-01", 1, "a,b"),
     }
-    assert stats.series_to_clear(specs, imported) == ["evn_vietnam:a", "evn_vietnam:c"]
+    assert stats.series_to_clear(specs, imported) == [
+        "evn_vietnam:later", "evn_vietnam:gone", "evn_vietnam:lost_middle", "evn_vietnam:rescoped",
+    ]
+
+
+def test_a_total_that_loses_a_day_when_the_selection_shrinks_is_cleared(modules) -> None:
+    """Deselecting the only code with a given day must not leave that day's old row behind."""
+    stats = modules.statistics
+    days = {
+        "PB000001": {"2026-03-01": 1.0, "2026-03-03": 3.0}, "PB000002": {"2026-03-02": 5.0},
+        "PB000003": {"2026-03-01": 2.0, "2026-03-03": 1.0},
+    }
+    models = {code: modules.pricing.PriceModel(True, "tiered", None) for code in days}
+    wide = {s.statistic_id: s for s in stats.build_series(days, models, list(days), {}, ICT)}
+    narrow = stats.build_series(days, models, ["PB000001", "PB000003"], {}, ICT)
+    recorded = {sid: {"start": spec.rows[0]["start"].date().isoformat(), "count": len(spec.rows), "scope": spec.scope}
+                for sid, spec in wide.items() if spec.rows}
+    assert "evn_vietnam:total_daily_energy" in stats.series_to_clear(narrow, recorded)
+    assert "evn_vietnam:pb000001_daily_energy" not in stats.series_to_clear(narrow, recorded)
+
+
+def test_a_code_without_a_known_price_model_gets_no_cost_series_and_no_total_cost(modules) -> None:
+    days = _days({"PB000001": {"2026-03-01": 10.0}, "PB000002": {"2026-03-01": 5.0}})
+    specs = _build(modules, days, models={"PB000001": modules.pricing.PriceModel(True, "tiered", None)})
+    assert "evn_vietnam:pb000002_daily_cost" not in specs
+    assert "evn_vietnam:pb000001_daily_cost" in specs
+    assert "evn_vietnam:total_daily_cost" not in specs, "a partial total would look complete"
+    assert specs["evn_vietnam:total_daily_energy"].rows[-1]["sum"] == 15.0
 
 
 # --------------------------------------------------------------- DailyHistory
@@ -373,12 +425,13 @@ class _FakeStore:
 
 
 class _FakeClient:
-    def __init__(self, api, months=None, fail_months=()):
+    def __init__(self, api, months=None, fail_months=(), fail_codes=()):
         self.api, self.months, self.fail_months, self.calls = api, months or {}, set(fail_months), []
+        self.fail_codes = set(fail_codes)
 
     async def async_daily(self, code, start, end):
         self.calls.append((code, start, end))
-        if (start.year, start.month) in self.fail_months:
+        if code in self.fail_codes or (start.year, start.month) in self.fail_months:
             raise self.api.EvnApiError("HTTP 500", status=500)
         return list(self.months.get((code, start.year, start.month), []))
 
@@ -403,10 +456,7 @@ def _history(modules, *, client=None, store=None, today=date(2026, 3, 15), impor
 
 
 def _meter(*pairs, model=None):
-    item = {"daily_history": _rows(*pairs)}
-    if model is not None:
-        item["price_model"] = model
-    return item
+    return {"daily_history": _rows(*pairs), "price_model": model or _DEFAULT_MODEL["model"]}
 
 
 def _update(history, meters, codes=None, selected=None, aliases=None, allow_backfill=False):
@@ -463,7 +513,8 @@ def test_a_storage_or_statistics_failure_never_breaks_the_update(modules) -> Non
 
 def test_series_that_start_later_than_before_are_cleared_before_the_import(modules) -> None:
     store = _FakeStore(loaded={
-        "daily": {"PB000001": {"2026-03-05": 1.0}}, "meta": {}, "series_start": {"evn_vietnam:pb000001_daily_energy": "2026-03-01"},
+        "daily": {"PB000001": {"2026-03-05": 1.0}}, "meta": {},
+        "series": {"evn_vietnam:pb000001_daily_energy": {"start": "2026-03-01", "count": 1, "scope": ""}},
     })
     history, seen = _history(modules, store=store)
     _update(history, {"PB000001": _meter(("2026-03-06", 1.0))})
@@ -526,11 +577,13 @@ def test_backfill_status_reports_the_earliest_stored_day(modules) -> None:
 
 def test_previous_month_is_refetched_once_a_day_early_in_the_month(modules) -> None:
     client = _FakeClient(modules.api, months={("PB000001", 2026, 2): _rows(("2026-02-28", 9.0))})
-    history, _ = _history(modules, client=client, today=date(2026, 3, 2))
+    history, _ = _history(modules, client=client, today=date(2026, 3, 2), months_per_cycle=0)
     meters = {"PB000001": _meter(("2026-03-01", 1.0))}
     _update(history, meters)
+    assert client.calls == [], "the first refresh after a restart makes no extra requests"
+    _update(history, meters, allow_backfill=True)
     assert [(c[1], c[2]) for c in client.calls] == [(date(2026, 2, 1), date(2026, 2, 28))]
-    _update(history, meters)
+    _update(history, meters, allow_backfill=True)
     assert len(client.calls) == 1
     assert history.days("PB000001")["2026-02-28"] == 9.0
 
@@ -570,7 +623,7 @@ def test_aliases_rename_a_series_without_touching_its_rows(modules) -> None:
 
 # ------------------------------------------------------- Home Assistant glue (stubbed)
 
-def _recorder_stubs(monkeypatch, *, with_mean_type):
+def _recorder_stubs(monkeypatch, *, with_mean_type, with_unit_class=True):
     added, cleared = [], []
 
     class Instance:
@@ -582,6 +635,11 @@ def _recorder_stubs(monkeypatch, *, with_mean_type):
     statistics = types.ModuleType("homeassistant.components.recorder.statistics")
     statistics.async_add_external_statistics = lambda _hass, metadata, rows: added.append((metadata, rows))
     models = types.ModuleType("homeassistant.components.recorder.models")
+    fields = {"has_sum": bool, "name": str, "source": str, "statistic_id": str, "unit_of_measurement": str}
+    fields["mean_type" if with_mean_type else "has_mean"] = object
+    if with_unit_class:
+        fields["unit_class"] = object
+    models.StatisticMetaData = type("StatisticMetaData", (), {"__annotations__": fields})
     if with_mean_type:
         models.StatisticMeanType = types.SimpleNamespace(NONE="none")
     for name, module in (
@@ -614,10 +672,20 @@ def test_import_passes_external_statistics_metadata_and_clears_first(modules, mo
     assert all(row["start"].tzinfo is not None and row["start"].minute == 0 for row in rows)
 
 
-def test_import_falls_back_to_has_mean_on_older_home_assistant(modules, monkeypatch) -> None:
-    added, _ = _recorder_stubs(monkeypatch, with_mean_type=False)
+def test_import_sends_only_the_metadata_keys_this_home_assistant_knows(modules, monkeypatch) -> None:
+    """HA before 2025.11 has no unit_class column and before 2025.4 no mean_type: sending them breaks the import."""
+    added, _ = _recorder_stubs(monkeypatch, with_mean_type=False, with_unit_class=False)
     asyncio.run(modules.statistics.async_import_series(object(), [_one_spec(modules)], []))
-    assert added[0][0]["has_mean"] is False and "mean_type" not in added[0][0]
+    metadata = added[0][0]
+    assert metadata["has_mean"] is False
+    assert "mean_type" not in metadata and "unit_class" not in metadata
+
+
+def test_import_without_the_metadata_type_sends_the_oldest_safe_keys(modules, monkeypatch) -> None:
+    added, _ = _recorder_stubs(monkeypatch, with_mean_type=False, with_unit_class=False)
+    del sys.modules["homeassistant.components.recorder.models"].StatisticMetaData
+    asyncio.run(modules.statistics.async_import_series(object(), [_one_spec(modules)], []))
+    assert "unit_class" not in added[0][0] and "mean_type" not in added[0][0]
 
 
 def test_create_uses_a_per_entry_store_key_and_the_ha_time_zone(modules, monkeypatch) -> None:
@@ -641,3 +709,73 @@ def test_create_uses_a_per_entry_store_key_and_the_ha_time_zone(modules, monkeyp
     history = modules.history.create_daily_history(object(), "entry-1", object())
     assert created == [(1, "evn_vietnam.daily.entry-1")]
     assert history._tz() is ICT and history._today() == date(2026, 3, 15)
+
+
+def test_a_code_that_keeps_failing_does_not_starve_the_others(modules) -> None:
+    client = _FakeClient(modules.api, fail_codes=["PB000001"])
+    history, _ = _history(modules, client=client, months_per_cycle=6)
+    meters = {"PB000001": _meter(("2026-03-01", 1.0)), "PB000002": _meter(("2026-03-01", 1.0))}
+    _update(history, meters, allow_backfill=True)
+    assert [c[0] for c in client.calls] == ["PB000001"], "one request, then the cycle stops to protect EVN"
+    client.calls.clear()
+    _update(history, meters, allow_backfill=True)
+    assert client.calls[0][0] == "PB000002", "the code that failed goes behind the others next cycle"
+    assert history.backfill_status()["PB000002"]["done"] is True
+    client.calls.clear()
+    _update(history, meters, allow_backfill=True)
+    assert [c[0] for c in client.calls] == ["PB000001"], "the failing code is still retried when nothing else is left"
+
+
+def test_a_success_resets_the_failure_count(modules) -> None:
+    client = _FakeClient(modules.api, months={("PB000001", 2026, 2): _rows(("2026-02-10", 3.0))}, fail_months=[(2026, 1)])
+    history, _ = _history(modules, client=client, months_per_cycle=6)
+    meters = {"PB000001": _meter(("2026-03-01", 1.0))}
+    _update(history, meters, allow_backfill=True)
+    assert history._data["meta"]["PB000001"]["failures"] == 1
+    client.fail_months.clear()
+    _update(history, meters, allow_backfill=True)
+    assert history._data["meta"]["PB000001"]["failures"] == 0
+
+
+def test_previous_month_refresh_does_not_starve_later_codes_either(modules) -> None:
+    client = _FakeClient(modules.api, months={("PB000002", 2026, 2): _rows(("2026-02-28", 9.0))}, fail_codes=["PB000001"])
+    history, _ = _history(modules, client=client, today=date(2026, 3, 2))
+    meters = {"PB000001": _meter(("2026-03-01", 1.0)), "PB000002": _meter(("2026-03-01", 1.0))}
+    _update(history, meters, allow_backfill=True)
+    _update(history, meters, allow_backfill=True)
+    assert history.days("PB000002").get("2026-02-28") == 9.0
+
+
+def test_a_series_that_was_cleared_and_comes_back_is_imported_again(modules) -> None:
+    history, seen = _history(modules)
+    meters = {"PB000001": _meter(("2026-03-01", 1.0)), "PB000002": _meter(("2026-03-01", 2.0))}
+    total = "evn_vietnam:total_daily_energy"
+    _update(history, meters, selected=["PB000001", "PB000002"])
+    assert total in seen.imported[-1][0]
+    _update(history, meters, selected=["PB000001"])
+    assert total in seen.imported[-1][1]
+    _update(history, meters, selected=["PB000001", "PB000002"])
+    assert total in seen.imported[-1][0], "the same rows must be imported again after a clear"
+
+
+def test_a_total_losing_a_day_on_a_smaller_selection_is_cleared_before_the_import(modules) -> None:
+    history, seen = _history(modules)
+    meters = {
+        "PB000001": _meter(("2026-03-01", 1.0), ("2026-03-03", 3.0)),
+        "PB000002": _meter(("2026-03-02", 5.0)),
+        "PB000003": _meter(("2026-03-01", 2.0), ("2026-03-03", 1.0)),
+    }
+    _update(history, meters, selected=list(meters))
+    _update(history, meters, selected=["PB000001", "PB000003"])
+    _, cleared, specs = seen.imported[-1]
+    assert "evn_vietnam:total_daily_energy" in cleared
+    assert [row["sum"] for row in specs["evn_vietnam:total_daily_energy"].rows] == [3.0, 7.0]
+
+
+def test_malformed_backfill_meta_is_repaired_on_load(modules) -> None:
+    raw = {"meta": {"PB000001": {"cursor": "bad", "empty": "x", "done": "yes", "prev_refresh": "no", "failures": -3}}}
+    meta = modules.store.normalize_store(raw)["meta"]["PB000001"]
+    assert meta == {"cursor": None, "empty": 0, "done": True, "prev_refresh": "", "failures": 0}
+    assert modules.store.next_backfill_month(date(2026, 3, 15), {**meta, "done": False}, 36) == date(2026, 2, 1)
+    good = {"meta": {"PB000001": {"cursor": "2025-12", "empty": 1, "done": False, "prev_refresh": "2026-03-02", "failures": 2}}}
+    assert modules.store.normalize_store(good)["meta"]["PB000001"] == good["meta"]["PB000001"]

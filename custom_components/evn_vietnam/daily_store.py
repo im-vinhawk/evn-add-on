@@ -3,13 +3,16 @@
 The dict handled here is what Home Assistant's ``Store`` writes to disk::
 
     {"daily": {code: {"YYYY-MM-DD": kwh}},
-     "meta": {code: {"cursor": "YYYY-MM" | None, "empty": int, "done": bool, "prev_refresh": "YYYY-MM-DD"}},
-     "series_start": {statistic_id: "YYYY-MM-DD"}}
+     "meta": {code: {"cursor": "YYYY-MM" | None, "empty": int, "done": bool, "prev_refresh": "YYYY-MM-DD",
+                     "failures": int}},
+     "series": {statistic_id: {"start": "YYYY-MM-DD", "count": int, "scope": str}}}
 """
 
 from __future__ import annotations
 
 from datetime import date
+import math
+import re
 from typing import Any, Iterable, Mapping
 
 STORE_VERSION = 1
@@ -19,8 +22,11 @@ BACKFILL_EMPTY_LIMIT = 2
 PREVIOUS_MONTH_REFRESH_DAYS = 5
 
 
+_CURSOR = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
 def empty_store() -> dict[str, Any]:
-    return {"daily": {}, "meta": {}, "series_start": {}}
+    return {"daily": {}, "meta": {}, "series": {}}
 
 
 def _valid_day(value: Any) -> bool:
@@ -42,19 +48,40 @@ def normalize_store(raw: Any) -> dict[str, Any]:
             continue
         kept = {
             day: float(kwh) for day, kwh in days.items()
-            if _valid_day(day) and isinstance(kwh, (int, float)) and not isinstance(kwh, bool)
+            if _valid_day(day) and isinstance(kwh, (int, float)) and not isinstance(kwh, bool) and math.isfinite(kwh)
         }
         if kept:
             store["daily"][str(code)] = kept
     meta = raw.get("meta")
     for code, item in (meta.items() if isinstance(meta, Mapping) else ()):
         if isinstance(item, Mapping):
-            store["meta"][str(code)] = {**_new_meta(), **{k: item[k] for k in _new_meta() if k in item}}
-    series = raw.get("series_start")
-    for statistic_id, day in (series.items() if isinstance(series, Mapping) else ()):
-        if _valid_day(day):
-            store["series_start"][str(statistic_id)] = day
+            store["meta"][str(code)] = _clean_meta(item)
+    series = raw.get("series")
+    for statistic_id, item in (series.items() if isinstance(series, Mapping) else ()):
+        if isinstance(item, Mapping) and _valid_day(item.get("start")) and _count(item.get("count")) is not None:
+            store["series"][str(statistic_id)] = {
+                "start": item["start"], "count": _count(item["count"]), "scope": str(item.get("scope") or ""),
+            }
     return store
+
+
+def _count(value: Any) -> int | None:
+    """A non-negative integer, else None (booleans and floats are not counts)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _clean_meta(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only well-formed backfill state; a bad field falls back to its initial value."""
+    meta = _new_meta()
+    cursor = item.get("cursor")
+    if isinstance(cursor, str) and _CURSOR.match(cursor):
+        meta["cursor"] = cursor
+    for key in ("empty", "failures"):
+        meta[key] = _count(item.get(key)) or 0
+    meta["done"] = bool(item.get("done"))
+    if _valid_day(item.get("prev_refresh")):
+        meta["prev_refresh"] = item["prev_refresh"]
+    return meta
 
 
 def merge_daily(
@@ -74,6 +101,8 @@ def merge_daily(
         try:
             kwh = float(row.get("consumption"))
         except (TypeError, ValueError):
+            continue
+        if not math.isfinite(kwh):
             continue
         if kwh == 0 and unreported_from is not None and day >= unreported_from:
             continue
@@ -95,7 +124,7 @@ def earliest_day(store: Mapping[str, Any], code: str) -> str | None:
 
 
 def _new_meta() -> dict[str, Any]:
-    return {"cursor": None, "empty": 0, "done": False, "prev_refresh": ""}
+    return {"cursor": None, "empty": 0, "done": False, "prev_refresh": "", "failures": 0}
 
 
 def backfill_meta(store: dict[str, Any], code: str) -> dict[str, Any]:
@@ -123,6 +152,7 @@ def next_backfill_month(today: date, meta: Mapping[str, Any], cap: int) -> date 
 
 def record_backfill_month(meta: dict[str, Any], month_start: date, row_count: int) -> None:
     """Note a fetched month and step the cursor one month further back."""
+    meta["failures"] = 0
     meta["empty"] = 0 if row_count > 0 else int(meta.get("empty", 0)) + 1
     meta["cursor"] = _month_from_index(_month_index(month_start) - 1).strftime("%Y-%m")
     if meta["empty"] >= BACKFILL_EMPTY_LIMIT:
@@ -134,4 +164,10 @@ def needs_previous_month_refresh(today: date, meta: Mapping[str, Any]) -> bool:
 
 
 def mark_previous_month_refreshed(meta: dict[str, Any], today: date) -> None:
+    meta["failures"] = 0
     meta["prev_refresh"] = today.isoformat()
+
+
+def record_failure(meta: dict[str, Any]) -> None:
+    """An EVN error for this code: it goes behind the others until one of its requests works."""
+    meta["failures"] = int(meta.get("failures", 0)) + 1

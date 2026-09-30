@@ -66,7 +66,7 @@ To use them in the Energy dashboard: **Settings → Dashboards → Energy → El
 How history is filled:
 
 - The days of the current month are merged on every refresh. During the first five days of a month the previous month is fetched again once a day, because EVN can still correct it.
-- After a restart, older days are fetched in the background: one customer code per refresh, at most six months per refresh, with a pause of at least two seconds before every request. It goes back at most 36 months, stops at the first two empty months in a row, and stops for the moment on any EVN error, then resumes on the next refresh. The first refresh after a restart does not backfill.
+- After a restart, older days are fetched during the regular refreshes, which can take up to a minute longer while it runs: one customer code per refresh, at most six months per refresh, with a pause of at least two seconds before every request. It goes back at most 36 months, stops at the first two empty months in a row, and stops for the moment on any EVN error, then resumes on the next refresh; a code whose requests fail goes behind the others. The first refresh after a restart neither backfills nor looks at the previous month, so startup is not held up.
 - Diagnostics list the oldest stored day per code (with masked codes) and whether the backfill finished.
 
 Limits:
