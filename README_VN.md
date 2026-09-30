@@ -13,6 +13,9 @@ Hướng dẫn HACS/GitHub bằng tiếng Anh: [README.md](README.md).
 - Lưu username và mật khẩu trong Config Entry của Home Assistant; refresh token, đăng nhập lại im lặng và keepalive phiên 8 phút.
 - Thẻ Lovelace tự đăng ký qua `extra_module_url` và dashboard panel EVN Energy.
 - Biểu đồ 7, 14, 30 ngày có một cột cho mỗi ngày lịch, kể cả ngày EVN chưa trả dữ liệu.
+- Biệt danh tùy chọn cho từng mã khách hàng, hiển thị trên thẻ.
+- Điện năng và chi phí ước tính theo ngày được lưu thành thống kê dài hạn cho bảng Năng lượng, cùng ô so sánh ngày với cùng ngày tháng trước trên thẻ.
+- Hóa đơn và chỉ số công tơ giữ bản tốt gần nhất khi một yêu cầu tới EVN thất bại.
 
 ## Yêu cầu
 
@@ -30,6 +33,8 @@ Hướng dẫn HACS/GitHub bằng tiếng Anh: [README.md](README.md).
 
 Đây là custom repository; integration chưa có trong HACS default store.
 
+Để cập nhật, mở **EVN Vietnam** trong HACS, chọn **Update information**, rồi **Update** và khởi động lại Home Assistant.
+
 ## Thiết lập lần đầu
 
 Nhập số điện thoại/tên đăng nhập và mật khẩu dùng cho ứng dụng EVN CSKH quốc gia. Home Assistant lưu cả hai trong Config Entry để integration có thể refresh hoặc tự khôi phục phiên EVN.
@@ -42,6 +47,35 @@ Mở **Settings → Devices & services → EVN Vietnam → Configure**.
 
 Chỉ thêm các mã khách hàng đã liên kết với cùng tài khoản EVN, rồi chọn các mã có mặt trong tổng hợp cục bộ. Tài khoản chính luôn được giữ; mỗi công tơ đã cấu hình vẫn có sensor riêng.
 
+## Biệt danh
+
+Sau khi lưu các tùy chọn ở trên, Home Assistant chuyển sang bước **Nicknames** với một ô tùy chọn cho mỗi mã khách hàng (tối đa 30 ký tự; để trống nếu không cần). Biệt danh chỉ lưu trong options của integration, không gửi tới EVN, và hiển thị qua thuộc tính `customer_alias`. Thẻ hiển thị `biệt danh (mã)` trong danh sách chọn và phần đầu thẻ; tên thống kê dùng biệt danh hoặc bốn chữ số cuối của mã.
+
+## Thống kê dài hạn và bảng Năng lượng
+
+Mỗi lần làm mới, integration lưu kWh theo ngày của từng mã và đăng ký chúng làm thống kê dài hạn của Home Assistant (nguồn `evn_vietnam`), nên lịch sử được giữ theo ngày thật thay vì theo thời điểm lấy dữ liệu:
+
+- `evn_vietnam:<mã>_daily_energy` và `evn_vietnam:<mã>_daily_cost` cho từng mã khách hàng, mã viết thường, ví dụ `evn_vietnam:pb000001_daily_energy`.
+- `evn_vietnam:total_daily_energy` và `evn_vietnam:total_daily_cost` cho các mã được chọn khi có từ hai mã trở lên. Chúng được dựng lại khi phạm vi chọn thay đổi.
+- Tên có dạng `EVN <biệt danh hoặc …bốn số cuối> daily energy` và `… daily cost (estimate)`; tên không chứa toàn bộ mã khách hàng.
+
+Sensor `current_month_consumption` ghi các id này trong thuộc tính `statistics_id` và `cost_statistics_id`.
+
+Để dùng trong bảng Năng lượng: **Settings → Dashboards → Energy → Electricity grid → Add consumption**, chọn thống kê `EVN … daily energy`; với chi phí chọn **Use an entity tracking the total costs** rồi chọn `… daily cost (estimate)` tương ứng. Thống kê chi phí tính bằng VND nên đơn vị tiền tệ của Home Assistant phải là VND. Chỉ dùng thống kê tổng hoặc thống kê từng mã, không dùng cả hai, nếu không cùng một lượng kWh bị cộng hai lần. Developer Tools → Statistics cũng liệt kê chúng.
+
+Cách lịch sử được bổ sung:
+
+- Các ngày của tháng hiện tại được gộp vào mỗi lần làm mới. Trong năm ngày đầu của tháng, tháng trước được lấy lại mỗi ngày một lần vì EVN vẫn có thể hiệu chỉnh.
+- Sau khi khởi động lại, các ngày cũ hơn được lấy ngầm: mỗi lần làm mới chỉ một mã khách hàng, tối đa sáu tháng, nghỉ ít nhất hai giây trước mỗi yêu cầu. Lùi tối đa 36 tháng, dừng khi gặp hai tháng trống liên tiếp, tạm dừng khi EVN báo bất kỳ lỗi nào rồi tiếp tục ở lần làm mới sau. Lần làm mới đầu tiên sau khi khởi động không bổ sung lịch sử.
+- Diagnostics liệt kê ngày cũ nhất đã lưu của từng mã (mã đã được che) và việc bổ sung đã xong hay chưa.
+
+Giới hạn:
+
+- Mỗi ngày có một điểm, tại 00:00 giờ địa phương, nên hãy xem theo ngày, tuần, tháng hoặc năm; chế độ xem theo giờ không có ý nghĩa.
+- EVN báo mỗi ngày chậm khoảng một ngày. Chỉ số 0 của hôm qua hoặc hôm nay được coi là "chưa báo" và chưa có điểm cho tới khi EVN báo.
+- Chi phí là ước tính, tính theo phương pháp ở `estimate_method` bên dưới, không phải hóa đơn.
+- Thống kê được dựng lại toàn bộ từ các ngày đã lưu sau mỗi thay đổi nên theo kịp hiệu chỉnh của EVN. Lỗi thống kê hoặc bổ sung lịch sử chỉ ghi log mức debug và không làm sensor ngừng cập nhật.
+
 ## Dashboard
 
 Sao chép [docs/evn-dashboard.example.yaml](docs/evn-dashboard.example.yaml) vào YAML dashboard và thay mọi placeholder `sensor.evn_*` bằng entity ID trong **Developer Tools → States**. Ví dụ dùng `type: panel` để card có toàn bộ chiều ngang cần thiết.
@@ -51,6 +85,8 @@ Sao chép [docs/evn-dashboard.example.yaml](docs/evn-dashboard.example.yaml) và
 Integration tự đăng ký `/evn_vietnam/evn-vietnam-energy-card.js` qua `extra_module_url`. Với dashboard storage mode mặc định, `lovelace.resources` trong `configuration.yaml` bị bỏ qua; không thêm YAML resource trùng lặp để xử lý lỗi tải card.
 
 Card đọc `daily_history` từ month sensor đang chọn. Nếu biểu đồ trống, hãy kiểm tra sensor đó trước.
+
+Bên dưới phần tóm tắt, một ô so sánh ngày đã chọn với cùng ngày của tháng trước và với mức trung bình ngày của tháng trước, theo kWh và, nếu có, theo chi phí. Ngày mặc định là ngày mới nhất có dữ liệu; bấm vào một cột của biểu đồ để chọn ngày khác. Ngày thiếu dữ liệu hiển thị `—`, không bao giờ là 0, và ngày 29 đến 31 không có ngày tương ứng trong tháng ngắn hơn. Ô này đọc các thống kê ở trên; khi chưa có thì hiển thị dòng mờ "Chưa có lịch sử".
 
 ## Bảo mật
 
@@ -63,14 +99,29 @@ Card đọc `daily_history` từ month sensor đang chọn. Nếu biểu đồ t
 Tổng hợp được tính cục bộ:
 
 - kWh là tổng kWh của các công tơ thành công.
-- Tiền ước tính là tổng tiền bậc thang của từng công tơ; không áp lại biểu giá trên kWh đã cộng.
+- Tiền ước tính là tổng ước tính riêng của từng công tơ; không áp lại biểu giá trên kWh đã cộng.
 - Hóa đơn chính thức là tổng `TONG_TIEN` EVN trong cùng kỳ.
 - Công tơ lỗi được hiển thị là tổng hợp một phần, không bị coi là 0 một cách im lặng.
 - kWh của hóa đơn lấy từ chỉ số công tơ theo tháng của EVN, ghép với hóa đơn theo tháng và kỳ; thiếu chỉ số thì `total_kwh` là chưa biết (`null`, hiển thị `—`), không bao giờ là 0.
+- Trong bảng hóa đơn tổng hợp, `total_kwh` và `calculated_amount` của một kỳ là `null` ngay khi hóa đơn của một công tơ trong kỳ đó không có giá trị, để tổng một phần không trông như đầy đủ. Công tơ không có hóa đơn cho kỳ đó thì không tính.
+
+### Lịch sử tốt gần nhất
+
+Hóa đơn và chỉ số công tơ theo tháng của từng mã được giữ trong bộ nhớ. Khi EVN lỗi, bản thành công gần nhất (dù cũ đến đâu) được hiển thị thay vì lịch sử trống hoặc ngắn đi; hóa đơn đã chốt không đổi nên bản cũ vẫn đúng như bản mới. Chỉ mã chưa từng đọc thành công mới không hiển thị gì. Thuộc tính `history_fetched_at` của `current_month_consumption` là thời điểm của lần lấy thành công mà lịch sử đang hiển thị đến từ đó (với tổng hợp là thời điểm cũ nhất trong các mã). Công tơ lỗi dữ liệu trực tiếp vẫn nằm trong `partial_errors`, nhưng lịch sử của tổng hợp vẫn giữ các hóa đơn tốt gần nhất của nó. Không có gì được ghi ra đĩa, nên khởi động lại khi EVN đang lỗi sẽ bắt đầu từ trống.
 
 ### Biểu giá
 
 Tiền ước tính và `calculated_amount` của từng hóa đơn dùng biểu giá điện sinh hoạt EVN có hiệu lực theo từng ngày: bảng áp dụng từ 10/05/2025 (evn.com.vn, VAT 8 %) và các bảng trước đó từ 09/11/2023. Tháng có đổi giá được chia theo số ngày như EVN tính hóa đơn. `calculated_amount` nằm cạnh `total_amount` thật trong `monthly_history` và `bills`; khi hai số bắt đầu lệch nhau là thiếu một đợt đổi giá: thêm một dòng kèm ngày hiệu lực vào `custom_components/evn_vietnam/tariff.py`. Chỉ tính cho tháng dương lịch đầy đủ từ 09/11/2023; kỳ khác có `calculated_amount: null`.
+
+### Kiểm tra biểu giá theo từng mã
+
+Mô hình bậc thang chỉ được tin khi nó tái hiện đúng các hóa đơn thật của mã đó. Thuộc tính `tariff_verified` của `current_month_amount` so `calculated_amount` với `total_amount` trên ba hóa đơn đã chốt gần nhất mà mô hình tính được và có số tiền lớn hơn 0:
+
+- bằng nhau hết: `true`, ước tính dùng mô hình bậc thang (`estimate_method: tiered`);
+- có hóa đơn lệch: `false`, ước tính bằng kWh của tháng nhân đơn giá thực tế của mã, là tổng tiền đã trả chia tổng kWh của ba hóa đơn gần nhất có kWh (`estimate_method: effective_price`);
+- không có hóa đơn để so: `null`, coi như mô hình bậc thang.
+
+Vì vậy mã tính theo biểu giá khác, hoặc mọi mã sau một đợt đổi giá hay VAT mà `tariff.py` chưa có dòng tương ứng, tự chuyển sang `effective_price`. Thêm dòng còn thiếu vào `tariff.py` sẽ đưa mã về lại khi các hóa đơn gần nhất khớp trở lại. Tổng hợp hiển thị `tariff_verified: false` khi có mã được chọn là `false` và `estimate_method: effective_price` khi có mã được chọn dùng nó; ước tính của tổng vẫn là tổng ước tính từng mã. `calculated_amount` trong lịch sử hóa đơn luôn là phép tính bậc thang thuần, làm mốc so sánh.
 
 ## Giới hạn đã biết
 
