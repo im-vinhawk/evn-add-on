@@ -13,6 +13,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import ATTRIBUTION, CONF_CUSTOMER_ALIASES, DOMAIN
 from .models import normalize_aliases
+from .statistics_import import (
+    TOTAL_COST_ID, TOTAL_ENERGY_ID, cost_statistic_id, energy_statistic_id,
+)
 from .coordinator import EvnDataUpdateCoordinator, aggregate_customer_codes, configured_customer_codes
 
 # State classes are constrained by the device class: `energy` accepts only
@@ -86,6 +89,8 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
             attrs["monthly_history"] = item.get("monthly_history", [])
             attrs["latest_reading"] = item.get("latest_index")
             attrs["history_fetched_at"] = item.get("history_fetched_at", "")
+            attrs["statistics_id"] = TOTAL_ENERGY_ID if self._customer_code == "__aggregate__" else energy_statistic_id(self._customer_code)
+            attrs["cost_statistics_id"] = TOTAL_COST_ID if self._customer_code == "__aggregate__" else cost_statistic_id(self._customer_code)
         if self._metric == "current_month_amount":
             attrs["bills"] = item.get("bills", [])
             attrs["tariff_verified"] = item.get("tariff_verified")

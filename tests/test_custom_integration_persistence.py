@@ -397,3 +397,49 @@ def test_aggregate_estimate_sums_the_per_code_estimates_and_flags_an_unverified_
     assert aggregate["tariff_verified"] is False
     assert aggregate["estimate_method"] == "effective_price"
     assert aggregate["current_month_amount"] == sum(m["current_month_amount"] for m in data["meters"].values())
+
+
+def test_update_hands_live_rows_and_the_selection_to_the_daily_history(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {},
+    )
+    instance = _two_code_coordinator(modules, client)
+    instance.config_entry.options = {"customer_aliases": {"PB000001": "Nhà chính"}}
+    calls: list[dict] = []
+
+    class History:
+        async def async_update(self, **kwargs):
+            calls.append(kwargs)
+
+    instance._history = History()
+    instance.data = None
+    asyncio.run(instance._async_update_data())
+    assert calls[0]["codes"] == ["PB000001", "PB000002"]
+    assert calls[0]["selected"] == ["PB000001", "PB000002"]
+    assert calls[0]["aliases"] == {"PB000001": "Nhà chính"}
+    assert set(calls[0]["meters"]) == {"PB000001", "PB000002"}
+    assert calls[0]["allow_backfill"] is False
+    instance.data = {"meters": {}}
+    asyncio.run(instance._async_update_data())
+    assert calls[1]["allow_backfill"] is True
+
+
+def test_a_failing_daily_history_never_fails_the_update(modules) -> None:
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+    instance = _two_code_coordinator(modules, client)
+
+    class History:
+        async def async_update(self, **_kwargs):
+            raise RuntimeError("store unavailable")
+
+    instance._history = History()
+    instance.data = None
+    data = asyncio.run(instance._async_update_data())
+    assert set(data["meters"]) == {"PB000001", "PB000002"}
+
+
+def test_coordinator_exposes_the_backfill_status_masked_later_by_diagnostics(modules) -> None:
+    instance = _two_code_coordinator(modules, _TwoCodeClient({}, {}))
+    assert instance.backfill_status == {}
+    instance._history = types.SimpleNamespace(backfill_status=lambda: {"PB000001": {"earliest": "2024-01-01", "done": True}})
+    assert instance.backfill_status == {"PB000001": {"earliest": "2024-01-01", "done": True}}

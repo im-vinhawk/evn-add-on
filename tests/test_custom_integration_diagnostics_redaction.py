@@ -69,3 +69,22 @@ def test_meter_point_not_derived_from_its_code_is_redacted() -> None:
 
 def test_redact_keys_cover_credentials_and_device_id() -> None:
     assert {"username", "password", "access_token", "refresh_token", "device_id"} <= set(const.DIAGNOSTICS_TO_REDACT)
+
+
+def test_customer_keyed_status_is_masked_with_the_same_aliases_as_the_config_data() -> None:
+    status = {PRIMARY: {"earliest": "2024-01-01", "done": True}, OTHER: {"earliest": None, "done": False}}
+    masked = models.mask_customer_keys(status, ENTRY_DATA)
+    data = models.anonymize_customer_codes(ENTRY_DATA)
+    assert masked == {
+        data["primary_customer_code"]: {"earliest": "2024-01-01", "done": True},
+        data["current_customer_code"]: {"earliest": None, "done": False},
+    }
+    dumped = json.dumps(masked)
+    assert PRIMARY not in dumped and OTHER not in dumped
+
+
+def test_a_code_outside_the_entry_data_still_gets_an_alias_and_no_code_leaks() -> None:
+    stranger = "PB0555555"
+    masked = models.mask_customer_keys({stranger: {"done": False}}, ENTRY_DATA)
+    assert list(masked) == ["customer_3"]
+    assert stranger not in json.dumps(masked)

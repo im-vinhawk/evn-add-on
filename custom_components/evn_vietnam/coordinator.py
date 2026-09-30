@@ -19,11 +19,13 @@ from .calculation import aggregate_selected_overviews, attach_readings
 from .const import (
     CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE,
     CONF_REFRESH_TOKEN, DEFAULT_SCAN_INTERVAL, DOMAIN, SESSION_KEEPALIVE_INTERVAL,
-    CONF_SELECTED_CUSTOMER_CODES,
+    CONF_SELECTED_CUSTOMER_CODES, CONF_CUSTOMER_ALIASES,
 )
+from .history import DailyHistory, create_daily_history
 from .pricing import price_overview
 from .models import (
     merge_linked_customer_meter_points,
+    normalize_aliases,
     normalize_linked_customer_meter_points,
     selected_customer_codes,
     SessionState,
@@ -61,6 +63,8 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Fetch all configured customers and calculate an optional local total."""
 
     config_entry: ConfigEntry
+    # Daily kWh store and long-term statistics; None until set up (and in tests that skip __init__).
+    _history: DailyHistory | None = None
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.config_entry = entry
@@ -74,6 +78,10 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             password=entry.data.get(CONF_PASSWORD),
         )
         self._update_lock = asyncio.Lock()
+        try:
+            self._history = create_daily_history(hass, entry.entry_id, self._client)
+        except Exception as err:  # noqa: BLE001 - history is optional; the sensors work without it
+            _LOGGER.debug("EVN daily history unavailable (%s)", type(err).__name__)
         self._unsub_keepalive = None
         interval = timedelta(minutes=int(entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL.total_seconds() / 60)))
         super().__init__(hass, _LOGGER, config_entry=entry, name=DOMAIN, update_interval=interval)
@@ -87,6 +95,11 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def shapes(self) -> dict[str, dict[str, Any]]:
         """Key/type-only description of the latest raw EVN rows."""
         return self._client.last_shapes
+
+    @property
+    def backfill_status(self) -> dict[str, dict[str, Any]]:
+        """Per code: oldest stored day and whether the historical backfill finished."""
+        return self._history.backfill_status() if self._history else {}
 
     async def _async_update_data(self) -> dict[str, Any]:
         # Customer switching mutates the EVN JWT. Keep all update paths strictly
@@ -126,7 +139,22 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             aggregate = aggregate_selected_overviews(
                 meters, aggregate_codes, partial_errors, self._last_good_history(partial_errors, meters)
             )
+            await self._async_update_history(meters, codes, aggregate_codes)
             return {"meters": meters, "aggregate": aggregate, "partial_errors": partial_errors}
+
+    async def _async_update_history(
+        self, meters: dict[str, dict[str, Any]], codes: list[str], selected: list[str]
+    ) -> None:
+        """Store the live days and publish statistics; the first refresh leaves the backfill for later."""
+        if self._history is None:
+            return
+        aliases = normalize_aliases(self.config_entry.options.get(CONF_CUSTOMER_ALIASES), codes)
+        try:
+            await self._history.async_update(
+                meters=meters, codes=codes, selected=selected, aliases=aliases, allow_backfill=self.data is not None,
+            )
+        except Exception as err:  # noqa: BLE001 - a history problem must never fail the sensor update
+            _LOGGER.debug("EVN daily history update skipped (%s)", type(err).__name__)
 
     def _last_good_history(
         self, partial_errors: dict[str, str], meters: dict[str, dict[str, Any]]
@@ -186,4 +214,6 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._unsub_keepalive:
             self._unsub_keepalive()
             self._unsub_keepalive = None
+        if self._history is not None:
+            await self._history.async_flush()
         await super().async_shutdown()

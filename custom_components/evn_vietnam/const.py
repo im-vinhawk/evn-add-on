@@ -30,6 +30,11 @@ DEFAULT_TIMEOUT = 20
 DAILY_HISTORY_DAYS = 31
 # Monthly readings change at most daily; one fetch per code serves several refreshes.
 MONTHLY_READINGS_CACHE_SECONDS = 6 * 3600
+# Historical daily backfill: how far back, how many months one refresh may fetch (for one code only),
+# and the pause before each EVN request so the backfill never hammers the service.
+MAX_BACKFILL_MONTHS = 36
+BACKFILL_MONTHS_PER_CYCLE = 6
+BACKFILL_PAUSE_SECONDS = 2.0
 CARD_FILENAME = "evn-vietnam-energy-card.js"
 CARD_MODULE_URL = f"/{DOMAIN}/{CARD_FILENAME}"
 

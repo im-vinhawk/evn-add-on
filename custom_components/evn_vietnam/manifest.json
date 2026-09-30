@@ -1,6 +1,7 @@
 {
   "domain": "evn_vietnam",
   "name": "EVN Vietnam",
+  "after_dependencies": ["recorder"],
   "config_flow": true,
   "integration_type": "service",
   "iot_class": "cloud_polling",

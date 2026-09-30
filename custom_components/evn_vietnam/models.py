@@ -224,20 +224,34 @@ def normalize_aliases(value: Any, valid_codes: Iterable[str]) -> dict[str, str]:
     return aliases
 
 
+def customer_code_aliases(data: Any, extra_codes: Iterable[str] = ()) -> dict[str, str]:
+    """Map each customer code of config-entry data (and any extra code) to a stable `customer_N` alias."""
+    out = data if isinstance(data, dict) else {}
+    linked = normalize_linked_customer_meter_points(out.get("linked_customers"))
+    primary = normalize_customer_code(out.get("primary_customer_code"))
+    current = normalize_customer_code(out.get("current_customer_code"))
+    extra = [normalize_customer_code(code) for code in extra_codes]
+    ordered = [code for code in (primary, *linked, current, *extra) if code]
+    return {code: f"customer_{index}" for index, code in enumerate(dict.fromkeys(ordered), start=1)}
+
+
+def mask_customer_keys(values: dict[str, Any], data: Any) -> dict[str, Any]:
+    """Return values keyed by the same `customer_N` aliases the diagnostics use for the config data."""
+    aliases = customer_code_aliases(data, values)
+    return {aliases[code]: value for code, value in values.items() if code in aliases}
+
+
 def anonymize_customer_codes(data: Any) -> dict[str, Any]:
     """Return a copy of config-entry data with each customer code replaced by a stable alias.
 
     Diagnostics get attached to public issues. `async_redact_data` only blanks
     values, but `linked_customers` uses codes as keys and each meter point
     starts with its code, so codes are swapped for `customer_N` everywhere.
-    The meter-point suffix is kept so roster problems stay diagnosable.
+    The meter-point suffix stays readable so roster problems stay diagnosable.
     """
     out = dict(data) if isinstance(data, dict) else {}
     linked = normalize_linked_customer_meter_points(out.get("linked_customers"))
-    primary = normalize_customer_code(out.get("primary_customer_code"))
-    current = normalize_customer_code(out.get("current_customer_code"))
-    ordered = [code for code in (primary, *linked, current) if code]
-    aliases = {code: f"customer_{index}" for index, code in enumerate(dict.fromkeys(ordered), start=1)}
+    aliases = customer_code_aliases(out)
     for key in ("primary_customer_code", "current_customer_code"):
         if out.get(key):
             out[key] = aliases.get(normalize_customer_code(out[key]), "**REDACTED**")

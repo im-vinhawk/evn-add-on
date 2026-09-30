@@ -112,14 +112,19 @@ def test_diagnostics_redacts_credentials_and_tokens(modules) -> None:
     diagnostics = _load_module("diagnostics")
     entry = types.SimpleNamespace(entry_id="entry-1", data={
         "username": "login-value", "password": "secret-pass", "access_token": "access-value", "refresh_token": "refresh-value",
+        "primary_customer_code": "PB000001",
     })
-    coordinator = types.SimpleNamespace(shapes={"bills": {"THANG": "int/1d"}})
+    coordinator = types.SimpleNamespace(
+        shapes={"bills": {"THANG": "int/1d"}},
+        backfill_status={"PB000001": {"earliest": "2024-01-01", "done": True}},
+    )
     hass = types.SimpleNamespace(data={"evn_vietnam": {"entry-1": coordinator}})
 
     result = asyncio.run(diagnostics.async_get_config_entry_diagnostics(hass, entry))
     assert result["shapes"] == {"bills": {"THANG": "int/1d"}}
+    assert result["backfill"] == {"customer_1": {"earliest": "2024-01-01", "done": True}}
     rendered = repr(result)
-    for secret in ("login-value", "secret-pass", "access-value", "refresh-value"):
+    for secret in ("login-value", "secret-pass", "access-value", "refresh-value", "PB000001"):
         assert secret not in rendered
 
 
