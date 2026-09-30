@@ -502,3 +502,226 @@ const mixedTexts = collectTextContents(mixedBillCard.shadowRoot);
 assert.ok(mixedTexts.includes('120 kWh'), 'a bill with known kWh must show it');
 assert.ok(mixedTexts.includes('—'), 'the bill without kWh must still show the placeholder');
 assert.ok(!mixedTexts.includes('0,0 kWh'), 'unknown kWh must never render as zero');
+
+// 7. Day-vs-last-month comparison tile (statistics via hass.callWS)
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const texts = (card) => collectTextContents(card.shadowRoot);
+const ENERGY_ID = 'evn_vietnam:pb000001_daily_energy';
+const COST_ID = 'evn_vietnam:pb000001_daily_cost';
+const HOUR = 3600 * 1000;
+
+// Statistics rows as the recorder returns them: one row per local day, `start` in epoch ms.
+function statRow(iso, change) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const start = Date.UTC(y, m - 1, d) - 7 * HOUR; // local midnight at +07
+  return { start, end: start + 24 * HOUR, change };
+}
+function monthRows(year, month, days, valueOf, skip = []) {
+  const rows = [];
+  for (let d = 1; d <= days; d += 1) {
+    if (skip.includes(d)) continue;
+    rows.push(statRow(`${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`, valueOf(d)));
+  }
+  return rows;
+}
+function compareHass(callWS, attrs = {}, lastUpdated = '2026-08-21T03:00:00+00:00') {
+  return {
+    config: { time_zone: 'Asia/Ho_Chi_Minh' },
+    callWS,
+    states: {
+      'sensor.cur': {
+        state: '100',
+        last_updated: lastUpdated,
+        attributes: {
+          customer_code: 'PB000001',
+          statistics_id: ENERGY_ID,
+          cost_statistics_id: COST_ID,
+          daily_history: [
+            { date: '2026-08-19', consumption: 11 },
+            { date: '2026-08-20', consumption: 12.5 },
+          ],
+          ...attrs,
+        },
+      },
+    },
+  };
+}
+function augustStats() {
+  // July: 10 kWh every day except the 5th; August 20th: 12.5 kWh. Cost: 25000 (July) / 30000 (Aug 20).
+  return {
+    [ENERGY_ID]: [
+      ...monthRows(2026, 7, 31, () => 10, [5]),
+      ...monthRows(2026, 8, 20, (d) => (d === 20 ? 12.5 : 11)),
+    ],
+    [COST_ID]: [
+      ...monthRows(2026, 7, 31, () => 25000, [5]),
+      ...monthRows(2026, 8, 20, (d) => (d === 20 ? 30000 : 27000)),
+    ],
+  };
+}
+function newCompareCard(hass) {
+  const card = new Card();
+  card.setConfig({ type: 'custom:evn-vietnam-energy-card', entity: 'sensor.cur' });
+  card.hass = hass;
+  return card;
+}
+function hasOwnInnerHtml(node) {
+  return Object.prototype.hasOwnProperty.call(node, 'innerHTML') || node.children.some(hasOwnInnerHtml);
+}
+
+(async () => {
+  // 7a. Pure comparison helper
+  const probe = new Card();
+  const julyAug = [
+    { date: '2026-07-20', value: 10 }, { date: '2026-07-21', value: 14 }, { date: '2026-08-20', value: 12.5 },
+  ];
+  let cmp = probe._compareDay(julyAug, '2026-08-20');
+  assert.equal(cmp.day, 12.5);
+  assert.equal(cmp.lastMonthDay, 10);
+  assert.equal(cmp.avgPrevMonth, 12, 'previous-month average is the sum over the days that have data');
+
+  cmp = probe._compareDay([{ date: '2026-07-21', value: 14 }, { date: '2026-08-20', value: 12.5 }], '2026-08-20');
+  assert.equal(cmp.lastMonthDay, null, 'a missing day in the previous month is unknown, never 0');
+  assert.equal(cmp.avgPrevMonth, 14);
+
+  cmp = probe._compareDay([{ date: '2026-02-28', value: 5 }, { date: '2026-03-31', value: 8 }], '2026-03-31');
+  assert.equal(cmp.day, 8);
+  assert.equal(cmp.lastMonthDay, null, 'the 31st has no counterpart in February');
+  assert.equal(cmp.avgPrevMonth, 5);
+
+  cmp = probe._compareDay([{ date: '2025-12-15', value: 7 }, { date: '2026-01-15', value: 9 }], '2026-01-15');
+  assert.equal(cmp.lastMonthDay, 7, 'January compares with December of the previous year');
+
+  cmp = probe._compareDay([], '2026-08-20');
+  assert.deepEqual([cmp.day, cmp.lastMonthDay, cmp.avgPrevMonth], [null, null, null]);
+
+  cmp = probe._compareDay([{ date: '2026-07-01', value: 0 }, { date: '2026-07-02', value: 10 }, { date: '2026-08-20', value: 1 }], '2026-08-20');
+  assert.equal(cmp.avgPrevMonth, 5, 'a recorded zero is data and counts as a day');
+  cmp = probe._compareDay([{ date: '2026-07-01', value: null }, { date: '2026-07-02', value: NaN }, { date: '2026-08-20', value: 1 }], '2026-08-20');
+  assert.equal(cmp.avgPrevMonth, null, 'unusable values are not data');
+
+  // 7b. Rendering with a fake recorder websocket
+  const calls = [];
+  const callWS = async (message) => { calls.push(message); return augustStats(); };
+  const tileCard = newCompareCard(compareHass(callWS));
+  await flush();
+  assert.equal(calls.length, 1, 'one request per view and month pair');
+  assert.equal(calls[0].type, 'recorder/statistics_during_period');
+  assert.equal(calls[0].period, 'day');
+  assert.equal(JSON.stringify(calls[0].types), JSON.stringify(['change']));
+  assert.equal(JSON.stringify(calls[0].statistic_ids), JSON.stringify([ENERGY_ID, COST_ID]));
+  assert.equal(calls[0].start_time, '2026-06-30T17:00:00.000Z', 'window starts at local midnight of the 1st of the previous month (+07)');
+  assert.equal(calls[0].end_time, '2026-08-31T17:00:00.000Z', 'window ends at local midnight of the 1st of the next month (+07)');
+
+  let shown = texts(tileCard);
+  const joined = shown.join(' | ');
+  assert.ok(shown.includes('So sánh ngày 20/08'), 'the tile names the selected day (latest day with data)');
+  assert.ok(shown.includes('12,5 kWh'), 'selected day kWh');
+  assert.ok(shown.includes('10 kWh'), 'same day of the previous month and its average');
+  assert.ok(shown.includes('+2,5 kWh (+25%)'), `delta against the same day last month: ${joined}`);
+  assert.ok(shown.includes('30.000 ₫'), 'cost of the selected day');
+  assert.ok(shown.includes('+5.000 ₫ (+20%)'), 'cost delta');
+  assert.ok(!shown.includes('Chưa có lịch sử'));
+  assert.ok(!hasOwnInnerHtml(tileCard.shadowRoot), 'the tile must only use textContent');
+
+  // The tile sits between the summary grid and the chart.
+  const content = findNode(tileCard.shadowRoot, (n) => n.className === 'card-content');
+  const order = content.children.map((c) => c.className);
+  assert.ok(order.indexOf('metrics-grid') < order.indexOf('compare-tile') && order.indexOf('compare-tile') < order.indexOf('chart-container'),
+    `tile must sit below the summary grid and above the chart, got ${order.join(',')}`);
+
+  // Re-rendering, even from a new hass object with the same data, asks nothing more.
+  tileCard.render();
+  tileCard.hass = compareHass(callWS);
+  await flush();
+  assert.equal(calls.length, 1, 'cached until the day or the entity update changes');
+
+  // Clicking a bar selects that day; the same month pair is served from the cache.
+  const bar18 = findAllNodes(tileCard.shadowRoot, isChartBar).find((b) => (b.attributes['aria-label'] || '').startsWith('2026-08-18'));
+  assert.ok(bar18, 'the chart has a bar for the 18th');
+  bar18.dispatchEvent({ type: 'click' });
+  await flush();
+  shown = texts(tileCard);
+  assert.ok(shown.includes('So sánh ngày 18/08'), 'clicking a bar selects its day');
+  assert.ok(shown.includes('11 kWh'), 'the 18th has 11 kWh in the statistics');
+  assert.equal(calls.length, 1, 'selecting another day of the same month needs no request');
+  assert.ok(
+    findAllNodes(tileCard.shadowRoot, (n) => n.tagName === 'rect' && String(n.className).includes('bar-selected')).length === 1,
+    'exactly the selected bar is highlighted',
+  );
+
+  // A new entity update (last_updated) refetches.
+  tileCard.hass = compareHass(callWS, {}, '2026-08-21T03:30:00+00:00');
+  await flush();
+  assert.equal(calls.length, 2, 'a changed last_updated refetches the statistics');
+
+  // 7c. Missing points are dashes, never zero
+  const gapCalls = [];
+  const gapCard = newCompareCard(compareHass(async (m) => {
+    gapCalls.push(m);
+    const stats = augustStats();
+    stats[ENERGY_ID] = stats[ENERGY_ID].filter((r) => r.start !== statRow('2026-07-20', 0).start);
+    delete stats[COST_ID];
+    return stats;
+  }, { cost_statistics_id: undefined }));
+  await flush();
+  shown = texts(gapCard);
+  assert.ok(shown.includes('—'), 'a missing day last month shows a dash');
+  assert.ok(!shown.includes('0 kWh') && !shown.includes('0,0 kWh'), 'a missing point must never render as 0');
+  assert.ok(shown.includes('12,5 kWh'), 'the selected day is still shown');
+  assert.equal(JSON.stringify(gapCalls[0].statistic_ids), JSON.stringify([ENERGY_ID]), 'no cost id attribute, no cost request');
+
+  // The 31st against a February with 28 days
+  const marCard = newCompareCard(compareHass(async () => ({
+    [ENERGY_ID]: [statRow('2026-02-28', 5), statRow('2026-03-31', 8)],
+  }), { cost_statistics_id: undefined, daily_history: [{ date: '2026-03-31', consumption: 8 }] }));
+  await flush();
+  shown = texts(marCard);
+  assert.ok(shown.includes('So sánh ngày 31/03'));
+  assert.ok(shown.includes('8 kWh') && shown.includes('5 kWh'));
+  assert.ok(shown.filter((t) => t === '—').length >= 2, 'no same-day counterpart: value and delta are dashes');
+
+  // Default selection: latest day with data, not a trailing zero
+  const zeroCard = newCompareCard(compareHass(callWS, {
+    daily_history: [{ date: '2026-08-19', consumption: 11 }, { date: '2026-08-20', consumption: 12.5 }, { date: '2026-08-21', consumption: 0 }],
+  }));
+  await flush();
+  assert.ok(texts(zeroCard).includes('So sánh ngày 20/08'), 'an unreported zero day is not the default selection');
+
+  // 7d. Unavailable statistics hide the tile behind a muted note
+  const failCalls = [];
+  const failCard = newCompareCard(compareHass(async (m) => { failCalls.push(m); throw new Error('no recorder'); }));
+  await flush();
+  shown = texts(failCard);
+  assert.ok(shown.includes('Chưa có lịch sử'), 'a failed request shows the muted note');
+  assert.ok(!shown.some((t) => t.startsWith('So sánh ngày')), 'and hides the tile');
+  failCard.render();
+  await flush();
+  assert.equal(failCalls.length, 1, 'a failure is not retried on every render');
+
+  const emptyCard = newCompareCard(compareHass(async () => ({})));
+  await flush();
+  assert.ok(texts(emptyCard).includes('Chưa có lịch sử'), 'statistics without any row show the muted note');
+
+  let asked = 0;
+  const noIdCard = newCompareCard(compareHass(async () => { asked += 1; return {}; }, { statistics_id: undefined }));
+  await flush();
+  assert.equal(asked, 0, 'an entity without statistics_id asks nothing');
+  assert.ok(texts(noIdCard).includes('Chưa có lịch sử'));
+
+  const noWsHass = compareHass(undefined);
+  assert.doesNotThrow(() => newCompareCard(noWsHass), 'a hass without callWS must not break the card');
+  await flush();
+
+  // Without a configured time zone the browser's own calendar is used; it must still ask.
+  const plainCalls = [];
+  const plainHass = compareHass(async (m) => { plainCalls.push(m); return augustStats(); });
+  delete plainHass.config;
+  newCompareCard(plainHass);
+  await flush();
+  assert.equal(plainCalls.length, 1);
+  assert.ok(Number.isFinite(Date.parse(plainCalls[0].start_time)) && Number.isFinite(Date.parse(plainCalls[0].end_time)));
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

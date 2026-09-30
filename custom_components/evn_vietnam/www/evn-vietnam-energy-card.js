@@ -11,6 +11,8 @@ class EvnVietnamEnergyCard extends HTMLElement {
     this._hass = null;
     this._selectedViewId = null;
     this._selectedRangeDays = 30;
+    this._selectedDay = '';
+    this._compareCache = new Map();
   }
 
   setConfig(config) {
@@ -376,10 +378,15 @@ class EvnVietnamEnergyCard extends HTMLElement {
       )
     );
 
-    // 4. Daily Energy Chart
+    // 4. Selected day against the same day last month (long-term statistics)
+    cardContent.appendChild(
+      this._renderCompareSection(currentViewId, attrs, mainEntity.last_updated, dailyHistory)
+    );
+
+    // 5. Daily Energy Chart
     cardContent.appendChild(this._renderChartSection(dailyHistory));
 
-    // 5. Official Bill History Table
+    // 6. Official Bill History Table
     cardContent.appendChild(this._renderBillTableSection(monthlyHistory));
 
     cardEl.appendChild(cardContent);
@@ -666,6 +673,229 @@ class EvnVietnamEnergyCard extends HTMLElement {
     return tile;
   }
 
+  // --- Day vs same day last month (recorder statistics) ---
+  _statisticsIds(attrs) {
+    const clean = (value) => (typeof value === 'string' && value.trim() ? value.trim() : '');
+    return { energy: clean(attrs && attrs.statistics_id), cost: clean(attrs && attrs.cost_statistics_id) };
+  }
+
+  _timeZone() {
+    const zone = this._hass && this._hass.config && this._hass.config.time_zone;
+    return typeof zone === 'string' ? zone : '';
+  }
+
+  _zonedParts(ms, timeZone) {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    const parts = {};
+    formatter.formatToParts(new Date(ms)).forEach((part) => {
+      parts[part.type] = Number(part.value);
+    });
+    return parts;
+  }
+
+  _zonedOffsetMs(ms, timeZone) {
+    const p = this._zonedParts(ms, timeZone);
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second) - Math.floor(ms / 1000) * 1000;
+  }
+
+  // Calendar date (YYYY-MM-DD) of an instant in Home Assistant's time zone.
+  _zonedIsoDate(ms) {
+    const pad = (n) => String(n).padStart(2, '0');
+    const zone = this._timeZone();
+    if (zone) {
+      try {
+        const p = this._zonedParts(ms, zone);
+        return `${p.year}-${pad(p.month)}-${pad(p.day)}`;
+      } catch (e) {
+        // unknown zone name: fall back to the browser's calendar
+      }
+    }
+    const date = new Date(ms);
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
+
+  // The instant a calendar day starts in Home Assistant's time zone.
+  _zonedMidnight(year, month, day) {
+    const zone = this._timeZone();
+    if (zone) {
+      try {
+        const guess = Date.UTC(year, month - 1, day);
+        const first = guess - this._zonedOffsetMs(guess, zone);
+        return new Date(guess - this._zonedOffsetMs(first, zone));
+      } catch (e) {
+        // unknown zone name: fall back to the browser's calendar
+      }
+    }
+    return new Date(year, month - 1, day);
+  }
+
+  _compareWindow(dayIso) {
+    const [year, month] = dayIso.split('-').map(Number);
+    const prevYear = month === 1 ? year - 1 : year;
+    const prevMonth = month === 1 ? 12 : month - 1;
+    const nextYear = month === 12 ? year + 1 : year;
+    const nextMonth = month === 12 ? 1 : month + 1;
+    return {
+      start: this._zonedMidnight(prevYear, prevMonth, 1).toISOString(),
+      end: this._zonedMidnight(nextYear, nextMonth, 1).toISOString(),
+    };
+  }
+
+  // rows: [{ date: 'YYYY-MM-DD', value }]. A missing or unusable value is null, never 0.
+  _compareDay(rows, dayIso) {
+    const [year, month, day] = String(dayIso).split('-').map(Number);
+    const byDate = new Map();
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      if (!row || row.value === null || row.value === undefined || row.value === '') return;
+      const num = Number(row.value);
+      if (Number.isFinite(num)) byDate.set(String(row.date), num);
+    });
+    const pad = (n) => String(n).padStart(2, '0');
+    const prevYear = month === 1 ? year - 1 : year;
+    const prevMonth = month === 1 ? 12 : month - 1;
+    const prefix = `${prevYear}-${pad(prevMonth)}-`;
+    const sameDay = `${prefix}${pad(day)}`;
+    const previous = [...byDate.entries()].filter(([date]) => date.startsWith(prefix)).map(([, value]) => value);
+    return {
+      day: byDate.has(dayIso) ? byDate.get(dayIso) : null,
+      // The 29th-31st have no row in a shorter previous month, so they stay unknown.
+      lastMonthDay: byDate.has(sameDay) ? byDate.get(sameDay) : null,
+      avgPrevMonth: previous.length > 0 ? previous.reduce((sum, v) => sum + v, 0) / previous.length : null,
+    };
+  }
+
+  _statRowsToDays(rows) {
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .filter((row) => row && Number.isFinite(Number(row.start)))
+      .map((row) => ({ date: this._zonedIsoDate(Number(row.start)), value: row.change }));
+  }
+
+  // The selected day: a clicked bar while it is still on the chart, else the latest day with data.
+  _selectedCompareDay(dailyHistory) {
+    const rows = Array.isArray(dailyHistory) ? dailyHistory : [];
+    if (this._selectedDay && this._calendarBars(rows, 30).some((bar) => bar.date === this._selectedDay)) {
+      return this._selectedDay;
+    }
+    const dated = rows
+      .map((item) => ({ iso: this._isoDate(item && item.date), value: this._chartValue(item) }))
+      .filter((item) => item.iso)
+      .sort((a, b) => (a.iso < b.iso ? -1 : 1));
+    const withData = dated.filter((item) => item.value > 0);
+    const latest = withData.length > 0 ? withData[withData.length - 1] : dated[dated.length - 1];
+    return latest ? latest.iso : '';
+  }
+
+  _formatDelta(value, reference, format) {
+    if (value === null || reference === null) return '—';
+    const delta = value - reference;
+    const sign = delta > 0 ? '+' : delta < 0 ? '-' : '';
+    const percent = reference !== 0 ? ` (${sign}${this._formatNumber(Math.abs(delta / reference) * 100, 1)}%)` : '';
+    return `${sign}${format(Math.abs(delta))}${percent}`;
+  }
+
+  _compareNote(message) {
+    const note = document.createElement('div');
+    note.className = 'compare-muted';
+    note.textContent = message;
+    return note;
+  }
+
+  _renderCompareSection(viewId, attrs, lastUpdated, dailyHistory) {
+    const ids = this._statisticsIds(attrs);
+    const day = this._selectedCompareDay(dailyHistory);
+    if (!ids.energy || !day || !this._hass || typeof this._hass.callWS !== 'function') {
+      return this._compareNote('Chưa có lịch sử');
+    }
+    const now = new Date();
+    const today = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+    const key = [viewId, ids.energy, ids.cost, day.slice(0, 7), lastUpdated || '', today].join('|');
+    let entry = this._compareCache.get(key);
+    if (!entry) {
+      entry = { status: 'loading' };
+      this._compareCache.set(key, entry);
+      while (this._compareCache.size > 16) {
+        this._compareCache.delete(this._compareCache.keys().next().value);
+      }
+      this._loadCompare(key, ids, day);
+    }
+    if (entry.status === 'loading') return this._compareNote('Đang tải so sánh…');
+    if (entry.status !== 'ready') return this._compareNote('Chưa có lịch sử');
+    return this._renderCompareTile(entry.data, day, ids);
+  }
+
+  _loadCompare(key, ids, day) {
+    const window = this._compareWindow(day);
+    const statisticIds = ids.cost ? [ids.energy, ids.cost] : [ids.energy];
+    Promise.resolve()
+      .then(() => this._hass.callWS({
+        type: 'recorder/statistics_during_period',
+        start_time: window.start,
+        end_time: window.end,
+        statistic_ids: statisticIds,
+        period: 'day',
+        types: ['change'],
+      }))
+      .then((result) => {
+        const energy = this._statRowsToDays(result && result[ids.energy]);
+        const cost = ids.cost ? this._statRowsToDays(result && result[ids.cost]) : [];
+        this._compareCache.set(key, energy.length > 0 ? { status: 'ready', data: { energy, cost } } : { status: 'error' });
+      })
+      .catch(() => {
+        this._compareCache.set(key, { status: 'error' });
+      })
+      .then(() => this.render());
+  }
+
+  _renderCompareTile(data, day, ids) {
+    const section = document.createElement('div');
+    section.className = 'compare-tile';
+
+    const title = document.createElement('div');
+    title.className = 'section-title';
+    title.textContent = `So sánh ngày ${this._formatDateLabel(day)}`;
+    section.appendChild(title);
+
+    const addGroup = (rows, format, prefix) => {
+      const cmp = this._compareDay(rows, day);
+      const grid = document.createElement('div');
+      grid.className = 'compare-grid';
+      const tile = (label, value, reference) => {
+        const card = this._createMetricTile(label, value === null ? '—' : format(value), false);
+        if (reference !== undefined) {
+          const delta = document.createElement('div');
+          delta.className = 'compare-delta';
+          delta.textContent = this._formatDelta(cmp.day, reference, format);
+          card.appendChild(delta);
+        }
+        return card;
+      };
+      grid.appendChild(tile(`${prefix}ngày đã chọn`, cmp.day));
+      grid.appendChild(tile(`${prefix}cùng ngày tháng trước`, cmp.lastMonthDay, cmp.lastMonthDay));
+      grid.appendChild(tile(`${prefix}TB ngày tháng trước`, cmp.avgPrevMonth, cmp.avgPrevMonth));
+      section.appendChild(grid);
+    };
+    addGroup(data.energy, (v) => this._formatKwh(v), 'Sản lượng ');
+    if (ids.cost && data.cost.length > 0) {
+      addGroup(data.cost, (v) => this._formatVnd(v), 'Chi phí ');
+    }
+
+    const hint = document.createElement('div');
+    hint.className = 'compare-hint';
+    hint.textContent = 'Chọn một cột trên biểu đồ để đổi ngày';
+    section.appendChild(hint);
+    return section;
+  }
+
   // --- SVG Chart Renderer ---
   _renderChartSection(dailyHistory) {
     const section = document.createElement('div');
@@ -714,6 +944,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
 
     const rangeDays = this._selectedRangeDays || 30;
     const filteredData = this._calendarBars(dailyHistory, rangeDays);
+    const selectedDay = this._selectedCompareDay(dailyHistory);
 
     if (filteredData.length === 0) {
       const emptyMsg = document.createElement('div');
@@ -815,7 +1046,8 @@ class EvnVietnamEnergyCard extends HTMLElement {
       }
 
       const rect = document.createElementNS(svgNS, 'rect');
-      rect.setAttribute('class', item.missing || val === 0 ? 'bar bar-empty' : 'bar');
+      const barClass = item.missing || val === 0 ? 'bar bar-empty' : 'bar';
+      rect.setAttribute('class', item.date === selectedDay ? `${barClass} bar-selected` : barClass);
       rect.setAttribute('x', xPos);
       rect.setAttribute('y', yPos);
       rect.setAttribute('width', barWidth);
@@ -839,6 +1071,10 @@ class EvnVietnamEnergyCard extends HTMLElement {
         tooltipEl.textContent = 'Chạm/Rê chuột để xem';
       };
 
+      rect.addEventListener('click', () => {
+        this._selectedDay = item.date;
+        this.render();
+      });
       rect.addEventListener('mouseenter', updateTooltip);
       rect.addEventListener('focus', updateTooltip);
       rect.addEventListener('mouseleave', resetTooltip);
@@ -1194,6 +1430,36 @@ class EvnVietnamEnergyCard extends HTMLElement {
       }
       .bar-empty {
         opacity: 0.28;
+      }
+      .bar-selected {
+        stroke: var(--primary-text-color, #111827);
+        stroke-width: 1.5;
+        opacity: 1;
+      }
+      .compare-tile {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .compare-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+      @media (max-width: 720px) {
+        .compare-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+      .compare-delta {
+        margin-top: 4px;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        color: var(--secondary-text-color, #6b7280);
+      }
+      .compare-hint, .compare-muted {
+        font-size: 12px;
+        color: var(--secondary-text-color, #6b7280);
       }
       .bar:hover, .bar:focus {
         opacity: 1;
