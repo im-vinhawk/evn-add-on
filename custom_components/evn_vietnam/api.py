@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 from datetime import date, timedelta
 import base64
 import json
@@ -16,7 +17,7 @@ import aiohttp
 from homeassistant.util import dt as dt_util
 
 from .calculation import (
-    as_float, calculate_tier_cost, describe_shape, normalize_bills, normalize_daily, normalize_readings,
+    as_float, calculate_bill_amount, describe_shape, normalize_bills, normalize_daily, normalize_readings,
 )
 from .const import (
     DAILY_HISTORY_DAYS, DEFAULT_TIMEOUT, MONTHLY_READINGS_CACHE_SECONDS, NATIONAL_BASE_URL, REGIONAL_GATEWAYS,
@@ -464,13 +465,14 @@ class EvnClient:
                 latest_date = str(latest.get("NGAY") or latest.get("ngayGhi") or "")
         except EvnApiError:
             pass
+        last_day = today.replace(day=calendar.monthrange(today.year, today.month)[1])
         values = {row["date"]: as_float(row["consumption"]) for row in daily}
         today_kwh = values.get(today.isoformat(), 0.0)
         yesterday_kwh = values.get((today - timedelta(days=1)).isoformat(), 0.0)
         return {
             "customer_code": customer_code, "latest_index": latest_index, "latest_date": latest_date,
             "today_consumption": round(today_kwh, 2), "yesterday_consumption": round(yesterday_kwh, 2),
-            "current_month_consumption": month_kwh, "current_month_amount": calculate_tier_cost(month_kwh),
+            "current_month_consumption": month_kwh, "current_month_amount": calculate_bill_amount(month_kwh, start, last_day),
             "daily_history": daily[-DAILY_HISTORY_DAYS:],
         }
 
@@ -498,7 +500,7 @@ class EvnClient:
         month_key = (today.year, today.month)
         cached = self._readings_cache.get(customer_code)
         if cached and cached[1] == month_key and self._clock() - cached[0] < MONTHLY_READINGS_CACHE_SECONDS:
-            return cached[2]
+            return list(cached[2])
         meter_point = await self._async_meter_point(customer_code)
         body = {
             "MA_KHANG": customer_code, "MA_DDO": meter_point,
@@ -513,4 +515,4 @@ class EvnClient:
         self._record_shape("monthly_readings", rows)
         readings = normalize_readings(row for row in rows if isinstance(row, dict))
         self._readings_cache[customer_code] = (self._clock(), month_key, readings)
-        return readings
+        return list(readings)

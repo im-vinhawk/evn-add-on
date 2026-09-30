@@ -66,6 +66,11 @@ Tổng hợp được tính cục bộ:
 - Tiền ước tính là tổng tiền bậc thang của từng công tơ; không áp lại biểu giá trên kWh đã cộng.
 - Hóa đơn chính thức là tổng `TONG_TIEN` EVN trong cùng kỳ.
 - Công tơ lỗi được hiển thị là tổng hợp một phần, không bị coi là 0 một cách im lặng.
+- kWh của hóa đơn lấy từ chỉ số công tơ theo tháng của EVN, ghép với hóa đơn theo tháng và kỳ; thiếu chỉ số thì `total_kwh` là chưa biết (`null`, hiển thị `—`), không bao giờ là 0.
+
+### Biểu giá
+
+Tiền ước tính và `calculated_amount` của từng hóa đơn dùng biểu giá điện sinh hoạt EVN có hiệu lực theo từng ngày: bảng áp dụng từ 10/05/2025 (evn.com.vn, VAT 8 %) và các bảng trước đó từ 09/11/2023. Tháng có đổi giá được chia theo số ngày như EVN tính hóa đơn. `calculated_amount` nằm cạnh `total_amount` thật trong `monthly_history` và `bills`; khi hai số bắt đầu lệch nhau là thiếu một đợt đổi giá: thêm một dòng kèm ngày hiệu lực vào `custom_components/evn_vietnam/tariff.py`. Chỉ tính cho tháng dương lịch đầy đủ từ 09/11/2023; kỳ khác có `calculated_amount: null`.
 
 ## Giới hạn đã biết
 

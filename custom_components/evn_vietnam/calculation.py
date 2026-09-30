@@ -7,9 +7,13 @@ household kWh value.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+import calendar
+from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 import re
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
+
+from .tariff import TARIFF_ROWS, TIER_WIDTHS, TariffRow
 
 _PERIOD_RE = re.compile(r"(?:Tháng\s*)?(\d{1,2})\s*/\s*(\d{4})", re.IGNORECASE)
 
@@ -41,16 +45,67 @@ def to_iso_date(value: Any) -> str:
         return raw
 
 
-def calculate_tier_cost(kwh: float, vat_rate: float = 0.08) -> int:
-    """Return the legacy dashboard's six-tier residential estimate in VND."""
-    remaining, pretax = max(kwh, 0), 0.0
-    for limit, rate in ((50, 1893), (50, 1956), (100, 2271), (100, 2860), (100, 3197), (float("inf"), 3302)):
-        used = min(remaining, limit)
-        pretax += used * rate
+def _round_half_up(value: Decimal) -> int:
+    return int(value.quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def _tier_cost(kwh: Decimal, prices: Sequence[int], widths: Sequence[int | None]) -> Decimal:
+    """Price kWh through the tiers; a width of None is unlimited."""
+    remaining, cost = kwh, Decimal(0)
+    for width, price in zip(widths, prices):
+        used = remaining if width is None else min(remaining, Decimal(width))
+        cost += used * price
         remaining -= used
         if remaining <= 0:
             break
-    return int(round(pretax * (1 + vat_rate)))
+    return cost
+
+
+def _with_vat(pretax: Decimal, vat_rate: Decimal) -> int:
+    pretax_vnd = _round_half_up(pretax)
+    return pretax_vnd + _round_half_up(pretax_vnd * vat_rate)
+
+
+def _tariff_on(day: date) -> TariffRow:
+    """The latest tariff row in force on day; day must not precede the table."""
+    return [row for row in TARIFF_ROWS if row.effective_from <= day][-1]
+
+
+def calculate_tier_cost(kwh: float, vat_rate: float = 0.08) -> int:
+    """Return the six-tier residential estimate in VND priced with the latest tariff row."""
+    row = TARIFF_ROWS[-1]
+    pretax = _tier_cost(max(Decimal(str(kwh)), Decimal(0)), row.prices, TIER_WIDTHS)
+    return _with_vat(pretax, Decimal(str(vat_rate)))
+
+
+def _is_calendar_month(start: date, end: date) -> bool:
+    return start.day == 1 and end == date(start.year, start.month, calendar.monthrange(start.year, start.month)[1])
+
+
+def calculate_bill_amount(kwh: float, period_start: date, period_end: date) -> int | None:
+    """Reproduce an EVN residential bill in VND including VAT, or None when it is not modelled.
+
+    Only a whole calendar month inside the tariff table is modelled.  When a price
+    change falls inside the month EVN splits it by days: every segment but the last
+    gets round(kWh * days / month_days) kWh and round(limit * days / month_days)
+    per tier limit, the last segment takes the remaining kWh, each segment is priced
+    with the table in force in it, and VAT (rate of the last segment) is added to
+    the summed pre-VAT amount.  Decimal throughout; halves round up.
+    """
+    if not _is_calendar_month(period_start, period_end) or period_start < TARIFF_ROWS[0].effective_from:
+        return None
+    total_days = (period_end - period_start).days + 1
+    starts = [period_start, *(row.effective_from for row in TARIFF_ROWS if period_start < row.effective_from <= period_end)]
+    total_kwh = max(Decimal(str(kwh)), Decimal(0))
+    remaining, pretax = total_kwh, Decimal(0)
+    for index, segment_start in enumerate(starts):
+        is_last = index == len(starts) - 1
+        days = ((period_end if is_last else starts[index + 1] - timedelta(days=1)) - segment_start).days + 1
+        segment_kwh = remaining if is_last else Decimal(_round_half_up(total_kwh * days / total_days))
+        remaining = max(remaining - segment_kwh, Decimal(0))
+        widths = [None if width is None else _round_half_up(Decimal(width) * days / total_days) for width in TIER_WIDTHS]
+        pretax += _tier_cost(segment_kwh, _tariff_on(segment_start).prices, widths)
+    return _with_vat(pretax, _tariff_on(period_end).vat_rate)
 
 
 def normalize_daily(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -170,6 +225,7 @@ def normalize_bills(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
             "NAM": _as_int(year),
             "period_start": "",
             "period_end": "",
+            "calculated_amount": None,
         })
     return result
 
@@ -179,7 +235,7 @@ def normalize_readings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]
     result = []
     for row in rows:
         year, month, period_no = _as_int(row.get("NAM")), _as_int(row.get("THANG")), _as_int(row.get("KY"))
-        if year is None or month is None or period_no is None:
+        if year is None or month is None or period_no is None or row.get("DIEN_TTHU") in (None, ""):
             continue
         result.append({
             "year": year, "month": month, "ky": period_no,
@@ -190,6 +246,14 @@ def normalize_readings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]
     return result
 
 
+def _calculated_amount(bill: Mapping[str, Any]) -> int | None:
+    """The add-on's own price of a bill, shown next to the real total_amount."""
+    start, end = _parse_iso_date(str(bill.get("period_start") or "")), _parse_iso_date(str(bill.get("period_end") or ""))
+    if bill.get("total_kwh") is None or start is None or end is None:
+        return None
+    return calculate_bill_amount(as_float(bill["total_kwh"]), start, end)
+
+
 def attach_readings(
     bills: Iterable[Mapping[str, Any]], readings: Iterable[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -197,6 +261,7 @@ def attach_readings(
 
     Several reading rows can share one key (meter swap, period change): their kWh
     is added and the period runs from the earliest start to the latest end.
+    Only the first bill of a key receives them.
     """
     grouped: dict[tuple[int, int, int], list[Mapping[str, Any]]] = {}
     for reading in readings:
@@ -204,13 +269,16 @@ def attach_readings(
     result = []
     for bill in bills:
         joined = dict(bill)
-        rows = grouped.get((bill.get("NAM"), bill.get("THANG"), bill.get("KY")))
+        # A period's readings belong to its first bill; a further invoice for the
+        # same period must not add the same kWh again.
+        rows = grouped.pop((bill.get("NAM"), bill.get("THANG"), bill.get("KY")), None)
         if rows:
             joined["total_kwh"] = round(sum(row["kwh"] for row in rows), 2)
             starts = [day for day in (_parse_iso_date(row["start"]) for row in rows) if day]
             ends = [day for day in (_parse_iso_date(row["end"]) for row in rows) if day]
             joined["period_start"] = min(starts).isoformat() if starts else ""
             joined["period_end"] = max(ends).isoformat() if ends else ""
+        joined["calculated_amount"] = _calculated_amount(joined)
         result.append(joined)
     return result
 
@@ -223,12 +291,17 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
             period = str(bill.get("period") or "")
             bucket = buckets.setdefault(period, {
                 "period": period, "total_kwh": None, "total_amount": 0, "is_paid": True,
-                "period_start": "", "period_end": "",
+                "period_start": "", "period_end": "", "calculated_amount": 0,
             })
             if bill.get("total_kwh") is not None:
                 bucket["total_kwh"] = round((bucket["total_kwh"] or 0.0) + as_float(bill.get("total_kwh")), 2)
             bucket["total_amount"] += int(as_float(bill.get("total_amount")))
             bucket["is_paid"] = bucket["is_paid"] and bool(bill.get("is_paid"))
+            calculated = bill.get("calculated_amount")
+            bucket["calculated_amount"] = (
+                None if calculated is None or bucket["calculated_amount"] is None
+                else bucket["calculated_amount"] + int(calculated)
+            )
             if bill.get("period_start"):
                 bucket["period_start"] = min(bucket["period_start"] or bill["period_start"], bill["period_start"])
             if bill.get("period_end"):

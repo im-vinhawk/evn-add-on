@@ -257,3 +257,35 @@ def test_failed_readings_request_is_not_cached(modules, monkeypatch) -> None:
     client._async_request = working
     asyncio.run(client.async_monthly_readings("PB000001"))
     assert len(requests) == 1
+
+
+def test_a_reading_is_attached_to_the_first_bill_of_its_period_only(modules) -> None:
+    """A second invoice for the same period must not count the kWh twice."""
+    calculation, _ = modules
+    readings = calculation.normalize_readings([_reading(2026, 3, 1, 150, "01/03/2026", "31/03/2026")])
+    first, second = calculation.attach_readings(
+        calculation.normalize_bills([_bill(2026, 3, amount=300000), _bill(2026, 3, amount=20000)]), readings
+    )
+    assert first["total_kwh"] == 150.0
+    assert second["total_kwh"] is None
+    assert second["period_start"] == second["period_end"] == ""
+
+
+def test_reading_without_a_kwh_value_is_ignored_not_zero(modules) -> None:
+    calculation, _ = modules
+    rows = [
+        {"NAM": 2026, "THANG": 3, "KY": 1, "DIEN_TTHU": None, "NGAY_DKY": "01/03/2026", "NGAY_CKY": "31/03/2026"},
+        {"NAM": 2026, "THANG": 3, "KY": 1, "NGAY_DKY": "01/03/2026", "NGAY_CKY": "31/03/2026"},
+    ]
+    assert calculation.normalize_readings(rows) == []
+    zero = {"NAM": 2026, "THANG": 3, "KY": 1, "DIEN_TTHU": 0, "NGAY_DKY": "01/03/2026", "NGAY_CKY": "31/03/2026"}
+    assert calculation.normalize_readings([zero])[0]["kwh"] == 0.0
+
+
+def test_cached_readings_cannot_be_changed_by_a_caller(modules, monkeypatch) -> None:
+    _, api = modules
+    monkeypatch.setattr(api.dt_util, "now", lambda: datetime(2026, 3, 15))
+    client = _client(api, [], {"data": [_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026")]})
+    client._clock = lambda: 1000.0
+    asyncio.run(client.async_monthly_readings("PB000001")).append({"junk": True})
+    assert len(asyncio.run(client.async_monthly_readings("PB000001"))) == 1

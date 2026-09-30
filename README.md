@@ -66,6 +66,11 @@ The aggregate is calculated locally:
 - Estimated cost is the sum of each meter's tier estimate; the tariff is never recalculated from aggregate kWh.
 - Official bills are the sum of EVN `TONG_TIEN` values for the same period.
 - A failed meter is surfaced as a partial aggregate rather than silently treated as zero.
+- Bill kWh comes from EVN's monthly meter readings, matched to each bill by month and period; when a reading is missing, `total_kwh` is unknown (`null`, shown as `—`), never 0.
+
+### Tariff
+
+Estimated cost and each bill's `calculated_amount` use the EVN residential tariff in force on each day: the table effective 2025-05-10 (evn.com.vn, VAT 8 %) and the earlier rows back to 2023-11-09. A month that contains a price change is split by days the way EVN bills it. `calculated_amount` sits next to the real `total_amount` in `monthly_history` and `bills`; when the two start to differ, a price change is missing: add one row with its effective date to `custom_components/evn_vietnam/tariff.py`. Only whole calendar months from 2023-11-09 are modelled; any other period shows `calculated_amount: null`.
 
 ## Known limitations
 

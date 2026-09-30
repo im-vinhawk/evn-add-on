@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
+import types
 
 
-MODULE_PATH = Path(__file__).parents[1] / "custom_components" / "evn_vietnam" / "calculation.py"
-SPEC = importlib.util.spec_from_file_location("evn_vietnam_calculation", MODULE_PATH)
+INTEGRATION_DIR = Path(__file__).parents[1] / "custom_components" / "evn_vietnam"
+PACKAGE = "evn_vietnam_calculation_test"
+# calculation imports the tariff module, so it is loaded as part of a package.
+sys.modules[PACKAGE] = types.ModuleType(PACKAGE)
+sys.modules[PACKAGE].__path__ = [str(INTEGRATION_DIR)]
+SPEC = importlib.util.spec_from_file_location(f"{PACKAGE}.calculation", INTEGRATION_DIR / "calculation.py")
 assert SPEC and SPEC.loader
 calculation = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = calculation
 SPEC.loader.exec_module(calculation)
 
 
