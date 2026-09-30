@@ -476,3 +476,29 @@ assert.ok(
   !collectTextContents(billCard.shadowRoot).includes('0,0 kWh') && collectTextContents(billCard.shadowRoot).includes('—'),
   'a bill without kWh must show the placeholder',
 );
+
+// Bill table: rows with known and unknown kWh side by side, extra period keys ignored
+const mixedBillCard = new Card();
+mixedBillCard.setConfig({ type: 'custom:evn-vietnam-energy-card', entity: 'sensor.a' });
+mixedBillCard.hass = {
+  states: {
+    'sensor.a': {
+      state: '1',
+      attributes: {
+        customer_code: 'PB000001',
+        daily_history: [],
+        monthly_history: [
+          {
+            period: 'Tháng 9/2026', total_kwh: 120, total_amount: 300000, calculated_amount: 300000,
+            period_start: '2026-09-01', period_end: '2026-09-30', KY: 1, THANG: 9, NAM: 2026,
+          },
+          { period: 'Tháng 8/2025', total_kwh: null, total_amount: 123000, calculated_amount: null },
+        ],
+      },
+    },
+  },
+};
+const mixedTexts = collectTextContents(mixedBillCard.shadowRoot);
+assert.ok(mixedTexts.includes('120 kWh'), 'a bill with known kWh must show it');
+assert.ok(mixedTexts.includes('—'), 'the bill without kWh must still show the placeholder');
+assert.ok(!mixedTexts.includes('0,0 kWh'), 'unknown kWh must never render as zero');

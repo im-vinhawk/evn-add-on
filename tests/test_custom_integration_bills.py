@@ -1,0 +1,259 @@
+"""Bill kWh comes from EVN's monthly meter readings, not from the bill rows."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+import importlib.util
+from pathlib import Path
+import sys
+import types
+
+import pytest
+
+
+INTEGRATION_DIR = Path(__file__).parents[1] / "custom_components" / "evn_vietnam"
+PACKAGE = "evn_vietnam_bills_test"
+
+
+def _load_module(name: str):
+    spec = importlib.util.spec_from_file_location(f"{PACKAGE}.{name}", INTEGRATION_DIR / f"{name}.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def modules():
+    """Load calculation and the adapter without a Home Assistant runtime."""
+    sys.modules[PACKAGE] = types.ModuleType(PACKAGE)
+    sys.modules[PACKAGE].__path__ = [str(INTEGRATION_DIR)]
+    sys.modules.setdefault("aiohttp", types.SimpleNamespace(
+        ClientSession=object, ClientError=Exception, ContentTypeError=ValueError,
+    ))
+    homeassistant = types.ModuleType("homeassistant")
+    homeassistant_util = types.ModuleType("homeassistant.util")
+    homeassistant_dt = types.ModuleType("homeassistant.util.dt")
+    homeassistant_dt.now = datetime.now
+    sys.modules.setdefault("homeassistant", homeassistant)
+    sys.modules.setdefault("homeassistant.util", homeassistant_util)
+    sys.modules.setdefault("homeassistant.util.dt", homeassistant_dt)
+    _load_module("const")
+    calculation = _load_module("calculation")
+    _load_module("models")
+    return calculation, _load_module("api")
+
+
+def _reading(year: int, month: int, ky: int, kwh: int, start: str, end: str) -> dict:
+    return {"NAM": year, "THANG": month, "KY": ky, "DIEN_TTHU": kwh, "NGAY_DKY": start, "NGAY_CKY": end}
+
+
+def _bill(year: int, month: int, ky: int = 1, amount: int = 300000, kwh: int = 0) -> dict:
+    return {"NAM": year, "THANG": month, "KY": ky, "DIEN_TTHU": kwh, "TONG_TIEN": amount}
+
+
+def test_bill_without_a_reading_has_unknown_kwh_not_zero(modules) -> None:
+    calculation, _ = modules
+    bill = calculation.normalize_bills([_bill(2026, 3)])[0]
+    assert bill["total_kwh"] is None
+    assert (bill["KY"], bill["THANG"], bill["NAM"]) == (1, 3, 2026)
+    assert bill["period_start"] == bill["period_end"] == ""
+    assert bill["total_amount"] == 300000
+
+
+def test_bill_row_with_a_real_kwh_value_is_kept_as_fallback(modules) -> None:
+    calculation, _ = modules
+    assert calculation.normalize_bills([_bill(2026, 3, kwh=42)])[0]["total_kwh"] == 42.0
+    assert calculation.normalize_bills([{"THANG": 3, "NAM": 2026, "totalKwh": 7.5}])[0]["total_kwh"] == 7.5
+
+
+def test_readings_of_one_period_are_summed_and_dated(modules) -> None:
+    """A meter swap yields several reading rows for one bill period."""
+    calculation, _ = modules
+    readings = calculation.normalize_readings([
+        _reading(2026, 3, 1, 100, "01/03/2026", "15/03/2026"),
+        _reading(2026, 3, 1, 20, "16/03/2026", "31/03/2026"),
+        _reading(2026, 2, 1, 90, "01/02/2026", "28/02/2026"),
+    ])
+    bills = calculation.attach_readings(calculation.normalize_bills([_bill(2026, 3)]), readings)
+    assert bills[0]["total_kwh"] == 120.0
+    assert bills[0]["period_start"] == "2026-03-01"
+    assert bills[0]["period_end"] == "2026-03-31"
+
+
+def test_reading_is_matched_on_year_month_and_period_number(modules) -> None:
+    calculation, _ = modules
+    readings = calculation.normalize_readings([
+        _reading(2025, 3, 1, 50, "01/03/2025", "31/03/2025"),
+        _reading(2026, 3, 2, 60, "01/03/2026", "31/03/2026"),
+    ])
+    bills = calculation.attach_readings(
+        calculation.normalize_bills([_bill(2026, 3, ky=1), _bill(2025, 3, ky=1)]), readings
+    )
+    assert bills[0]["total_kwh"] is None
+    assert bills[1]["total_kwh"] == 50.0
+
+
+def test_unusable_reading_rows_are_ignored(modules) -> None:
+    calculation, _ = modules
+    readings = calculation.normalize_readings([
+        {"DIEN_TTHU": 5}, {"NAM": "x", "THANG": 3, "KY": 1}, _reading(2026, 3, 1, 10, "not a date", ""),
+    ])
+    bill = calculation.attach_readings(calculation.normalize_bills([_bill(2026, 3)]), readings)[0]
+    assert bill["total_kwh"] == 10.0
+    assert bill["period_start"] == bill["period_end"] == ""
+
+
+def test_attach_readings_does_not_mutate_its_input(modules) -> None:
+    calculation, _ = modules
+    bills = calculation.normalize_bills([_bill(2026, 3)])
+    calculation.attach_readings(
+        bills, calculation.normalize_readings([_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026")])
+    )
+    assert bills[0]["total_kwh"] is None
+
+
+def test_aggregate_sums_only_known_kwh(modules) -> None:
+    calculation, _ = modules
+    known = {"period": "Tháng 3/2026", "total_kwh": 120.0, "total_amount": 100, "is_paid": True}
+    unknown = {"period": "Tháng 3/2026", "total_kwh": None, "total_amount": 50, "is_paid": True}
+    rows = calculation.aggregate_bills([[known], [unknown]])
+    assert rows[0]["total_kwh"] == 120.0
+    assert rows[0]["total_amount"] == 150
+    assert calculation.aggregate_bills([[unknown], [unknown]])[0]["total_kwh"] is None
+
+
+def test_aggregate_period_spans_every_meter(modules) -> None:
+    calculation, _ = modules
+    first = {"period": "Tháng 3/2026", "total_kwh": 1.0, "total_amount": 1, "is_paid": True,
+             "period_start": "2026-03-01", "period_end": "2026-03-30"}
+    second = {"period": "Tháng 3/2026", "total_kwh": 1.0, "total_amount": 1, "is_paid": True,
+              "period_start": "2026-03-02", "period_end": "2026-03-31"}
+    row = calculation.aggregate_bills([[first], [second]])[0]
+    assert (row["period_start"], row["period_end"]) == ("2026-03-01", "2026-03-31")
+
+
+def test_december_sorts_before_the_following_january_newest_first(modules) -> None:
+    calculation, _ = modules
+    rows = calculation.aggregate_bills([[
+        {"period": "Tháng 12/2025", "total_kwh": 1.0, "total_amount": 1, "is_paid": True},
+        {"period": "Tháng 1/2026", "total_kwh": 1.0, "total_amount": 1, "is_paid": True},
+    ]])
+    assert [row["period"] for row in rows] == ["Tháng 1/2026", "Tháng 12/2025"]
+
+
+def _client(api_module, requests: list, payload):
+    state = api_module.SessionState("user", "token", "refresh", "device", "PB000001", "PB000001")
+    client = api_module.EvnClient(object(), state, {"PB000001": "PB000001001", "PB000002": "PB000002001"})
+
+    async def switch_customer(_: str) -> None:
+        return None
+
+    async def request(method, url, body=None):
+        requests.append((method, url, body))
+        return payload
+
+    client._async_switch_customer = switch_customer
+    client._async_request = request
+    return client
+
+
+def test_bills_are_requested_for_previous_and_current_year_in_one_call(modules, monkeypatch) -> None:
+    _, api = modules
+    monkeypatch.setattr(api.dt_util, "now", lambda: datetime(2026, 1, 10))
+    requests: list = []
+    client = _client(api, requests, {"data": []})
+    asyncio.run(client.async_bills("PB000001"))
+    assert len(requests) == 1
+    assert requests[0][1].endswith("/api/evn/tracuu/lichsu-hoadon")
+    assert requests[0][2] == {"MA_KHANG": "PB000001", "TU_THANG_NAM": "01/2025", "DEN_THANG_NAM": "12/2026"}
+
+
+def test_monthly_readings_request_shape_and_range(modules, monkeypatch) -> None:
+    _, api = modules
+    monkeypatch.setattr(api.dt_util, "now", lambda: datetime(2026, 3, 15))
+    requests: list = []
+    payload = {"success": True, "status": "OK", "statusCode": 200, "data": [
+        _reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026"),
+    ]}
+    client = _client(api, requests, payload)
+    rows = asyncio.run(client.async_monthly_readings("PB000001"))
+    assert requests[0][0] == "POST"
+    assert requests[0][1].endswith("/api/evn/tracuu/chisothang")
+    assert requests[0][2] == {
+        "MA_KHANG": "PB000001", "MA_DDO": "PB000001001", "TU_THANG_NAM": "01/2025", "DEN_THANG_NAM": "03/2026",
+    }
+    assert [(row["year"], row["month"], row["ky"], row["kwh"]) for row in rows] == [(2026, 3, 1, 10.0)]
+
+
+def test_monthly_readings_shape_is_recorded_without_values(modules, monkeypatch) -> None:
+    _, api = modules
+    monkeypatch.setattr(api.dt_util, "now", lambda: datetime(2026, 3, 15))
+    row = {**_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026"), "MA_KHANG": "PB000001", "SO_CTO": "123456789"}
+    client = _client(api, [], {"data": [row]})
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    shape = client.last_shapes["monthly_readings"]
+    assert shape["DIEN_TTHU"] == "int/2d"
+    assert shape["NGAY_DKY"] == "str/len10/date-dmy"
+    dumped = repr(shape)
+    assert "PB000001" not in dumped and "123456789" not in dumped
+
+
+def test_monthly_readings_are_cached_per_code_for_six_hours(modules, monkeypatch) -> None:
+    _, api = modules
+    monkeypatch.setattr(api.dt_util, "now", lambda: datetime(2026, 3, 15))
+    requests: list = []
+    client = _client(api, requests, {"data": [_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026")]})
+    now = [1000.0]
+    client._clock = lambda: now[0]
+
+    first = asyncio.run(client.async_monthly_readings("PB000001"))
+    now[0] += 6 * 3600 - 1
+    assert asyncio.run(client.async_monthly_readings("PB000001")) == first
+    assert len(requests) == 1
+
+    asyncio.run(client.async_monthly_readings("PB000002"))
+    assert len(requests) == 2
+
+    now[0] += 2
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    assert len(requests) == 3
+
+
+def test_monthly_readings_cache_is_dropped_when_the_month_changes(modules, monkeypatch) -> None:
+    _, api = modules
+    today = [datetime(2026, 3, 31)]
+    monkeypatch.setattr(api.dt_util, "now", lambda: today[0])
+    requests: list = []
+    client = _client(api, requests, {"data": []})
+    client._clock = lambda: 1000.0
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    today[0] = datetime(2026, 4, 1)
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    assert len(requests) == 2
+    assert requests[1][2]["DEN_THANG_NAM"] == "04/2026"
+
+
+def test_failed_readings_request_is_not_cached(modules, monkeypatch) -> None:
+    _, api = modules
+    monkeypatch.setattr(api.dt_util, "now", lambda: datetime(2026, 3, 15))
+    requests: list = []
+    client = _client(api, requests, {"data": []})
+    client._clock = lambda: 1000.0
+
+    async def failing(*_args, **_kwargs):
+        raise api.EvnApiError("HTTP 500", status=500)
+
+    client._async_request = failing
+    with pytest.raises(api.EvnApiError):
+        asyncio.run(client.async_monthly_readings("PB000001"))
+
+    async def working(method, url, body=None):
+        requests.append(url)
+        return {"data": []}
+
+    client._async_request = working
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    assert len(requests) == 1

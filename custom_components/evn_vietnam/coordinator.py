@@ -15,7 +15,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import EvnApiError, EvnAuthenticationError, EvnClient, EvnCustomerSwitchError, EvnMeterPointError
-from .calculation import aggregate_selected_overviews
+from .calculation import aggregate_selected_overviews, attach_readings
 from .const import (
     CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE,
     CONF_REFRESH_TOKEN, DEFAULT_SCAN_INTERVAL, DOMAIN, SESSION_KEEPALIVE_INTERVAL,
@@ -99,7 +99,9 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for code in codes:
                 try:
                     overview = await self._client.async_overview(code)
-                    overview["bills"] = await self._client.async_bills(code)
+                    overview["bills"] = attach_readings(
+                        await self._client.async_bills(code), await self._async_readings_or_empty(code)
+                    )
                     # The legacy monthly history is derived from official bills.
                     overview["monthly_history"] = overview["bills"]
                     meters[code] = overview
@@ -120,6 +122,16 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             aggregate_codes = aggregate_customer_codes(self.config_entry)
             aggregate = aggregate_selected_overviews(meters, aggregate_codes, partial_errors)
             return {"meters": meters, "aggregate": aggregate, "partial_errors": partial_errors}
+
+    async def _async_readings_or_empty(self, code: str) -> list[dict[str, Any]]:
+        """Bills stay useful without their kWh, so a readings failure only leaves kWh unknown."""
+        try:
+            return await self._client.async_monthly_readings(code)
+        except EvnAuthenticationError:
+            raise
+        except EvnApiError:
+            _LOGGER.debug("EVN monthly readings unavailable; bill kWh stays unknown")
+            return []
 
     def _persist_changed_tokens(self) -> None:
         """Persist refreshed/switched tokens while retaining stored credentials."""

@@ -28,6 +28,8 @@ DEFAULT_SCAN_INTERVAL = timedelta(minutes=30)
 SESSION_KEEPALIVE_INTERVAL = timedelta(minutes=8)
 DEFAULT_TIMEOUT = 20
 DAILY_HISTORY_DAYS = 31
+# Monthly readings change at most daily; one fetch per code serves several refreshes.
+MONTHLY_READINGS_CACHE_SECONDS = 6 * 3600
 CARD_FILENAME = "evn-vietnam-energy-card.js"
 CARD_MODULE_URL = f"/{DOMAIN}/{CARD_FILENAME}"
 

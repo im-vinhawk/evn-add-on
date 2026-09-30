@@ -130,8 +130,27 @@ def aggregate_daily(daily_series: Iterable[tuple[str, Iterable[Mapping[str, Any]
     return [by_date[key] for key in sorted(by_date)]
 
 
+def _as_int(value: Any) -> int | None:
+    """Parse an EVN integer field; unusable values are unknown, not zero."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_iso_date(value: str) -> date | None:
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def normalize_bills(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize official bills; their amount is never re-priced."""
+    """Normalize official bills; their amount is never re-priced.
+
+    EVN's bill rows carry no real kWh (DIEN_TTHU is always 0 there), so kWh stays
+    unknown (None) until attach_readings joins the monthly meter readings.
+    """
     result = []
     for row in rows:
         month, year = row.get("THANG", row.get("thang")), row.get("NAM", row.get("nam"))
@@ -139,13 +158,60 @@ def normalize_bills(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
             period = f"Tháng {int(month)}/{int(year)}"
         except (TypeError, ValueError):
             period = str(row.get("period") or "")
+        kwh = as_float(row.get("DIEN_TTHU", row.get("totalKwh", 0)))
         result.append({
             "period": period,
-            "total_kwh": as_float(row.get("DIEN_TTHU", row.get("totalKwh", 0))),
+            "total_kwh": kwh if kwh > 0 else None,
             "total_amount": round(as_float(row.get("TONG_TIEN", row.get("totalAmount", 0)))),
             "is_paid": bool(row.get("isPaid", True)),
             "issue_date": row.get("NGAY_TTOAN", row.get("issueDate", "")),
+            "KY": _as_int(row.get("KY", row.get("ky"))),
+            "THANG": _as_int(month),
+            "NAM": _as_int(year),
+            "period_start": "",
+            "period_end": "",
         })
+    return result
+
+
+def normalize_readings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Reduce EVN monthly meter-reading rows to the fields a bill needs."""
+    result = []
+    for row in rows:
+        year, month, period_no = _as_int(row.get("NAM")), _as_int(row.get("THANG")), _as_int(row.get("KY"))
+        if year is None or month is None or period_no is None:
+            continue
+        result.append({
+            "year": year, "month": month, "ky": period_no,
+            "kwh": as_float(row.get("DIEN_TTHU")),
+            "start": to_iso_date(row.get("NGAY_DKY")),
+            "end": to_iso_date(row.get("NGAY_CKY")),
+        })
+    return result
+
+
+def attach_readings(
+    bills: Iterable[Mapping[str, Any]], readings: Iterable[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Join monthly readings to bills on (year, month, period number).
+
+    Several reading rows can share one key (meter swap, period change): their kWh
+    is added and the period runs from the earliest start to the latest end.
+    """
+    grouped: dict[tuple[int, int, int], list[Mapping[str, Any]]] = {}
+    for reading in readings:
+        grouped.setdefault((reading["year"], reading["month"], reading["ky"]), []).append(reading)
+    result = []
+    for bill in bills:
+        joined = dict(bill)
+        rows = grouped.get((bill.get("NAM"), bill.get("THANG"), bill.get("KY")))
+        if rows:
+            joined["total_kwh"] = round(sum(row["kwh"] for row in rows), 2)
+            starts = [day for day in (_parse_iso_date(row["start"]) for row in rows) if day]
+            ends = [day for day in (_parse_iso_date(row["end"]) for row in rows) if day]
+            joined["period_start"] = min(starts).isoformat() if starts else ""
+            joined["period_end"] = max(ends).isoformat() if ends else ""
+        result.append(joined)
     return result
 
 
@@ -155,10 +221,18 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
     for rows in bill_series:
         for bill in rows:
             period = str(bill.get("period") or "")
-            bucket = buckets.setdefault(period, {"period": period, "total_kwh": 0.0, "total_amount": 0, "is_paid": True})
-            bucket["total_kwh"] = round(bucket["total_kwh"] + as_float(bill.get("total_kwh")), 2)
+            bucket = buckets.setdefault(period, {
+                "period": period, "total_kwh": None, "total_amount": 0, "is_paid": True,
+                "period_start": "", "period_end": "",
+            })
+            if bill.get("total_kwh") is not None:
+                bucket["total_kwh"] = round((bucket["total_kwh"] or 0.0) + as_float(bill.get("total_kwh")), 2)
             bucket["total_amount"] += int(as_float(bill.get("total_amount")))
             bucket["is_paid"] = bucket["is_paid"] and bool(bill.get("is_paid"))
+            if bill.get("period_start"):
+                bucket["period_start"] = min(bucket["period_start"] or bill["period_start"], bill["period_start"])
+            if bill.get("period_end"):
+                bucket["period_end"] = max(bucket["period_end"], bill["period_end"])
     return sorted(buckets.values(), key=lambda item: _period_sort_key(item["period"]), reverse=True)
 
 

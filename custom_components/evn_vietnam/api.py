@@ -7,6 +7,7 @@ from datetime import date, timedelta
 import base64
 import json
 import logging
+import time
 from typing import Any
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -14,8 +15,12 @@ from uuid import uuid4
 import aiohttp
 from homeassistant.util import dt as dt_util
 
-from .calculation import as_float, calculate_tier_cost, describe_shape, normalize_bills, normalize_daily
-from .const import DAILY_HISTORY_DAYS, DEFAULT_TIMEOUT, NATIONAL_BASE_URL, REGIONAL_GATEWAYS
+from .calculation import (
+    as_float, calculate_tier_cost, describe_shape, normalize_bills, normalize_daily, normalize_readings,
+)
+from .const import (
+    DAILY_HISTORY_DAYS, DEFAULT_TIMEOUT, MONTHLY_READINGS_CACHE_SECONDS, NATIONAL_BASE_URL, REGIONAL_GATEWAYS,
+)
 from .models import (
     SessionState,
     extract_linked_customer_meter_points,
@@ -127,6 +132,9 @@ class EvnClient:
         self._password = password
         # Key/type-only description of the latest raw rows, for diagnostics.
         self.last_shapes: dict[str, dict[str, Any]] = {}
+        self._clock = time.monotonic
+        # code -> (fetched_at, (year, month), rows); keyed by month so a new month refetches.
+        self._readings_cache: dict[str, tuple[float, tuple[int, int], list[dict[str, Any]]]] = {}
 
     @staticmethod
     def new_device_id() -> str:
@@ -467,9 +475,9 @@ class EvnClient:
         }
 
     async def async_bills(self, customer_code: str) -> list[dict[str, Any]]:
-        year = date.today().year
+        year = dt_util.now().year
         await self._async_switch_customer(customer_code)
-        body = {"MA_KHANG": customer_code, "TU_THANG_NAM": f"01/{year}", "DEN_THANG_NAM": f"12/{year}"}
+        body = {"MA_KHANG": customer_code, "TU_THANG_NAM": f"01/{year - 1}", "DEN_THANG_NAM": f"12/{year}"}
         payload = await self._async_request("POST", self._regional_url(customer_code, "tracuu/lichsu-hoadon"), body)
         rows = _extract_rows(
             payload,
@@ -482,3 +490,27 @@ class EvnClient:
         )
         self._record_shape("bills", rows)
         return normalize_bills(row for row in rows if isinstance(row, dict))
+
+    async def async_monthly_readings(self, customer_code: str) -> list[dict[str, Any]]:
+        """Monthly meter readings since January of last year; they carry each bill's real kWh."""
+        customer_code = customer_code.strip().upper()
+        today = dt_util.now().date()
+        month_key = (today.year, today.month)
+        cached = self._readings_cache.get(customer_code)
+        if cached and cached[1] == month_key and self._clock() - cached[0] < MONTHLY_READINGS_CACHE_SECONDS:
+            return cached[2]
+        meter_point = await self._async_meter_point(customer_code)
+        body = {
+            "MA_KHANG": customer_code, "MA_DDO": meter_point,
+            "TU_THANG_NAM": f"01/{today.year - 1}", "DEN_THANG_NAM": f"{today.month:02d}/{today.year}",
+        }
+        payload = await self._async_request("POST", self._regional_url(customer_code, "tracuu/chisothang"), body)
+        rows = _extract_rows(
+            payload,
+            ("data", "items"),
+            (("THANG", "thang"), ("NAM", "nam"), ("DIEN_TTHU", "dienTthu")),
+        )
+        self._record_shape("monthly_readings", rows)
+        readings = normalize_readings(row for row in rows if isinstance(row, dict))
+        self._readings_cache[customer_code] = (self._clock(), month_key, readings)
+        return readings

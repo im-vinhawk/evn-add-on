@@ -183,3 +183,58 @@ def test_reauth_retains_roster_password_and_device_id(modules, monkeypatch) -> N
     assert received[-1] == "device-1"
     assert updates[0]["password"] == "secret-pass"
     assert updates[0]["linked_customers"]["PB000002"] == "PB000002009"
+
+
+def _update_coordinator(modules, client):
+    model, _, _, coordinator = modules
+    entry = types.SimpleNamespace(
+        data={"primary_customer_code": "PB000001", "linked_customers": {"PB000001": "PB000001009"}},
+        options={},
+    )
+    instance = object.__new__(coordinator.EvnDataUpdateCoordinator)
+    instance.config_entry = entry
+    instance._update_lock = asyncio.Lock()
+    instance._client = client
+    instance._persist_changed_tokens = lambda: None
+    return instance
+
+
+def _bill_client(api, readings):
+    async def overview(_code):
+        return {"customer_code": "PB000001", "current_month_consumption": 1.0, "current_month_amount": 1}
+
+    async def bills(_code):
+        return [{
+            "period": "Tháng 3/2026", "total_kwh": None, "total_amount": 300000, "is_paid": True,
+            "issue_date": "", "KY": 1, "THANG": 3, "NAM": 2026, "period_start": "", "period_end": "",
+        }]
+
+    async def monthly_readings(_code):
+        if isinstance(readings, Exception):
+            raise readings
+        return readings
+
+    return types.SimpleNamespace(
+        async_overview=overview, async_bills=bills, async_monthly_readings=monthly_readings,
+        last_shapes={}, linked_customer_meter_points={},
+    )
+
+
+def test_update_joins_readings_onto_bills(modules) -> None:
+    _, api, _, _ = modules
+    client = _bill_client(api, [{"year": 2026, "month": 3, "ky": 1, "kwh": 120.0, "start": "2026-03-01", "end": "2026-03-31"}])
+    data = asyncio.run(_update_coordinator(modules, client)._async_update_data())
+    bill = data["meters"]["PB000001"]["bills"][0]
+    assert bill["total_kwh"] == 120.0
+    assert bill["period_end"] == "2026-03-31"
+    assert data["meters"]["PB000001"]["monthly_history"] == data["meters"]["PB000001"]["bills"]
+
+
+def test_update_keeps_bills_when_readings_fail(modules) -> None:
+    _, api, _, _ = modules
+    client = _bill_client(api, api.EvnApiError("HTTP 500", status=500))
+    data = asyncio.run(_update_coordinator(modules, client)._async_update_data())
+    assert data["partial_errors"] == {}
+    bill = data["meters"]["PB000001"]["bills"][0]
+    assert bill["total_kwh"] is None
+    assert bill["total_amount"] == 300000
