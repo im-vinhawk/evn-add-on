@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import base64
 import json
 import logging
@@ -134,8 +134,11 @@ class EvnClient:
         # Key/type-only description of the latest raw rows, for diagnostics.
         self.last_shapes: dict[str, dict[str, Any]] = {}
         self._clock = time.monotonic
-        # code -> (fetched_at, (year, month), rows); keyed by month so a new month refetches.
-        self._readings_cache: dict[str, tuple[float, tuple[int, int], list[dict[str, Any]]]] = {}
+        # code -> (monotonic fetched_at, (year, month), rows, wall-clock fetched_at); keyed by month so a
+        # new month refetches. Kept after expiry: a failed refresh falls back to the last good rows.
+        self._readings_cache: dict[str, tuple[float, tuple[int, int], list[dict[str, Any]], datetime]] = {}
+        # code -> (wall-clock fetched_at, rows) of the last successful bills fetch.
+        self._bills_cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = {}
 
     @staticmethod
     def new_device_id() -> str:
@@ -477,6 +480,23 @@ class EvnClient:
         }
 
     async def async_bills(self, customer_code: str) -> list[dict[str, Any]]:
+        """Official bills of last and this year; the last good copy stands in when EVN fails.
+
+        A closed bill never changes, so an older copy is as correct as a fresh one.
+        """
+        key = customer_code.strip().upper()
+        try:
+            bills = await self._async_fetch_bills(customer_code)
+        except EvnApiError:
+            cached = self._bills_cache.get(key)
+            if cached is None:
+                raise
+            _LOGGER.debug("EVN bills unavailable; showing the last successful fetch")
+            return [dict(row) for row in cached[1]]
+        self._bills_cache[key] = (dt_util.now(), [dict(row) for row in bills])
+        return bills
+
+    async def _async_fetch_bills(self, customer_code: str) -> list[dict[str, Any]]:
         year = dt_util.now().year
         await self._async_switch_customer(customer_code)
         body = {"MA_KHANG": customer_code, "TU_THANG_NAM": f"01/{year - 1}", "DEN_THANG_NAM": f"12/{year}"}
@@ -494,13 +514,28 @@ class EvnClient:
         return normalize_bills(row for row in rows if isinstance(row, dict))
 
     async def async_monthly_readings(self, customer_code: str) -> list[dict[str, Any]]:
-        """Monthly meter readings since January of last year; they carry each bill's real kWh."""
+        """Monthly meter readings since January of last year; they carry each bill's real kWh.
+
+        A failed refresh returns the last good rows of any age; it raises only
+        when this code has never been read successfully.
+        """
         customer_code = customer_code.strip().upper()
         today = dt_util.now().date()
         month_key = (today.year, today.month)
         cached = self._readings_cache.get(customer_code)
         if cached and cached[1] == month_key and self._clock() - cached[0] < MONTHLY_READINGS_CACHE_SECONDS:
             return list(cached[2])
+        try:
+            readings = await self._async_fetch_monthly_readings(customer_code, today)
+        except EvnApiError:
+            if cached is None:
+                raise
+            _LOGGER.debug("EVN monthly readings unavailable; showing the last successful fetch")
+            return list(cached[2])
+        self._readings_cache[customer_code] = (self._clock(), month_key, readings, dt_util.now())
+        return list(readings)
+
+    async def _async_fetch_monthly_readings(self, customer_code: str, today: date) -> list[dict[str, Any]]:
         meter_point = await self._async_meter_point(customer_code)
         body = {
             "MA_KHANG": customer_code, "MA_DDO": meter_point,
@@ -513,6 +548,25 @@ class EvnClient:
             (("THANG", "thang"), ("NAM", "nam"), ("DIEN_TTHU", "dienTthu")),
         )
         self._record_shape("monthly_readings", rows)
-        readings = normalize_readings(row for row in rows if isinstance(row, dict))
-        self._readings_cache[customer_code] = (self._clock(), month_key, readings)
-        return list(readings)
+        return normalize_readings(row for row in rows if isinstance(row, dict))
+
+    def history_fetched_at(self, customer_code: str) -> str:
+        """ISO time of the oldest successful fetch behind a code's shown history, or "" if none yet."""
+        customer_code = customer_code.strip().upper()
+        bills, readings = self._bills_cache.get(customer_code), self._readings_cache.get(customer_code)
+        stamps = [bills[0]] if bills else []
+        stamps += [readings[3]] if readings else []
+        return min(stamps).isoformat(timespec="seconds") if stamps else ""
+
+    def cached_history(self, customer_code: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str] | None:
+        """Last good (bills, readings, fetched_at) without any request; None until bills were fetched once."""
+        customer_code = customer_code.strip().upper()
+        bills = self._bills_cache.get(customer_code)
+        if bills is None:
+            return None
+        readings = self._readings_cache.get(customer_code)
+        return (
+            [dict(row) for row in bills[1]],
+            list(readings[2]) if readings else [],
+            self.history_fetched_at(customer_code),
+        )

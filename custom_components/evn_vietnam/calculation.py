@@ -150,14 +150,28 @@ def aggregate_selected_overviews(
     meters: Mapping[str, Mapping[str, Any]],
     selected_codes: list[str],
     partial_errors: Mapping[str, str],
+    history_only: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Aggregate only the selected successful meters with scoped provenance."""
+    """Aggregate only the selected successful meters with scoped provenance.
+
+    history_only carries the last good bills of a selected code whose live call
+    failed ({"bills": [...], "history_fetched_at": iso}); only the bill history
+    uses it, so the aggregate does not silently lose a meter's past bills.
+    """
     if len(selected_codes) < 2:
         return None
+    history_only = history_only or {}
     successful_codes = [code for code in selected_codes if code in meters]
     aggregate = aggregate_overviews((meters[code] for code in successful_codes), selected_codes)
     aggregate["successful_customer_codes"] = successful_codes
-    aggregate["bills"] = aggregate_bills(meters[code].get("bills", []) for code in successful_codes)
+    history = [
+        meters[code] if code in meters else history_only[code]
+        for code in selected_codes if code in meters or code in history_only
+    ]
+    aggregate["bills"] = aggregate_bills(item.get("bills", []) for item in history)
+    aggregate["history_fetched_at"] = min(
+        (str(item["history_fetched_at"]) for item in history if item.get("history_fetched_at")), default=""
+    )
     aggregate["monthly_history"] = aggregate["bills"]
     aggregate["daily_history"] = aggregate_daily(
         (code, meters[code].get("daily_history", [])) for code in successful_codes
@@ -284,17 +298,26 @@ def attach_readings(
 
 
 def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[dict[str, Any]]:
-    """Join official bills by billing period and add kWh and VND independently."""
+    """Join official bills by billing period and add kWh and VND independently.
+
+    kWh and the calculated amount of a period are unknown (None) as soon as one
+    bill of that period has no value: a partial sum would look complete.  A code
+    with no bill for the period does not take part.
+    """
     buckets: dict[str, dict[str, Any]] = {}
+    kwh_known: dict[str, bool] = {}
     for rows in bill_series:
         for bill in rows:
             period = str(bill.get("period") or "")
             bucket = buckets.setdefault(period, {
-                "period": period, "total_kwh": None, "total_amount": 0, "is_paid": True,
+                "period": period, "total_kwh": 0.0, "total_amount": 0, "is_paid": True,
                 "period_start": "", "period_end": "", "calculated_amount": 0,
             })
-            if bill.get("total_kwh") is not None:
-                bucket["total_kwh"] = round((bucket["total_kwh"] or 0.0) + as_float(bill.get("total_kwh")), 2)
+            if bill.get("total_kwh") is None:
+                kwh_known[period] = False
+            else:
+                kwh_known.setdefault(period, True)
+                bucket["total_kwh"] = round(bucket["total_kwh"] + as_float(bill.get("total_kwh")), 2)
             bucket["total_amount"] += int(as_float(bill.get("total_amount")))
             bucket["is_paid"] = bucket["is_paid"] and bool(bill.get("is_paid"))
             calculated = bill.get("calculated_amount")
@@ -306,6 +329,9 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
                 bucket["period_start"] = min(bucket["period_start"] or bill["period_start"], bill["period_start"])
             if bill.get("period_end"):
                 bucket["period_end"] = max(bucket["period_end"], bill["period_end"])
+    for period, bucket in buckets.items():
+        if not kwh_known[period]:
+            bucket["total_kwh"] = None
     return sorted(buckets.values(), key=lambda item: _period_sort_key(item["period"]), reverse=True)
 
 

@@ -104,6 +104,7 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                     # The legacy monthly history is derived from official bills.
                     overview["monthly_history"] = overview["bills"]
+                    overview["history_fetched_at"] = self._client.history_fetched_at(code)
                     meters[code] = overview
                 except EvnAuthenticationError as err:
                     raise ConfigEntryAuthFailed("EVN session expired; reauthenticate this integration") from err
@@ -120,8 +121,22 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not meters:
                 raise UpdateFailed("EVN could not return data for any configured customer")
             aggregate_codes = aggregate_customer_codes(self.config_entry)
-            aggregate = aggregate_selected_overviews(meters, aggregate_codes, partial_errors)
+            aggregate = aggregate_selected_overviews(
+                meters, aggregate_codes, partial_errors, self._last_good_history(partial_errors, meters)
+            )
             return {"meters": meters, "aggregate": aggregate, "partial_errors": partial_errors}
+
+    def _last_good_history(
+        self, partial_errors: dict[str, str], meters: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """Last good bills of codes whose live call failed, read from the client's memory only."""
+        history: dict[str, dict[str, Any]] = {}
+        for code in partial_errors:
+            cached = None if code in meters else self._client.cached_history(code)
+            if cached is not None:
+                bills, readings, fetched_at = cached
+                history[code] = {"bills": attach_readings(bills, readings), "history_fetched_at": fetched_at}
+        return history
 
     async def _async_readings_or_empty(self, code: str) -> list[dict[str, Any]]:
         """Bills stay useful without their kWh, so a readings failure only leaves kWh unknown."""

@@ -85,6 +85,7 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
             attrs["daily_history"] = item.get("daily_history", [])
             attrs["monthly_history"] = item.get("monthly_history", [])
             attrs["latest_reading"] = item.get("latest_index")
+            attrs["history_fetched_at"] = item.get("history_fetched_at", "")
         if self._metric == "current_month_amount":
             attrs["bills"] = item.get("bills", [])
         if self._customer_code == "__aggregate__":

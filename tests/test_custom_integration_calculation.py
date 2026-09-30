@@ -97,6 +97,7 @@ def test_selected_aggregate_keeps_explicit_partial_state_when_no_selected_meter_
         "current_month_consumption": 0,
         "current_month_amount": 0,
         "successful_customer_codes": [],
+        "history_fetched_at": "",
         "bills": [],
         "monthly_history": [],
         "daily_history": [],

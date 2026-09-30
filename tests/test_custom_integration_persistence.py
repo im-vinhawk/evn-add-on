@@ -217,6 +217,7 @@ def _bill_client(api, readings):
     return types.SimpleNamespace(
         async_overview=overview, async_bills=bills, async_monthly_readings=monthly_readings,
         last_shapes={}, linked_customer_meter_points={},
+        history_fetched_at=lambda _code: "", cached_history=lambda _code: None,
     )
 
 
@@ -238,3 +239,104 @@ def test_update_keeps_bills_when_readings_fail(modules) -> None:
     bill = data["meters"]["PB000001"]["bills"][0]
     assert bill["total_kwh"] is None
     assert bill["total_amount"] == 300000
+
+
+class _TwoCodeClient:
+    """Stub client for two codes; a code in `failing_overview` fails its live call only."""
+
+    def __init__(self, bills_by_code, stamps, failing_overview=()):
+        self.bills_by_code, self.stamps, self.failing_overview = bills_by_code, stamps, set(failing_overview)
+        self.last_shapes, self.linked_customer_meter_points = {}, {}
+        self.bills_calls: list[str] = []
+
+    async def async_overview(self, code):
+        if code in self.failing_overview:
+            raise self.api.EvnApiError("HTTP 500", status=500)
+        return {"customer_code": code, "current_month_consumption": 1.0, "current_month_amount": 1}
+
+    async def async_bills(self, code):
+        self.bills_calls.append(code)
+        return [dict(bill) for bill in self.bills_by_code[code]]
+
+    async def async_monthly_readings(self, _code):
+        return []
+
+    def history_fetched_at(self, code):
+        return self.stamps.get(code, "")
+
+    def cached_history(self, code):
+        if code not in self.bills_by_code:
+            return None
+        return [dict(bill) for bill in self.bills_by_code[code]], [], self.stamps.get(code, "")
+
+
+def _two_code_coordinator(modules, client):
+    _, api, _, coordinator = modules
+    client.api = api
+    entry = types.SimpleNamespace(
+        data={
+            "primary_customer_code": "PB000001",
+            "linked_customers": {"PB000001": "PB000001009", "PB000002": "PB000002009"},
+        },
+        options={},
+    )
+    instance = object.__new__(coordinator.EvnDataUpdateCoordinator)
+    instance.config_entry = entry
+    instance._update_lock = asyncio.Lock()
+    instance._client = client
+    instance._persist_changed_tokens = lambda: None
+    return instance
+
+
+def _march_bill(kwh, amount):
+    return {
+        "period": "Tháng 3/2026", "total_kwh": kwh, "total_amount": amount, "is_paid": True, "issue_date": "",
+        "KY": 1, "THANG": 3, "NAM": 2026, "period_start": "", "period_end": "", "calculated_amount": None,
+    }
+
+
+def test_update_exposes_history_fetched_at_per_code_and_the_oldest_for_the_aggregate(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(100.0, 200)], "PB000002": [_march_bill(50.0, 100)]},
+        {"PB000001": "2026-03-15T10:00:00", "PB000002": "2026-03-14T08:00:00"},
+    )
+    data = asyncio.run(_two_code_coordinator(modules, client)._async_update_data())
+    assert data["meters"]["PB000001"]["history_fetched_at"] == "2026-03-15T10:00:00"
+    assert data["meters"]["PB000002"]["history_fetched_at"] == "2026-03-14T08:00:00"
+    assert data["aggregate"]["history_fetched_at"] == "2026-03-14T08:00:00"
+
+
+def test_aggregate_history_keeps_a_code_whose_live_overview_failed(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(100.0, 200)], "PB000002": [_march_bill(50.0, 100)]},
+        {"PB000001": "2026-03-15T10:00:00", "PB000002": "2026-03-14T08:00:00"},
+        failing_overview=["PB000002"],
+    )
+    data = asyncio.run(_two_code_coordinator(modules, client)._async_update_data())
+    assert data["partial_errors"] == {"PB000002": "api_error"}
+    assert "PB000002" not in data["meters"]
+    row = data["aggregate"]["bills"][0]
+    assert (row["total_kwh"], row["total_amount"]) == (150.0, 300)
+    assert data["aggregate"]["history_fetched_at"] == "2026-03-14T08:00:00"
+    assert data["aggregate"]["successful_customer_codes"] == ["PB000001"]
+    assert client.bills_calls == ["PB000001"]
+
+
+def test_failed_overview_without_any_last_good_history_adds_nothing_to_the_aggregate(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(100.0, 200)]}, {"PB000001": "2026-03-15T10:00:00"}, failing_overview=["PB000002"],
+    )
+    data = asyncio.run(_two_code_coordinator(modules, client)._async_update_data())
+    assert data["aggregate"]["bills"][0]["total_amount"] == 200
+    assert data["aggregate"]["history_fetched_at"] == "2026-03-15T10:00:00"
+
+
+def test_failed_overview_does_not_affect_live_values_of_the_aggregate(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(100.0, 200)], "PB000002": [_march_bill(50.0, 100)]},
+        {"PB000001": "a", "PB000002": "b"},
+        failing_overview=["PB000002"],
+    )
+    data = asyncio.run(_two_code_coordinator(modules, client)._async_update_data())
+    assert data["aggregate"]["current_month_consumption"] == 1.0
+    assert data["aggregate"]["is_partial"] is True

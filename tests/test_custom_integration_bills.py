@@ -115,13 +115,13 @@ def test_attach_readings_does_not_mutate_its_input(modules) -> None:
     assert bills[0]["total_kwh"] is None
 
 
-def test_aggregate_sums_only_known_kwh(modules) -> None:
+def test_aggregate_sums_known_kwh(modules) -> None:
     calculation, _ = modules
     known = {"period": "Tháng 3/2026", "total_kwh": 120.0, "total_amount": 100, "is_paid": True}
     unknown = {"period": "Tháng 3/2026", "total_kwh": None, "total_amount": 50, "is_paid": True}
-    rows = calculation.aggregate_bills([[known], [unknown]])
-    assert rows[0]["total_kwh"] == 120.0
-    assert rows[0]["total_amount"] == 150
+    rows = calculation.aggregate_bills([[known], [known]])
+    assert rows[0]["total_kwh"] == 240.0
+    assert calculation.aggregate_bills([[known], [unknown]])[0]["total_amount"] == 150
     assert calculation.aggregate_bills([[unknown], [unknown]])[0]["total_kwh"] is None
 
 
@@ -289,3 +289,165 @@ def test_cached_readings_cannot_be_changed_by_a_caller(modules, monkeypatch) -> 
     client._clock = lambda: 1000.0
     asyncio.run(client.async_monthly_readings("PB000001")).append({"junk": True})
     assert len(asyncio.run(client.async_monthly_readings("PB000001"))) == 1
+
+
+def _stamped_client(api, monkeypatch, payloads):
+    """Client whose clock and wall time are driven by the test; payloads is a list of (payload|Exception)."""
+    wall = [datetime(2026, 3, 15, 10, 0, 0)]
+    monkeypatch.setattr(api.dt_util, "now", lambda: wall[0])
+    state = api.SessionState("user", "token", "refresh", "device", "PB000001", "PB000001")
+    client = api.EvnClient(object(), state, {"PB000001": "PB000001001"})
+    mono = [1000.0]
+    client._clock = lambda: mono[0]
+    queue = list(payloads)
+
+    async def switch_customer(_: str) -> None:
+        return None
+
+    async def request(method, url, body=None):
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    client._async_switch_customer = switch_customer
+    client._async_request = request
+    return client, wall, mono
+
+
+def test_failed_readings_fetch_returns_the_last_good_rows_at_any_age(modules, monkeypatch) -> None:
+    _, api = modules
+    good = {"data": [_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026")]}
+    client, wall, mono = _stamped_client(api, monkeypatch, [good, api.EvnApiError("HTTP 500", status=500)])
+    first = asyncio.run(client.async_monthly_readings("PB000001"))
+    mono[0] += 30 * 24 * 3600
+    wall[0] = datetime(2026, 4, 20, 9, 0, 0)
+    assert asyncio.run(client.async_monthly_readings("PB000001")) == first
+
+
+def test_failed_readings_fetch_without_a_prior_success_still_raises(modules, monkeypatch) -> None:
+    _, api = modules
+    client, _, _ = _stamped_client(api, monkeypatch, [api.EvnApiError("HTTP 500", status=500)])
+    with pytest.raises(api.EvnApiError):
+        asyncio.run(client.async_monthly_readings("PB000001"))
+
+
+def test_readings_authentication_failure_is_not_masked_by_the_last_good_rows(modules, monkeypatch) -> None:
+    _, api = modules
+    good = {"data": [_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026")]}
+    client, _, mono = _stamped_client(api, monkeypatch, [good, api.EvnAuthenticationError("expired")])
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    mono[0] += 7 * 3600
+    with pytest.raises(api.EvnAuthenticationError):
+        asyncio.run(client.async_monthly_readings("PB000001"))
+
+
+def test_failed_readings_fetch_is_per_code(modules, monkeypatch) -> None:
+    _, api = modules
+    good = {"data": [_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026")]}
+    client, _, _ = _stamped_client(api, monkeypatch, [good, api.EvnApiError("HTTP 500", status=500)])
+    client._meter_points["PB000002"] = "PB000002001"
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    with pytest.raises(api.EvnApiError):
+        asyncio.run(client.async_monthly_readings("PB000002"))
+
+
+def test_failed_bills_fetch_returns_the_last_good_bills(modules, monkeypatch) -> None:
+    _, api = modules
+    good = {"data": [_bill(2026, 3, amount=300000)]}
+    client, _, _ = _stamped_client(api, monkeypatch, [good, api.EvnApiError("HTTP 500", status=500)])
+    first = asyncio.run(client.async_bills("PB000001"))
+    again = asyncio.run(client.async_bills("PB000001"))
+    assert again == first and again[0]["total_amount"] == 300000
+
+
+def test_failed_bills_fetch_without_a_prior_success_still_raises(modules, monkeypatch) -> None:
+    _, api = modules
+    client, _, _ = _stamped_client(api, monkeypatch, [api.EvnApiError("HTTP 500", status=500)])
+    with pytest.raises(api.EvnApiError):
+        asyncio.run(client.async_bills("PB000001"))
+
+
+def test_bills_authentication_failure_is_not_masked_by_the_last_good_bills(modules, monkeypatch) -> None:
+    _, api = modules
+    client, _, _ = _stamped_client(
+        api, monkeypatch, [{"data": [_bill(2026, 3)]}, api.EvnAuthenticationError("expired")]
+    )
+    asyncio.run(client.async_bills("PB000001"))
+    with pytest.raises(api.EvnAuthenticationError):
+        asyncio.run(client.async_bills("PB000001"))
+
+
+def test_last_good_bills_cannot_be_changed_by_a_caller(modules, monkeypatch) -> None:
+    _, api = modules
+    client, _, _ = _stamped_client(
+        api, monkeypatch, [{"data": [_bill(2026, 3)]}, api.EvnApiError("HTTP 500", status=500)]
+    )
+    rows = asyncio.run(client.async_bills("PB000001"))
+    rows[0]["total_amount"] = -1
+    rows.append({"junk": True})
+    again = asyncio.run(client.async_bills("PB000001"))
+    assert len(again) == 1 and again[0]["total_amount"] == 300000
+
+
+def test_history_fetched_at_is_the_oldest_successful_fetch_and_survives_fallback(modules, monkeypatch) -> None:
+    _, api = modules
+    readings = {"data": [_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026")]}
+    bills = {"data": [_bill(2026, 3)]}
+    client, wall, mono = _stamped_client(
+        api, monkeypatch, [readings, bills, api.EvnApiError("HTTP 500", status=500), api.EvnApiError("HTTP 500", status=500)],
+    )
+    assert client.history_fetched_at("PB000001") == ""
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    wall[0] = datetime(2026, 3, 15, 10, 30, 0)
+    asyncio.run(client.async_bills("PB000001"))
+    assert client.history_fetched_at("PB000001") == "2026-03-15T10:00:00"
+    # Both later fetches fail: the stamp stays with the data that is still shown.
+    wall[0] = datetime(2026, 3, 16, 8, 0, 0)
+    mono[0] += 7 * 3600
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    asyncio.run(client.async_bills("PB000001"))
+    assert client.history_fetched_at("PB000001") == "2026-03-15T10:00:00"
+
+
+def test_history_fetched_at_advances_with_a_fresh_fetch(modules, monkeypatch) -> None:
+    _, api = modules
+    client, wall, _ = _stamped_client(api, monkeypatch, [{"data": [_bill(2026, 3)]}, {"data": [_bill(2026, 3)]}])
+    asyncio.run(client.async_bills("PB000001"))
+    wall[0] = datetime(2026, 3, 15, 11, 0, 0)
+    asyncio.run(client.async_bills("PB000001"))
+    assert client.history_fetched_at("PB000001") == "2026-03-15T11:00:00"
+
+
+def test_cached_history_is_none_until_bills_have_been_fetched(modules, monkeypatch) -> None:
+    _, api = modules
+    readings = {"data": [_reading(2026, 3, 1, 10, "01/03/2026", "31/03/2026")]}
+    client, _, _ = _stamped_client(api, monkeypatch, [readings, {"data": [_bill(2026, 3)]}])
+    assert client.cached_history("PB000001") is None
+    asyncio.run(client.async_monthly_readings("PB000001"))
+    assert client.cached_history("PB000001") is None
+    asyncio.run(client.async_bills("PB000001"))
+    bills, rows, stamp = client.cached_history("PB000001")
+    assert [bill["THANG"] for bill in bills] == [3]
+    assert [(row["month"], row["kwh"]) for row in rows] == [(3, 10.0)]
+    assert stamp == "2026-03-15T10:00:00"
+
+
+def test_aggregate_total_kwh_is_unknown_when_any_bill_of_the_period_has_unknown_kwh(modules) -> None:
+    calculation, _ = modules
+    known = {"period": "Tháng 3/2026", "total_kwh": 120.0, "total_amount": 100, "is_paid": True}
+    unknown = {"period": "Tháng 3/2026", "total_kwh": None, "total_amount": 50, "is_paid": True}
+    for order in ([[known], [unknown]], [[unknown], [known]]):
+        assert calculation.aggregate_bills(order)[0]["total_kwh"] is None
+    assert calculation.aggregate_bills([[known], [known]])[0]["total_kwh"] == 240.0
+
+
+def test_aggregate_kwh_ignores_a_code_without_a_bill_for_that_period(modules) -> None:
+    calculation, _ = modules
+    march = {"period": "Tháng 3/2026", "total_kwh": 120.0, "total_amount": 100, "is_paid": True}
+    april = {"period": "Tháng 4/2026", "total_kwh": 80.0, "total_amount": 70, "is_paid": True}
+    unknown_feb = {"period": "Tháng 2/2026", "total_kwh": None, "total_amount": 50, "is_paid": True}
+    rows = {row["period"]: row for row in calculation.aggregate_bills([[march, april], [march, unknown_feb]])}
+    assert rows["Tháng 3/2026"]["total_kwh"] == 240.0
+    assert rows["Tháng 4/2026"]["total_kwh"] == 80.0
+    assert rows["Tháng 2/2026"]["total_kwh"] is None
