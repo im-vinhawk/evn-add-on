@@ -45,7 +45,7 @@ def to_iso_date(value: Any) -> str:
         return raw
 
 
-def _round_half_up(value: Decimal) -> int:
+def round_half_up(value: Decimal) -> int:
     return int(value.quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
@@ -62,8 +62,8 @@ def _tier_cost(kwh: Decimal, prices: Sequence[int], widths: Sequence[int | None]
 
 
 def _with_vat(pretax: Decimal, vat_rate: Decimal) -> int:
-    pretax_vnd = _round_half_up(pretax)
-    return pretax_vnd + _round_half_up(pretax_vnd * vat_rate)
+    pretax_vnd = round_half_up(pretax)
+    return pretax_vnd + round_half_up(pretax_vnd * vat_rate)
 
 
 def _tariff_on(day: date) -> TariffRow:
@@ -101,9 +101,9 @@ def calculate_bill_amount(kwh: float, period_start: date, period_end: date) -> i
     for index, segment_start in enumerate(starts):
         is_last = index == len(starts) - 1
         days = ((period_end if is_last else starts[index + 1] - timedelta(days=1)) - segment_start).days + 1
-        segment_kwh = remaining if is_last else Decimal(_round_half_up(total_kwh * days / total_days))
+        segment_kwh = remaining if is_last else Decimal(round_half_up(total_kwh * days / total_days))
         remaining = max(remaining - segment_kwh, Decimal(0))
-        widths = [None if width is None else _round_half_up(Decimal(width) * days / total_days) for width in TIER_WIDTHS]
+        widths = [None if width is None else round_half_up(Decimal(width) * days / total_days) for width in TIER_WIDTHS]
         pretax += _tier_cost(segment_kwh, _tariff_on(segment_start).prices, widths)
     return _with_vat(pretax, _tariff_on(period_end).vat_rate)
 
@@ -129,6 +129,14 @@ def normalize_daily(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return sorted(normalized, key=lambda item: item["date"])
 
 
+def _combined_tariff_verified(flags: Iterable[bool | None]) -> bool | None:
+    """False if any meter's bills contradict the tier model, None if any is unknown, else True."""
+    values = list(flags)
+    if any(flag is False for flag in values):
+        return False
+    return None if not values or any(flag is None for flag in values) else True
+
+
 def aggregate_overviews(overviews: Iterable[Mapping[str, Any]], codes: list[str]) -> dict[str, Any]:
     """Sum overview fields after each code's tariff has been calculated."""
     values = list(overviews)
@@ -143,6 +151,10 @@ def aggregate_overviews(overviews: Iterable[Mapping[str, Any]], codes: list[str]
         "yesterday_consumption": round(sum(as_float(item.get("yesterday_consumption")) for item in values), 2),
         "current_month_consumption": round(sum(as_float(item.get("current_month_consumption")) for item in values), 2),
         "current_month_amount": sum(int(as_float(item.get("current_month_amount"))) for item in values),
+        "tariff_verified": _combined_tariff_verified(item.get("tariff_verified") for item in values),
+        "estimate_method": (
+            "effective_price" if any(item.get("estimate_method") == "effective_price" for item in values) else "tiered"
+        ),
     }
 
 

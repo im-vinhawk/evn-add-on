@@ -88,6 +88,8 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
             attrs["history_fetched_at"] = item.get("history_fetched_at", "")
         if self._metric == "current_month_amount":
             attrs["bills"] = item.get("bills", [])
+            attrs["tariff_verified"] = item.get("tariff_verified")
+            attrs["estimate_method"] = item.get("estimate_method", "tiered")
         if self._customer_code == "__aggregate__":
             attrs["selected_customer_codes"] = item.get("selected_customer_codes", [])
             attrs["successful_customer_codes"] = item.get("successful_customer_codes", [])

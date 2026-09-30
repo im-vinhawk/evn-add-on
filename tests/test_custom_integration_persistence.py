@@ -244,8 +244,9 @@ def test_update_keeps_bills_when_readings_fail(modules) -> None:
 class _TwoCodeClient:
     """Stub client for two codes; a code in `failing_overview` fails its live call only."""
 
-    def __init__(self, bills_by_code, stamps, failing_overview=()):
+    def __init__(self, bills_by_code, stamps, failing_overview=(), readings_by_code=None):
         self.bills_by_code, self.stamps, self.failing_overview = bills_by_code, stamps, set(failing_overview)
+        self.readings_by_code = readings_by_code or {}
         self.last_shapes, self.linked_customer_meter_points = {}, {}
         self.bills_calls: list[str] = []
 
@@ -258,8 +259,8 @@ class _TwoCodeClient:
         self.bills_calls.append(code)
         return [dict(bill) for bill in self.bills_by_code[code]]
 
-    async def async_monthly_readings(self, _code):
-        return []
+    async def async_monthly_readings(self, code):
+        return list(self.readings_by_code.get(code, []))
 
     def history_fetched_at(self, code):
         return self.stamps.get(code, "")
@@ -340,3 +341,59 @@ def test_failed_overview_does_not_affect_live_values_of_the_aggregate(modules) -
     data = asyncio.run(_two_code_coordinator(modules, client)._async_update_data())
     assert data["aggregate"]["current_month_consumption"] == 1.0
     assert data["aggregate"]["is_partial"] is True
+
+
+def _march_reading(kwh):
+    return {"year": 2026, "month": 3, "ky": 1, "kwh": kwh, "start": "2026-03-01", "end": "2026-03-31"}
+
+
+def test_update_prices_the_current_month_from_the_code_own_bills(modules) -> None:
+    """Bills that contradict the tier model make the estimate use the code's effective price."""
+    _, api, _, _ = modules
+
+    def bill(month, amount):
+        return {
+            "period": f"Tháng {month}/2026", "total_kwh": None, "total_amount": amount, "is_paid": True,
+            "issue_date": "", "KY": 1, "THANG": month, "NAM": 2026, "period_start": "", "period_end": "",
+            "calculated_amount": None,
+        }
+
+    def reading(month, kwh):
+        end = {1: "2026-01-31", 2: "2026-02-28", 3: "2026-03-31"}[month]
+        return {"year": 2026, "month": month, "ky": 1, "kwh": kwh, "start": f"2026-{month:02d}-01", "end": end}
+
+    async def overview(_code):
+        return {
+            "customer_code": "PB000001", "current_month_consumption": 120.0, "current_month_amount": 1,
+            "month_start": "2026-04-01", "month_end": "2026-04-30",
+        }
+
+    async def bills(_code):
+        return [bill(1, 250000), bill(2, 500000), bill(3, 750000)]
+
+    async def readings(_code):
+        return [reading(1, 100.0), reading(2, 200.0), reading(3, 300.0)]
+
+    client = types.SimpleNamespace(
+        async_overview=overview, async_bills=bills, async_monthly_readings=readings,
+        last_shapes={}, linked_customer_meter_points={},
+        history_fetched_at=lambda _code: "", cached_history=lambda _code: None,
+    )
+    data = asyncio.run(_update_coordinator(modules, client)._async_update_data())
+    meter = data["meters"]["PB000001"]
+    assert meter["current_month_amount"] == 300000
+    assert (meter["tariff_verified"], meter["estimate_method"]) == (False, "effective_price")
+
+
+def test_aggregate_estimate_sums_the_per_code_estimates_and_flags_an_unverified_code(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {},
+        readings_by_code={"PB000001": [_march_reading(100.0)]},
+    )
+    data = asyncio.run(_two_code_coordinator(modules, client)._async_update_data())
+    aggregate = data["aggregate"]
+    assert data["meters"]["PB000001"]["tariff_verified"] is False
+    assert data["meters"]["PB000002"]["tariff_verified"] is None
+    assert aggregate["tariff_verified"] is False
+    assert aggregate["estimate_method"] == "effective_price"
+    assert aggregate["current_month_amount"] == sum(m["current_month_amount"] for m in data["meters"].values())

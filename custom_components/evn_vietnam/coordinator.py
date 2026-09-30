@@ -21,6 +21,7 @@ from .const import (
     CONF_REFRESH_TOKEN, DEFAULT_SCAN_INTERVAL, DOMAIN, SESSION_KEEPALIVE_INTERVAL,
     CONF_SELECTED_CUSTOMER_CODES,
 )
+from .pricing import price_overview
 from .models import (
     merge_linked_customer_meter_points,
     normalize_linked_customer_meter_points,
@@ -105,6 +106,7 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # The legacy monthly history is derived from official bills.
                     overview["monthly_history"] = overview["bills"]
                     overview["history_fetched_at"] = self._client.history_fetched_at(code)
+                    price_overview(overview)
                     meters[code] = overview
                 except EvnAuthenticationError as err:
                     raise ConfigEntryAuthFailed("EVN session expired; reauthenticate this integration") from err

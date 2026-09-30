@@ -96,6 +96,8 @@ def test_selected_aggregate_keeps_explicit_partial_state_when_no_selected_meter_
         "yesterday_consumption": 0,
         "current_month_consumption": 0,
         "current_month_amount": 0,
+        "tariff_verified": None,
+        "estimate_method": "tiered",
         "successful_customer_codes": [],
         "history_fetched_at": "",
         "bills": [],

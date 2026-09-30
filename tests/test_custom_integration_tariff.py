@@ -163,3 +163,21 @@ def test_current_month_estimate_uses_the_dated_tariff(modules, monkeypatch) -> N
     overview = asyncio.run(client.async_overview("PB000001"))
     # 200 kWh in May 2025 crosses the 2025-05-10 price change.
     assert overview["current_month_amount"] == 469250
+
+
+def test_overview_reports_the_calendar_month_it_estimates(modules, monkeypatch) -> None:
+    _, _, api = modules
+    monkeypatch.setattr(api.dt_util, "now", lambda: datetime(2026, 2, 10))
+    state = api.SessionState("user", "token", "refresh", "device", "PB000001", "PB000001")
+    client = api.EvnClient(object(), state, {"PB000001": "PB000001001"})
+
+    async def daily(_code, _start, _end):
+        return [{"date": "2026-02-09", "consumption": 10.0}]
+
+    async def readings(*_args):
+        return []
+
+    client.async_daily = daily
+    client._async_readings = readings
+    overview = asyncio.run(client.async_overview("PB000001"))
+    assert (overview["month_start"], overview["month_end"]) == ("2026-02-01", "2026-02-28")

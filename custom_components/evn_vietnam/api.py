@@ -474,6 +474,7 @@ class EvnClient:
         yesterday_kwh = values.get((today - timedelta(days=1)).isoformat(), 0.0)
         return {
             "customer_code": customer_code, "latest_index": latest_index, "latest_date": latest_date,
+            "month_start": start.isoformat(), "month_end": last_day.isoformat(),
             "today_consumption": round(today_kwh, 2), "yesterday_consumption": round(yesterday_kwh, 2),
             "current_month_consumption": month_kwh, "current_month_amount": calculate_bill_amount(month_kwh, start, last_day),
             "daily_history": daily[-DAILY_HISTORY_DAYS:],
