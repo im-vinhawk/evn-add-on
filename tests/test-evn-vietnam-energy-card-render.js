@@ -650,6 +650,14 @@ function hasOwnInnerHtml(node) {
     'exactly the selected bar is highlighted',
   );
 
+  // The keyboard picks a day too (bars are focusable).
+  const bar17 = findAllNodes(tileCard.shadowRoot, isChartBar).find((b) => (b.attributes['aria-label'] || '').startsWith('2026-08-17'));
+  bar17.dispatchEvent({ type: 'keydown', key: 'Enter' });
+  assert.ok(texts(tileCard).includes('So sánh ngày 17/08'), 'Enter on a focused bar selects its day');
+  findAllNodes(tileCard.shadowRoot, isChartBar).find((b) => (b.attributes['aria-label'] || '').startsWith('2026-08-16'))
+    .dispatchEvent({ type: 'keydown', key: 'a' });
+  assert.ok(texts(tileCard).includes('So sánh ngày 17/08'), 'other keys do nothing');
+
   // A new entity update (last_updated) refetches.
   tileCard.hass = compareHass(callWS, {}, '2026-08-21T03:30:00+00:00');
   await flush();

@@ -834,13 +834,13 @@ class EvnVietnamEnergyCard extends HTMLElement {
   }
 
   _loadCompare(key, ids, day) {
-    const window = this._compareWindow(day);
+    const range = this._compareWindow(day);
     const statisticIds = ids.cost ? [ids.energy, ids.cost] : [ids.energy];
     Promise.resolve()
       .then(() => this._hass.callWS({
         type: 'recorder/statistics_during_period',
-        start_time: window.start,
-        end_time: window.end,
+        start_time: range.start,
+        end_time: range.end,
         statistic_ids: statisticIds,
         period: 'day',
         types: ['change'],
@@ -1071,9 +1071,13 @@ class EvnVietnamEnergyCard extends HTMLElement {
         tooltipEl.textContent = 'Chạm/Rê chuột để xem';
       };
 
-      rect.addEventListener('click', () => {
+      const selectDay = () => {
         this._selectedDay = item.date;
         this.render();
+      };
+      rect.addEventListener('click', selectDay);
+      rect.addEventListener('keydown', (event) => {
+        if (event && event.key === 'Enter') selectDay();
       });
       rect.addEventListener('mouseenter', updateTooltip);
       rect.addEventListener('focus', updateTooltip);
