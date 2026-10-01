@@ -974,3 +974,177 @@ def test_aggregate_yesterday_is_unknown_when_a_contributing_code_has_none(module
     assert calc.aggregate_overviews([known, unknown], ["a", "b"])["yesterday_consumption"] is None
     assert calc.aggregate_overviews([known, known], ["a", "b"])["yesterday_consumption"] == 8.0
     assert calc.aggregate_overviews([{"today_consumption": 1}], ["a"])["yesterday_consumption"] == 0.0
+
+
+# ------------------------------------------------------------- seen bills in the store
+
+def _valid_bill_entry(**overrides):
+    return {"bill_id": "0123456789ab", "first_seen": "2026-10-02", "status": "match", "amount": 1000, **overrides}
+
+
+def test_a_store_without_bills_loads_with_an_empty_bills_state(modules) -> None:
+    s = modules.store
+    assert s.empty_store()["bills"] == {}
+    old = {"daily": {"PB000001": {"2026-03-01": 5.0}}, "meta": {}, "series": {}}
+    assert s.normalize_store(old)["bills"] == {}
+    for garbage in (None, [], {"bills": "x"}, {"bills": [1]}):
+        assert s.normalize_store(garbage)["bills"] == {}
+
+
+def test_bills_state_round_trips_and_a_seeded_code_without_periods_is_kept(modules) -> None:
+    s = modules.store
+    raw = {"bills": {"PB000001": {"2026-09-1": _valid_bill_entry()}, "PB000002": {}}}
+    again = s.normalize_store(json.loads(json.dumps(raw)))
+    assert again["bills"] == raw["bills"]
+
+
+@pytest.mark.parametrize("entry", [
+    _valid_bill_entry(bill_id="PB000001"), _valid_bill_entry(bill_id="0123456789AB"), _valid_bill_entry(bill_id="short"),
+    _valid_bill_entry(first_seen="yesterday"), _valid_bill_entry(first_seen=None), _valid_bill_entry(status="odd"),
+    _valid_bill_entry(amount="1000"), _valid_bill_entry(amount=True), _valid_bill_entry(amount=None), "x", None, [],
+])
+def test_a_malformed_seen_period_is_dropped(modules, entry) -> None:
+    loaded = modules.store.normalize_store({"bills": {"PB000001": {"2026-09-1": entry, "2026-08-1": _valid_bill_entry()}}})
+    assert loaded["bills"] == {"PB000001": {"2026-08-1": _valid_bill_entry()}}
+
+
+@pytest.mark.parametrize("key", ["2026-9-1", "2026-13-1", "2026-09", "2026-09-x", "Sept", "2026-09-1-2"])
+def test_a_malformed_period_key_is_dropped(modules, key) -> None:
+    loaded = modules.store.normalize_store({"bills": {"PB000001": {key: _valid_bill_entry()}}})
+    assert loaded["bills"] == {"PB000001": {}}
+
+
+# --------------------------------------------------------- bill events in the cycle
+
+class _FailingStore(_FakeStore):
+    def __init__(self, loaded=None):
+        super().__init__(loaded)
+        self.fail = False
+
+    async def async_save(self, data):
+        if self.fail:
+            raise OSError("disk full")
+        await super().async_save(data)
+
+
+def _bill_row(year, month, kwh, *, amount=1000, ky=1):
+    last = date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+    return {
+        "period": f"Tháng {month}/{year}", "total_kwh": kwh, "total_amount": amount, "is_paid": True, "issue_date": "",
+        "KY": ky, "THANG": month, "NAM": year, "period_start": date(year, month, 1).isoformat(),
+        "period_end": last.isoformat(), "calculated_amount": None,
+    }
+
+
+def _bill_store(**extra):
+    """Daily rows covering 08/2026 and 09/2026 bills (shifted windows), 3.0 kWh a day."""
+    days = {}
+    day = date(2026, 7, 31)
+    while day <= date(2026, 9, 29):
+        days[day.isoformat()] = 3.0
+        day += timedelta(days=1)
+    meta = {"cursor": None, "empty": 0, "done": True, "prev_refresh": "2026-10-02", "failures": 0, "tail_try": ""}
+    return {"daily": {"PB000001": days}, "meta": {"PB000001": meta}, "series": {}, **extra}
+
+
+def _bill_meter(bills, *, fresh=True):
+    return {"daily_history": [], "bills": bills, "bills_fresh": fresh, "price_model": _DEFAULT_MODEL["model"]}
+
+
+def _bill_update(history, meter, **kwargs):
+    return asyncio.run(history.async_update(
+        meters={"PB000001": meter}, codes=["PB000001"], selected=["PB000001"], aliases=kwargs.pop("aliases", {}),
+        allow_backfill=False, **kwargs,
+    ))
+
+
+_SEPT = _bill_row(2026, 9, 90.0, amount=250000)
+_AUG = _bill_row(2026, 8, 93.0, amount=240000)
+
+
+def test_the_first_fresh_poll_announces_only_last_month_and_saves_before_returning(modules) -> None:
+    history, seen = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 2))
+    events = _bill_update(history, _bill_meter([_AUG, _SEPT]), aliases={"PB000001": "Nhà chính"})
+    assert [(e["period"], e["reason"], e["label"]) for e in events] == [("09/2026", "new", "Nhà chính")]
+    assert set(seen.store.saved[-1]["bills"]["PB000001"]) == {"2026-08-1", "2026-09-1"}, "saved before the events are returned"
+    assert _bill_update(history, _bill_meter([_AUG, _SEPT])) == []
+
+
+def test_cached_bills_never_seed_or_fire(modules) -> None:
+    history, seen = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 2))
+    assert _bill_update(history, _bill_meter([_AUG, _SEPT], fresh=False)) == []
+    assert history._data["bills"] == {}
+    assert all("PB000001" not in saved.get("bills", {}) for saved in seen.store.saved)
+    assert [e["period"] for e in _bill_update(history, _bill_meter([_AUG, _SEPT]))] == ["09/2026"]
+
+
+def test_a_failed_save_fires_nothing_and_the_next_poll_retries(modules) -> None:
+    store = _FailingStore(_bill_store())
+    history, seen = _history(modules, store=store, today=date(2026, 10, 2))
+    store.fail = True
+    assert _bill_update(history, _bill_meter([_AUG, _SEPT])) == []
+    assert history._data["bills"] == {}, "the in-memory state is rolled back so nothing is lost"
+    store.fail = False
+    assert [e["period"] for e in _bill_update(history, _bill_meter([_AUG, _SEPT]))] == ["09/2026"]
+
+
+def test_a_restart_after_a_fire_does_not_announce_again(modules) -> None:
+    store = _FakeStore(_bill_store())
+    history, _ = _history(modules, store=store, today=date(2026, 10, 2))
+    assert len(_bill_update(history, _bill_meter([_AUG, _SEPT]))) == 1
+    restarted, _ = _history(modules, store=_FakeStore(store.saved[-1]), today=date(2026, 10, 2))
+    assert _bill_update(restarted, _bill_meter([_AUG, _SEPT])) == []
+
+
+def test_a_downgrade_and_re_upgrade_announces_at_most_the_previous_month(modules) -> None:
+    store = _FakeStore(_bill_store())
+    history, _ = _history(modules, store=store, today=date(2026, 10, 2))
+    _bill_update(history, _bill_meter([_AUG, _SEPT]))
+    old_version_saved = {key: value for key, value in store.saved[-1].items() if key != "bills"}
+    again, _ = _history(modules, store=_FakeStore(old_version_saved), today=date(2026, 10, 4))
+    assert [e["period"] for e in _bill_update(again, _bill_meter([_AUG, _SEPT]))] == ["09/2026"]
+
+
+def test_a_status_change_within_ten_days_is_one_update_through_the_cycle(modules) -> None:
+    store = _bill_store()
+    del store["daily"]["PB000001"]["2026-09-10"], store["daily"]["PB000001"]["2026-09-11"]
+    history, seen = _history(modules, store=_FakeStore(store), today=date(2026, 10, 2))
+    first = _bill_update(history, _bill_meter([_SEPT]))
+    assert [(e["reason"], e["status"]) for e in first] == [("new", "incomplete")]
+    history._data["daily"]["PB000001"]["2026-09-10"] = 3.0
+    history._data["daily"]["PB000001"]["2026-09-11"] = 3.0
+    second = _bill_update(history, _bill_meter([_SEPT]))
+    assert [(e["reason"], e["status"], e["previous_status"]) for e in second] == [("update", "match", "incomplete")]
+
+
+def test_the_threshold_comes_from_the_caller(modules) -> None:
+    history, _ = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 2))
+    off_by_two = _bill_row(2026, 9, 92.0)
+    events = _bill_update(history, _bill_meter([off_by_two]), threshold_kwh=2.5)
+    assert events[0]["status"] == "match" and events[0]["threshold_kwh"] == 2.5
+
+
+def test_the_events_and_the_stored_state_never_hold_the_code(modules) -> None:
+    history, seen = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 2))
+    events = _bill_update(history, _bill_meter([_AUG, _SEPT]), aliases={"PB000001": "Kho PB000001"})
+    assert events[0]["label"] == "…0001"
+    assert "PB000001" not in repr(events) and "PB000001" not in repr(seen.store.saved[-1]["bills"].get("PB000001", {}))
+
+
+def test_a_broken_bill_row_never_breaks_the_cycle(modules) -> None:
+    history, _ = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 2))
+    assert _bill_update(history, _bill_meter([None, "x"])) == []
+
+
+def test_annotate_bills_uses_the_stored_days(modules) -> None:
+    history, _ = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 2))
+    _bill_update(history, _bill_meter([_SEPT]))
+    rows = history.annotate_bills("PB000001", [_SEPT], 1.0)
+    assert (rows[0]["reconcile_status"], rows[0]["collected_kwh"], rows[0]["diff_kwh"]) == ("match", 90.0, 0.0)
+    assert history.annotate_bills("PB000009", [_SEPT], 1.0)[0]["reconcile_status"] == "incomplete", "no days stored: data is missing"
+
+
+def test_annotate_bills_gives_only_the_canonical_period_while_the_store_is_unavailable(modules) -> None:
+    history, _ = _history(modules)
+    rows = history.annotate_bills("PB000001", [_SEPT], 1.0)
+    assert (rows[0]["year"], rows[0]["month"], rows[0]["reconcile_status"]) == (2026, 9, None)

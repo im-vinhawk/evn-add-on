@@ -321,17 +321,26 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
 
     kWh and the calculated amount of a period are unknown (None) as soon as one
     bill of that period has no value: a partial sum would look complete.  A code
-    with no bill for the period does not take part.
+    with no bill for the period does not take part.  The reconciliation of the
+    codes is summed under the same rule and shows the worst status among them.
     """
     buckets: dict[str, dict[str, Any]] = {}
     kwh_known: dict[str, bool] = {}
-    for rows in bill_series:
+    takers: dict[str, set[int]] = {}
+    reconciled: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
+    for index, rows in enumerate(bill_series):
         for bill in rows:
             period = str(bill.get("period") or "")
             bucket = buckets.setdefault(period, {
                 "period": period, "total_kwh": 0.0, "total_amount": 0, "is_paid": True,
                 "period_start": "", "period_end": "", "calculated_amount": 0,
             })
+            takers.setdefault(period, set()).add(index)
+            if bill.get("reconcile_status") is not None:
+                reconciled.setdefault(period, []).append((index, bill))
+            ky = bill.get("ky", bill.get("KY"))
+            if isinstance(ky, int) and not isinstance(ky, bool):
+                bucket["ky"] = min(bucket.get("ky", ky), ky)
             if bill.get("total_kwh") is None:
                 kwh_known[period] = False
             else:
@@ -351,7 +360,35 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
     for period, bucket in buckets.items():
         if not kwh_known[period]:
             bucket["total_kwh"] = None
+        match = _PERIOD_RE.search(period)
+        bucket["year"], bucket["month"] = (int(match.group(2)), int(match.group(1))) if match else (None, None)
+        bucket.setdefault("ky", None)
+        bucket.update(_aggregate_reconciliation(takers[period], reconciled.get(period, [])))
     return sorted(buckets.values(), key=lambda item: _period_sort_key(item["period"]), reverse=True)
+
+
+_STATUS_WORST_FIRST = ("mismatch", "incomplete", "boundary", "match", "no_kwh")
+
+
+def _aggregate_reconciliation(takers: set[int], rows: list[tuple[int, Mapping[str, Any]]]) -> dict[str, Any]:
+    """Sum the codes' reconciliation of one period; unknown unless every code that billed it has one."""
+    unknown: dict[str, Any] = {
+        "collected_kwh": None, "diff_kwh": None, "missing_days": None, "reconcile_status": None, "paired_with": None,
+    }
+    if not rows or {index for index, _ in rows} != takers:
+        return unknown
+
+    def total(field: str) -> float | int | None:
+        values = [row.get(field) for _, row in rows]
+        return None if any(value is None for value in values) else round(sum(values), 2)
+
+    statuses = {row["reconcile_status"] for _, row in rows}
+    worst = next((status for status in _STATUS_WORST_FIRST if status in statuses), None)
+    missing = total("missing_days")
+    return {
+        **unknown, "collected_kwh": total("collected_kwh"), "diff_kwh": total("diff_kwh"),
+        "missing_days": None if missing is None else int(missing), "reconcile_status": worst,
+    }
 
 
 def _period_sort_key(period: str) -> tuple[int, int]:

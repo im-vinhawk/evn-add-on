@@ -5,7 +5,8 @@ The dict handled here is what Home Assistant's ``Store`` writes to disk::
     {"daily": {code: {"YYYY-MM-DD": kwh}},
      "meta": {code: {"cursor": "YYYY-MM" | None, "empty": int, "done": bool, "prev_refresh": "YYYY-MM-DD",
                      "failures": int, "tail_try": ISO datetime with offset | ""}},
-     "series": {statistic_id: {"start": "YYYY-MM-DD", "count": int, "scope": str}}}
+     "series": {statistic_id: {"start": "YYYY-MM-DD", "count": int, "scope": str}},
+     "bills": {code: {"YYYY-MM-K": {"bill_id": 12 hex, "first_seen": "YYYY-MM-DD", "status": str, "amount": int}}}}
 """
 
 from __future__ import annotations
@@ -25,10 +26,13 @@ PREVIOUS_MONTH_REFRESH_DAYS = 5
 
 
 _CURSOR = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_BILL_KEY = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-\d+$")
+_BILL_ID = re.compile(r"^[0-9a-f]{12}$")
+_BILL_STATUSES = frozenset({"match", "boundary", "incomplete", "mismatch", "no_kwh"})
 
 
 def empty_store() -> dict[str, Any]:
-    return {"daily": {}, "meta": {}, "series": {}}
+    return {"daily": {}, "meta": {}, "series": {}, "bills": {}}
 
 
 def _valid_day(value: Any) -> bool:
@@ -64,7 +68,25 @@ def normalize_store(raw: Any) -> dict[str, Any]:
             store["series"][str(statistic_id)] = {
                 "start": item["start"], "count": _count(item["count"]), "scope": str(item.get("scope") or ""),
             }
+    bills = raw.get("bills")
+    for code, periods in (bills.items() if isinstance(bills, Mapping) else ()):
+        if isinstance(periods, Mapping):
+            store["bills"][str(code)] = {
+                str(key): {name: entry[name] for name in ("bill_id", "first_seen", "status", "amount")}
+                for key, entry in periods.items()
+                if isinstance(key, str) and _BILL_KEY.match(key) and _valid_bill_entry(entry)
+            }
     return store
+
+
+def _valid_bill_entry(entry: Any) -> bool:
+    return (
+        isinstance(entry, Mapping)
+        and isinstance(entry.get("bill_id"), str) and bool(_BILL_ID.match(entry["bill_id"]))
+        and _valid_day(entry.get("first_seen"))
+        and entry.get("status") in _BILL_STATUSES
+        and isinstance(entry.get("amount"), int) and not isinstance(entry.get("amount"), bool)
+    )
 
 
 def _count(value: Any) -> int | None:

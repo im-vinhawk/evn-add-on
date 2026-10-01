@@ -214,9 +214,12 @@ def _bill_client(api, readings):
             raise readings
         return readings
 
+    async def bills_with_source(code):
+        return await bills(code), True
+
     return types.SimpleNamespace(
-        async_overview=overview, async_bills=bills, async_monthly_readings=monthly_readings,
-        last_shapes={}, linked_customer_meter_points={},
+        async_overview=overview, async_bills=bills, async_bills_with_source=bills_with_source,
+        async_monthly_readings=monthly_readings, last_shapes={}, linked_customer_meter_points={},
         history_fetched_at=lambda _code: "", cached_history=lambda _code: None,
     )
 
@@ -244,8 +247,9 @@ def test_update_keeps_bills_when_readings_fail(modules) -> None:
 class _TwoCodeClient:
     """Stub client for two codes; a code in `failing_overview` fails its live call only."""
 
-    def __init__(self, bills_by_code, stamps, failing_overview=(), readings_by_code=None):
+    def __init__(self, bills_by_code, stamps, failing_overview=(), readings_by_code=None, cached_bills=()):
         self.bills_by_code, self.stamps, self.failing_overview = bills_by_code, stamps, set(failing_overview)
+        self.cached_bills = set(cached_bills)
         self.readings_by_code = readings_by_code or {}
         self.last_shapes, self.linked_customer_meter_points = {}, {}
         self.bills_calls: list[str] = []
@@ -258,6 +262,9 @@ class _TwoCodeClient:
     async def async_bills(self, code):
         self.bills_calls.append(code)
         return [dict(bill) for bill in self.bills_by_code[code]]
+
+    async def async_bills_with_source(self, code):
+        return await self.async_bills(code), code not in self.cached_bills
 
     async def async_monthly_readings(self, code):
         return list(self.readings_by_code.get(code, []))
@@ -374,9 +381,12 @@ def test_update_prices_the_current_month_from_the_code_own_bills(modules) -> Non
     async def readings(_code):
         return [reading(1, 100.0), reading(2, 200.0), reading(3, 300.0)]
 
+    async def bills_with_source(code):
+        return await bills(code), True
+
     client = types.SimpleNamespace(
-        async_overview=overview, async_bills=bills, async_monthly_readings=readings,
-        last_shapes={}, linked_customer_meter_points={},
+        async_overview=overview, async_bills=bills, async_bills_with_source=bills_with_source,
+        async_monthly_readings=readings, last_shapes={}, linked_customer_meter_points={},
         history_fetched_at=lambda _code: "", cached_history=lambda _code: None,
     )
     data = asyncio.run(_update_coordinator(modules, client)._async_update_data())
@@ -517,3 +527,118 @@ def test_a_failing_window_composition_leaves_the_live_rows_in_place(modules) -> 
     instance.data = None
     data = asyncio.run(instance._async_update_data())
     assert set(data["meters"]) == {"PB000001", "PB000002"}
+
+
+class _BillHistory(_WindowHistory):
+    """Records what the coordinator hands over and returns scripted events; annotates like the real one."""
+
+    def __init__(self, events=()):
+        super().__init__({"PB000001": {}, "PB000002": {}}, __import__("datetime").date(2026, 10, 2))
+        self.scripted, self.calls, self.log = list(events), [], []
+
+    async def async_update(self, **kwargs):
+        self.calls.append(kwargs)
+        self.log.append("history")
+        return list(self.scripted)
+
+    def annotate_bills(self, code, bills, threshold_kwh):
+        return [{**bill, "year": bill["NAM"], "month": bill["THANG"], "ky": bill["KY"], "reconcile_status": "match"} for bill in bills]
+
+
+def _bus(log):
+    return types.SimpleNamespace(async_fire=lambda name, data: log.append(("fire", name, data)))
+
+
+def test_bills_carry_their_provenance_and_the_reconciliation_before_the_aggregate(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {}, cached_bills=["PB000002"],
+    )
+    instance = _two_code_coordinator(modules, client)
+    instance._history = _BillHistory()
+    instance.data = None
+    data = asyncio.run(instance._async_update_data())
+    assert (data["meters"]["PB000001"]["bills_fresh"], data["meters"]["PB000002"]["bills_fresh"]) == (True, False)
+    first = data["meters"]["PB000001"]
+    assert first["bills"][0]["reconcile_status"] == "match" and first["monthly_history"] is first["bills"]
+    assert data["aggregate"]["bills"][0]["reconcile_status"] == "match"
+    assert data["aggregate"]["bills"][0]["year"] == 2026
+
+
+def test_a_failed_overview_keeps_its_last_good_bills_annotated_in_the_aggregate(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(100.0, 200)], "PB000002": [_march_bill(50.0, 100)]}, {}, failing_overview=["PB000002"],
+    )
+    instance = _two_code_coordinator(modules, client)
+    instance._history = _BillHistory()
+    instance.data = None
+    data = asyncio.run(instance._async_update_data())
+    assert data["aggregate"]["bills"][0]["total_amount"] == 300 and data["aggregate"]["bills"][0]["month"] == 3
+
+
+def test_events_are_fired_on_the_bus_only_after_the_history_step_returned(modules) -> None:
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+    instance = _two_code_coordinator(modules, client)
+    history = _BillHistory(events=[{"bill_id": "0123456789ab", "reason": "new"}])
+    instance._history = history
+    instance.hass = types.SimpleNamespace(bus=_bus(history.log))
+    instance.data = None
+    asyncio.run(instance._async_update_data())
+    assert history.log == ["history", ("fire", "evn_vietnam_bill", {"bill_id": "0123456789ab", "reason": "new"})]
+
+
+def test_a_bus_error_never_fails_the_update(modules) -> None:
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+    instance = _two_code_coordinator(modules, client)
+    instance._history = _BillHistory(events=[{"bill_id": "0123456789ab"}])
+
+    def boom(_name, _data):
+        raise RuntimeError("bus closed")
+
+    instance.hass = types.SimpleNamespace(bus=types.SimpleNamespace(async_fire=boom))
+    instance.data = None
+    assert set(asyncio.run(instance._async_update_data())["meters"]) == {"PB000001", "PB000002"}
+
+
+def test_the_threshold_option_reaches_the_history_and_a_bad_value_falls_back(modules) -> None:
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+    instance = _two_code_coordinator(modules, client)
+    history = _BillHistory()
+    instance._history = history
+    instance.data = None
+    asyncio.run(instance._async_update_data())
+    assert history.calls[-1]["threshold_kwh"] == 1.0
+    for option, expected in ((2.5, 2.5), ("3", 3.0), ("x", 1.0), (-4, 1.0), (500, 1.0), (None, 1.0)):
+        instance.config_entry.options = {"reconcile_threshold_kwh": option}
+        asyncio.run(instance._async_update_data())
+        assert history.calls[-1]["threshold_kwh"] == expected
+
+
+def test_without_a_history_the_bill_rows_still_get_the_canonical_period(modules) -> None:
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+    data = asyncio.run(_two_code_coordinator(modules, client)._async_update_data())
+    row = data["meters"]["PB000001"]["bills"][0]
+    assert (row["year"], row["month"], row["ky"], row["reconcile_status"]) == (2026, 3, 1, None)
+
+
+def test_the_options_flow_offers_the_threshold_with_a_default_and_a_range(modules, monkeypatch) -> None:
+    _, _, config_flow, _ = modules
+    recorded = []
+    monkeypatch.setattr(config_flow.vol, "Range", lambda **kwargs: recorded.append(kwargs) or (lambda value: value))
+    monkeypatch.setattr(config_flow.vol, "Optional", lambda value, **_kwargs: value, raising=False)
+    flow = config_flow.EvnVietnamOptionsFlow()
+    flow.async_show_form = lambda **kwargs: kwargs
+    flow.async_create_entry = lambda **kwargs: kwargs
+    flow.config_entry = types.SimpleNamespace(
+        data={"primary_customer_code": "PB000001", "linked_customers": {"PB000001": "PB000001009"}}, options={},
+    )
+    form = asyncio.run(flow.async_step_init(None))
+    assert "reconcile_threshold_kwh" in form["data_schema"]
+    assert {"min": 0, "max": 100} in recorded
+    flow.config_entry.options = {"reconcile_threshold_kwh": 2.0}
+    asyncio.run(flow.async_step_init(None))
+    result = asyncio.run(flow.async_step_init({
+        "customer_codes": "", "selected_customer_codes": "PB000001", "scan_interval": 30, "reconcile_threshold_kwh": "1.5",
+    }))
+    assert result["step_id"] == "aliases" and flow._pending["reconcile_threshold_kwh"] == 1.5
+    saved = asyncio.run(flow.async_step_aliases({}))
+    assert saved["data"]["reconcile_threshold_kwh"] == 1.5

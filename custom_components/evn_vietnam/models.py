@@ -20,6 +20,7 @@ _ROSTER_CONTAINER_KEYS = (
 )
 _EVN_REGION_PREFIXES = "PA|PB|PC|PD|PE|PH|PK|PM|PN|PP|PQ|PT|HN"
 _CUSTOMER_CODE_PATTERN = re.compile(rf"^(?:{_EVN_REGION_PREFIXES})[0-9]{{4,}}$")
+_CUSTOMER_CODE_ANYWHERE = re.compile(rf"(?:{_EVN_REGION_PREFIXES})[0-9]{{4,}}", re.IGNORECASE)
 _METER_POINT_PATTERN = re.compile(rf"^(?:{_EVN_REGION_PREFIXES})[0-9]{{7,}}$")
 _SENSOR_UNIQUE_ID_METRICS = (
     "today_consumption",
@@ -43,6 +44,11 @@ def normalize_customer_code(value: Any) -> str:
     """
     identifier = _normalized_ascii_identifier(value)
     return identifier if _CUSTOMER_CODE_PATTERN.fullmatch(identifier) else ""
+
+
+def contains_customer_code(value: Any) -> bool:
+    """True when free text holds something shaped like a customer code, anywhere and in any letter case."""
+    return bool(_CUSTOMER_CODE_ANYWHERE.search(str(value or "")))
 
 
 def normalize_meter_point(value: Any) -> str:

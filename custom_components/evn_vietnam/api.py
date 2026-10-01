@@ -485,6 +485,10 @@ class EvnClient:
 
         A closed bill never changes, so an older copy is as correct as a fresh one.
         """
+        return (await self.async_bills_with_source(customer_code))[0]
+
+    async def async_bills_with_source(self, customer_code: str) -> tuple[list[dict[str, Any]], bool]:
+        """The bills as `async_bills` returns them, and whether this call fetched them (False: the cached copy)."""
         key = customer_code.strip().upper()
         try:
             bills = await self._async_fetch_bills(customer_code)
@@ -493,9 +497,9 @@ class EvnClient:
             if cached is None:
                 raise
             _LOGGER.debug("EVN bills unavailable; showing the last successful fetch")
-            return [dict(row) for row in cached[1]]
+            return [dict(row) for row in cached[1]], False
         self._bills_cache[key] = (dt_util.now(), [dict(row) for row in bills])
-        return bills
+        return bills, True
 
     async def _async_fetch_bills(self, customer_code: str) -> list[dict[str, Any]]:
         year = dt_util.now().year

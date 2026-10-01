@@ -18,12 +18,13 @@ from .api import EvnApiError, EvnAuthenticationError, EvnClient, EvnCustomerSwit
 from .calculation import aggregate_selected_overviews, attach_readings
 from .const import (
     CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE,
-    CONF_REFRESH_TOKEN, DEFAULT_SCAN_INTERVAL, DOMAIN, SESSION_KEEPALIVE_INTERVAL,
-    CONF_SELECTED_CUSTOMER_CODES, CONF_CUSTOMER_ALIASES,
+    CONF_REFRESH_TOKEN, DEFAULT_RECONCILE_THRESHOLD_KWH, DEFAULT_SCAN_INTERVAL, DOMAIN, EVENT_BILL,
+    SESSION_KEEPALIVE_INTERVAL, CONF_SELECTED_CUSTOMER_CODES, CONF_CUSTOMER_ALIASES, CONF_RECONCILE_THRESHOLD_KWH,
 )
 from .daily_store import day_values
 from .history import DailyHistory, create_daily_history
 from .pricing import price_overview
+from .reconcile import annotate_bills
 from .models import (
     merge_linked_customer_meter_points,
     normalize_aliases,
@@ -114,9 +115,8 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for code in codes:
                 try:
                     overview = await self._client.async_overview(code)
-                    overview["bills"] = attach_readings(
-                        await self._client.async_bills(code), await self._async_readings_or_empty(code)
-                    )
+                    bills, overview["bills_fresh"] = await self._client.async_bills_with_source(code)
+                    overview["bills"] = attach_readings(bills, await self._async_readings_or_empty(code))
                     # The legacy monthly history is derived from official bills.
                     overview["monthly_history"] = overview["bills"]
                     overview["history_fetched_at"] = self._client.history_fetched_at(code)
@@ -137,8 +137,11 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not meters:
                 raise UpdateFailed("EVN could not return data for any configured customer")
             aggregate_codes = aggregate_customer_codes(self.config_entry)
-            await self._async_update_history(meters, codes, aggregate_codes)
+            events = await self._async_update_history(meters, codes, aggregate_codes)
+            self._fire_bill_events(events)
             self._compose_windows(meters)
+            for code, overview in meters.items():
+                overview["bills"] = overview["monthly_history"] = self._reconciled(code, overview["bills"])
             aggregate = aggregate_selected_overviews(
                 meters, aggregate_codes, partial_errors, self._last_good_history(partial_errors, meters)
             )
@@ -148,17 +151,48 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_history(
         self, meters: dict[str, dict[str, Any]], codes: list[str], selected: list[str]
-    ) -> None:
-        """Store the live days and publish statistics; the first refresh leaves the backfill for later."""
+    ) -> list[dict[str, Any]]:
+        """Store the live days and publish statistics; returns the new-bill events to fire.
+
+        The first refresh leaves the backfill for later.
+        """
         if self._history is None:
-            return
+            return []
         aliases = normalize_aliases(self.config_entry.options.get(CONF_CUSTOMER_ALIASES), codes)
         try:
-            await self._history.async_update(
+            events = await self._history.async_update(
                 meters=meters, codes=codes, selected=selected, aliases=aliases, allow_backfill=self.data is not None,
+                threshold_kwh=self._reconcile_threshold(),
             )
         except Exception as err:  # noqa: BLE001 - a history problem must never fail the sensor update
             _LOGGER.debug("EVN daily history update skipped (%s)", type(err).__name__)
+            return []
+        return list(events) if isinstance(events, list) else []
+
+    def _reconcile_threshold(self) -> float:
+        """The kWh a bill may differ from the collected days; an unusable option falls back to the default."""
+        try:
+            value = float(self.config_entry.options.get(CONF_RECONCILE_THRESHOLD_KWH, DEFAULT_RECONCILE_THRESHOLD_KWH))
+        except (TypeError, ValueError):
+            return DEFAULT_RECONCILE_THRESHOLD_KWH
+        return value if 0 <= value <= 100 else DEFAULT_RECONCILE_THRESHOLD_KWH
+
+    def _fire_bill_events(self, events: list[dict[str, Any]]) -> None:
+        """Announce new bills; their state was saved before they were handed over, so each fires once."""
+        for payload in events:
+            try:
+                self.hass.bus.async_fire(EVENT_BILL, payload)
+            except Exception as err:  # noqa: BLE001 - an event problem must never fail the sensor update
+                _LOGGER.debug("EVN bill event not fired (%s)", type(err).__name__)
+
+    def _reconciled(self, code: str, bills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Bill rows with the canonical period and, when the daily store is loaded, the kWh reconciliation."""
+        try:
+            if self._history is not None:
+                return self._history.annotate_bills(code, bills, self._reconcile_threshold())
+        except Exception as err:  # noqa: BLE001 - a reconciliation problem must never fail the sensor update
+            _LOGGER.debug("EVN bill reconciliation skipped (%s)", type(err).__name__)
+        return annotate_bills(bills, None, self._reconcile_threshold())[0]
 
     def _compose_windows(self, meters: dict[str, dict[str, Any]]) -> None:
         """Give each code the last 31 days across the month boundary, and today/yesterday read from them."""
@@ -185,7 +219,9 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cached = None if code in meters else self._client.cached_history(code)
             if cached is not None:
                 bills, readings, fetched_at = cached
-                history[code] = {"bills": attach_readings(bills, readings), "history_fetched_at": fetched_at}
+                history[code] = {
+                    "bills": self._reconciled(code, attach_readings(bills, readings)), "history_fetched_at": fetched_at,
+                }
         return history
 
     async def _async_readings_or_empty(self, code: str) -> list[dict[str, Any]]:

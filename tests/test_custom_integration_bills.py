@@ -451,3 +451,71 @@ def test_aggregate_kwh_ignores_a_code_without_a_bill_for_that_period(modules) ->
     assert rows["Tháng 3/2026"]["total_kwh"] == 240.0
     assert rows["Tháng 4/2026"]["total_kwh"] == 80.0
     assert rows["Tháng 2/2026"]["total_kwh"] is None
+
+
+# ------------------------------------------------------------ provenance and reconciliation
+
+def test_bills_with_source_say_fresh_for_a_live_fetch_and_cached_for_the_fallback(modules, monkeypatch) -> None:
+    _, api = modules
+    good = {"data": [_bill(2026, 3, amount=300000)]}
+    client, _, _ = _stamped_client(api, monkeypatch, [good, api.EvnApiError("HTTP 500", status=500)])
+    rows, fresh = asyncio.run(client.async_bills_with_source("PB000001"))
+    assert fresh is True and rows[0]["total_amount"] == 300000
+    again, fresh = asyncio.run(client.async_bills_with_source("PB000001"))
+    assert fresh is False and again == rows
+
+
+def test_bills_with_source_still_raises_without_a_prior_success(modules, monkeypatch) -> None:
+    _, api = modules
+    client, _, _ = _stamped_client(api, monkeypatch, [api.EvnApiError("HTTP 500", status=500)])
+    with pytest.raises(api.EvnApiError):
+        asyncio.run(client.async_bills_with_source("PB000001"))
+
+
+def _annotated(period, kwh, *, status, collected=None, diff=None, missing=0, ky=1, year=2026, month=3):
+    return {
+        "period": period, "total_kwh": kwh, "total_amount": 100, "is_paid": True, "period_start": "", "period_end": "",
+        "calculated_amount": None, "year": year, "month": month, "ky": ky, "collected_kwh": collected,
+        "diff_kwh": diff, "missing_days": missing, "reconcile_status": status, "paired_with": None,
+    }
+
+
+def test_aggregate_rows_carry_the_canonical_period_even_from_plain_bill_rows(modules) -> None:
+    calculation, _ = modules
+    plain = {"period": "Tháng 3/2026", "total_kwh": 10.0, "total_amount": 1, "is_paid": True, "KY": 2}
+    row = calculation.aggregate_bills([[plain]])[0]
+    assert (row["year"], row["month"], row["ky"]) == (2026, 3, 2)
+    assert row["reconcile_status"] is None and row["collected_kwh"] is None and row["diff_kwh"] is None
+
+
+def test_aggregate_reconciliation_sums_when_every_code_has_a_value_and_shows_the_worst_status(modules) -> None:
+    calculation, _ = modules
+    first = _annotated("Tháng 3/2026", 100.0, status="match", collected=100.4, diff=0.4)
+    second = _annotated("Tháng 3/2026", 50.0, status="mismatch", collected=47.0, diff=-3.0)
+    row = calculation.aggregate_bills([[first], [second]])[0]
+    assert (row["collected_kwh"], row["diff_kwh"], row["missing_days"], row["reconcile_status"]) == (147.4, -2.6, 0, "mismatch")
+    third = _annotated("Tháng 3/2026", 50.0, status="incomplete", collected=45.0, diff=-5.0, missing=2)
+    row = calculation.aggregate_bills([[first], [third]])[0]
+    assert (row["reconcile_status"], row["missing_days"]) == ("incomplete", 2)
+    boundary = _annotated("Tháng 3/2026", 50.0, status="boundary", collected=44.0, diff=-6.0)
+    assert calculation.aggregate_bills([[first], [boundary]])[0]["reconcile_status"] == "boundary"
+    assert calculation.aggregate_bills([[first], [first]])[0]["reconcile_status"] == "match"
+
+
+def test_aggregate_reconciliation_is_null_when_a_contributing_code_has_none(modules) -> None:
+    calculation, _ = modules
+    first = _annotated("Tháng 3/2026", 100.0, status="match", collected=100.4, diff=0.4)
+    unreconciled = _annotated("Tháng 3/2026", 50.0, status=None)
+    row = calculation.aggregate_bills([[first], [unreconciled]])[0]
+    assert (row["collected_kwh"], row["diff_kwh"], row["missing_days"], row["reconcile_status"]) == (None, None, None, None)
+    no_kwh = _annotated("Tháng 3/2026", None, status="no_kwh", collected=40.0, diff=None)
+    row = calculation.aggregate_bills([[first], [no_kwh]])[0]
+    assert (row["collected_kwh"], row["diff_kwh"], row["reconcile_status"]) == (140.4, None, "match")
+
+
+def test_a_code_with_no_bill_for_the_period_does_not_block_the_aggregate_reconciliation(modules) -> None:
+    calculation, _ = modules
+    march = _annotated("Tháng 3/2026", 100.0, status="match", collected=100.0, diff=0.0)
+    april = _annotated("Tháng 4/2026", 80.0, status="match", collected=80.5, diff=0.5, month=4)
+    rows = {row["period"]: row for row in calculation.aggregate_bills([[march, april], [march]])}
+    assert rows["Tháng 4/2026"]["collected_kwh"] == 80.5 and rows["Tháng 3/2026"]["collected_kwh"] == 200.0

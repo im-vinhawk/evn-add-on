@@ -12,7 +12,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import EvnAuthenticationError, EvnClient, EvnError
-from .const import CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_ALIASES, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE, CONF_REFRESH_TOKEN, CONF_SELECTED_CUSTOMER_CODES, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_ALIASES, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE, CONF_RECONCILE_THRESHOLD_KWH, CONF_REFRESH_TOKEN, CONF_SELECTED_CUSTOMER_CODES, DEFAULT_RECONCILE_THRESHOLD_KWH, DEFAULT_SCAN_INTERVAL, DOMAIN
 from .models import (
     merge_linked_customer_meter_points,
     normalize_aliases,
@@ -156,6 +156,7 @@ class EvnVietnamOptionsFlow(config_entries.OptionsFlow):
                     CONF_CUSTOMER_CODES: codes,
                     CONF_SELECTED_CUSTOMER_CODES: selection,
                     CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
+                    CONF_RECONCILE_THRESHOLD_KWH: float(user_input[CONF_RECONCILE_THRESHOLD_KWH]),
                 }
                 self._alias_codes = configured_codes
                 return await self.async_step_aliases()
@@ -174,6 +175,7 @@ class EvnVietnamOptionsFlow(config_entries.OptionsFlow):
             vol.Required(CONF_CUSTOMER_CODES, default=", ".join(options.get(CONF_CUSTOMER_CODES, []))): str,
             vol.Required(CONF_SELECTED_CUSTOMER_CODES, default=", ".join(default_selection)): str,
             vol.Required(CONF_SCAN_INTERVAL, default=options.get(CONF_SCAN_INTERVAL, int(DEFAULT_SCAN_INTERVAL.total_seconds() / 60))): vol.All(vol.Coerce(int), vol.Range(min=5, max=1440)),
+            vol.Required(CONF_RECONCILE_THRESHOLD_KWH, default=options.get(CONF_RECONCILE_THRESHOLD_KWH, DEFAULT_RECONCILE_THRESHOLD_KWH)): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
         })
         return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
 

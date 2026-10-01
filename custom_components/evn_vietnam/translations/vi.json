@@ -30,7 +30,8 @@
         "data": {
           "customer_codes": "Mã khách hàng bổ sung đã liên kết trong ứng dụng EVN (phân cách bằng dấu phẩy)",
           "selected_customer_codes": "Mã khách hàng trong tổng hợp (luôn gồm mã tài khoản chính)",
-          "scan_interval": "Chu kỳ cập nhật (phút)"
+          "scan_interval": "Chu kỳ cập nhật (phút)",
+          "reconcile_threshold_kwh": "Ngưỡng đối chiếu hoá đơn (kWh): hoá đơn khớp với số liệu đã thu thập khi chênh lệch không quá mức này"
         }
       },
       "aliases": {

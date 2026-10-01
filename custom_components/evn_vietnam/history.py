@@ -9,18 +9,23 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import copy
 from datetime import date, datetime, timedelta, tzinfo
 import logging
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .api import EvnApiError
-from .const import BACKFILL_MONTHS_PER_CYCLE, BACKFILL_PAUSE_SECONDS, DAILY_HISTORY_DAYS, DOMAIN, MAX_BACKFILL_MONTHS
+from .const import (
+    BACKFILL_MONTHS_PER_CYCLE, BACKFILL_PAUSE_SECONDS, DAILY_HISTORY_DAYS, DEFAULT_RECONCILE_THRESHOLD_KWH, DOMAIN,
+    MAX_BACKFILL_MONTHS,
+)
 from .daily_store import (
     STORE_VERSION, backfill_meta, code_days, compose_window, earliest_day, mark_previous_month_refreshed, mark_tail_tried,
     merge_daily, needs_previous_month_refresh, needs_previous_month_tail, next_backfill_month, normalize_store,
     record_backfill_month, record_failure,
 )
 from .pricing import PriceModel
+from .reconcile import annotate_bills, plan_events, safe_label
 from .statistics_import import SeriesSpec, async_import_series, build_series, series_to_clear
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +44,7 @@ class DailyHistory:
         store: Any,
         importer: Callable[[Sequence[SeriesSpec], Sequence[str]], Awaitable[None]],
         tz_provider: Callable[[], tzinfo],
+        entry_id: str = "",
         now_provider: Callable[[], datetime],
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         backfill_cap: int = MAX_BACKFILL_MONTHS,
@@ -46,6 +52,7 @@ class DailyHistory:
     ) -> None:
         self._client, self._store, self._importer = client, store, importer
         self._tz, self._now, self._sleep = tz_provider, now_provider, sleep
+        self._entry_id = entry_id
         self._cap, self._months_per_cycle = backfill_cap, months_per_cycle
         self._data: dict[str, Any] | None = None
         self._models: dict[str, PriceModel] = {}
@@ -81,6 +88,11 @@ class DailyHistory:
             for code in sorted(codes)
         }
 
+    def annotate_bills(self, code: str, bills: Sequence[Mapping[str, Any]], threshold_kwh: float) -> list[dict[str, Any]]:
+        """Bill rows with the canonical period and, once the store is loaded, their kWh reconciliation."""
+        days = self.days(code) if self._data is not None else None
+        return annotate_bills(bills, days, threshold_kwh)[0]
+
     async def async_update(
         self,
         *,
@@ -89,11 +101,15 @@ class DailyHistory:
         selected: Sequence[str],
         aliases: Mapping[str, str],
         allow_backfill: bool,
-    ) -> None:
-        """One coordinator cycle: merge, refresh last month early in the month, backfill, import."""
+        threshold_kwh: float = DEFAULT_RECONCILE_THRESHOLD_KWH,
+    ) -> list[dict[str, Any]]:
+        """One coordinator cycle: merge, refresh last month, backfill, import; returns the bill events to fire.
+
+        The events come back only after the state that records them has been saved.
+        """
         await self._step("load", self._async_load)
         if self._data is None:
-            return
+            return []
         await self._step("merge", self._async_merge, meters)
         live = [code for code in codes if code in meters]
         if allow_backfill:
@@ -101,9 +117,11 @@ class DailyHistory:
             await self._step("previous month", self._async_refresh_previous_month, live)
             await self._step("backfill", self._async_backfill, live)
         await self._step("import", self._async_import, codes, selected, aliases)
+        events = await self._async_bill_events(meters, aliases, threshold_kwh)
         if self._dirty:
             self._dirty = False
             self._store.async_delay_save(lambda: self._data, SAVE_DELAY_SECONDS)
+        return events
 
     async def async_flush(self) -> None:
         """Write the store now (called when the config entry unloads)."""
@@ -118,6 +136,43 @@ class DailyHistory:
             await step(*args)
         except Exception as err:  # noqa: BLE001 - a history problem must never fail the sensor update
             _LOGGER.debug("EVN daily history step '%s' skipped (%s)", name, type(err).__name__)
+
+    async def _async_bill_events(
+        self, meters: Mapping[str, Mapping[str, Any]], aliases: Mapping[str, str], threshold_kwh: float,
+    ) -> list[dict[str, Any]]:
+        """Plan the new-bill events of codes whose bills are fresh; save the seen state before returning them."""
+        try:
+            return await self._plan_and_save_bill_events(meters, aliases, threshold_kwh)
+        except Exception as err:  # noqa: BLE001 - a reconciliation problem must never fail the sensor update
+            _LOGGER.debug("EVN bill events skipped (%s)", type(err).__name__)
+            return []
+
+    async def _plan_and_save_bill_events(
+        self, meters: Mapping[str, Mapping[str, Any]], aliases: Mapping[str, str], threshold_kwh: float,
+    ) -> list[dict[str, Any]]:
+        previous = self._data["bills"]
+        planned = copy.deepcopy(previous)
+        today, events = self.today(), []
+        for code, overview in meters.items():
+            if overview.get("bills_fresh") is not True:
+                continue
+            _, periods, results = annotate_bills(overview.get("bills", []), code_days(self._data, code), threshold_kwh)
+            fired, planned[code] = plan_events(
+                self._entry_id, code, safe_label(code, aliases.get(code)), periods, results, planned.get(code), today,
+                threshold_kwh,
+            )
+            events.extend(fired)
+        if planned == previous:
+            return []
+        self._data["bills"] = planned
+        try:
+            await self._store.async_save(self._data)
+        except Exception as err:  # noqa: BLE001 - nothing is announced that could not be remembered
+            self._data["bills"] = previous
+            _LOGGER.debug("EVN seen bills could not be saved (%s)", type(err).__name__)
+            return []
+        self._dirty = False
+        return events
 
     async def _async_load(self) -> None:
         if self._data is None:
@@ -232,6 +287,7 @@ def create_daily_history(hass: Any, entry_id: str, client: Any) -> DailyHistory:
     return DailyHistory(
         client=client,
         store=Store(hass, STORE_VERSION, f"{DOMAIN}.daily.{entry_id}"),
+        entry_id=entry_id,
         importer=importer,
         tz_provider=lambda: dt_util.DEFAULT_TIME_ZONE,
         now_provider=dt_util.now,
