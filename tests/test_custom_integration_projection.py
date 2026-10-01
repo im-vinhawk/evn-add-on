@@ -124,9 +124,31 @@ def test_when_the_new_period_has_no_row_yet_nothing_is_collected_and_the_rate_co
     assert (got["collected_kwh"], got["data_until"], got["projected_kwh"]) == (0.0, "2026-09-29", 4.0 * 31)
 
 
-def test_a_finished_period_projects_exactly_what_was_collected(m) -> None:
+def test_a_period_whose_window_is_over_is_never_the_running_one(m) -> None:
+    """Data past the window of the period after the newest bill means that period has ended: step forward."""
     got = _project(m, _days(date(2026, 9, 30), date(2026, 11, 2), 1.0), [SEPT], date(2026, 11, 3))
-    assert got["projected_kwh"] == got["collected_kwh"] == 31.0
+    assert (got["period_start"], got["expected_end"]) == ("2026-11-01", "2026-11-30")
+    assert got["collected_kwh"] == 3.0 and got["projected_kwh"] == 3.0 + 1.0 * 27
+
+
+def test_a_bill_that_is_late_does_not_pin_the_projection_to_a_closed_month(m) -> None:
+    """The newest listed bill is August; on 03/10 September is over and its bill is not listed yet."""
+    august = _bill(2026, 8, "2026-08-01", "2026-08-31")
+    got = _project(m, _days(date(2026, 8, 31), date(2026, 10, 2), 3.0), [august], date(2026, 10, 3))
+    assert (got["period_start"], got["expected_end"]) == ("2026-10-01", "2026-10-31")
+    assert got["collected_kwh"] == 3 * 3.0 and got["tier"] == 1
+
+
+def test_readings_newer_than_the_bills_set_the_running_period_too(m) -> None:
+    august = _bill(2026, 8, "2026-08-01", "2026-08-31")
+    readings = [{"year": 2026, "month": 9, "ky": 1, "kwh": 90.0, "start": "2026-09-01", "end": "2026-09-30"}]
+    got = _project(m, _days(date(2026, 9, 30), date(2026, 10, 10), 3.0), [august], date(2026, 10, 11), readings=readings)
+    assert got["period_start"] == "2026-10-01"
+
+
+def test_a_period_still_running_is_not_stepped_over(m) -> None:
+    got = _project(m, _days(date(2026, 8, 31), date(2026, 9, 28), 3.0), [_bill(2026, 8, "2026-08-01", "2026-08-31")], date(2026, 9, 29))
+    assert got["period_start"] == "2026-09-01" and got["expected_end"] == "2026-09-30"
 
 
 def test_no_data_means_no_projection(m) -> None:

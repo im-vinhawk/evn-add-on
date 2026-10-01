@@ -116,17 +116,20 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed("No EVN customer code is configured")
             meters: dict[str, dict[str, Any]] = {}
             partial_errors: dict[str, str] = {}
+            # A step that failed for a code whose other data is fine (unpaid list, outages): shown on that
+            # step's own figures, never as a failed code.
+            step_errors: dict[str, str] = {}
             readings_by_code: dict[str, list[dict[str, Any]]] = {}
             for code in codes:
                 try:
                     overview = await self._client.async_overview(code)
                     history_bills, overview["bills_fresh"] = await self._client.async_bills_with_source(code)
-                    unpaid, overview["unpaid_fresh"], unpaid_loaded = await self._async_unpaid_or_empty(code, partial_errors)
+                    unpaid, overview["unpaid_fresh"], unpaid_loaded = await self._async_unpaid_or_empty(code, step_errors)
                     bills = merge_bill_sources(history_bills, unpaid, unpaid_fresh=overview["unpaid_fresh"])
                     readings_by_code[code] = await self._async_readings_or_empty(code)
                     overview["bills"] = attach_readings(bills, readings_by_code[code])
                     overview.update(unpaid_summary(overview["bills"], loaded=unpaid_loaded))
-                    overview.update(await self._async_outage_summary(code, partial_errors))
+                    overview.update(await self._async_outage_summary(code, step_errors))
                     # The legacy monthly history is derived from official bills.
                     overview["monthly_history"] = overview["bills"]
                     overview["history_fetched_at"] = self._client.history_fetched_at(code)
@@ -158,7 +161,7 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             # The backfill can switch customer or refresh the session, so persist those tokens now.
             self._persist_changed_tokens()
-            return {"meters": meters, "aggregate": aggregate, "partial_errors": partial_errors}
+            return {"meters": meters, "aggregate": aggregate, "partial_errors": partial_errors, "step_errors": step_errors}
 
     async def _async_update_history(
         self, meters: dict[str, dict[str, Any]], codes: list[str], selected: list[str]
@@ -254,7 +257,7 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return history
 
     async def _async_unpaid_or_empty(
-        self, code: str, partial_errors: dict[str, str]
+        self, code: str, step_errors: dict[str, str]
     ) -> tuple[list[dict[str, Any]], bool, bool]:
         """(unpaid bills, read within the cadence, ever loaded).
 
@@ -267,11 +270,11 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
         except EvnApiError:
             _LOGGER.debug("EVN unpaid bills unavailable; the payment state stays unknown")
-            partial_errors.setdefault(code, "unpaid_bills")
+            step_errors.setdefault(code, "unpaid_bills")
             return [], False, False
         return rows, fresh, True
 
-    async def _async_outage_summary(self, code: str, partial_errors: dict[str, str]) -> dict[str, Any]:
+    async def _async_outage_summary(self, code: str, step_errors: dict[str, str]) -> dict[str, Any]:
         """The next planned outage of a code; it never fails the update, and unknown stays unknown."""
         now = dt_util.now()
         try:
@@ -281,7 +284,7 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
         except EvnApiError:
             _LOGGER.debug("EVN planned outages unavailable; they stay unknown")
-            partial_errors.setdefault(code, "outages")
+            step_errors.setdefault(code, "outages")
         except Exception as err:  # noqa: BLE001 - an outage problem must never fail the sensor update
             _LOGGER.debug("EVN planned outages skipped (%s)", type(err).__name__)
         return outage_summary([], loaded=False)

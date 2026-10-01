@@ -1286,3 +1286,13 @@ def test_a_fresh_install_with_three_unpaid_periods_announces_only_the_previous_m
     assert [e["period"] for e in events] == ["09/2026"]
     assert set(seen.store.saved[-1]["bills"]["PB000001"]) == {"2026-07-1", "2026-08-1", "2026-09-1"}
     assert seen.store.saved[-1]["unpaid_seeded"] == {"PB000001": True}
+
+
+def test_a_code_with_no_seen_periods_is_not_seeded_from_the_unpaid_list_alone(modules) -> None:
+    """Cached paid history with a fresh unpaid list: seeding now would let the history announce every old period next poll."""
+    history, seen = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 1))
+    old_paid = [_paid_bill_row(2025, month, 90.0) for month in range(1, 13)]
+    assert _bill_update(history, _unpaid_meter(old_paid + _ARREARS, history_fresh=False)) == []
+    assert history._data["bills"] == {} and history._data["unpaid_seeded"] == {}
+    events = _bill_update(history, _unpaid_meter(old_paid + _ARREARS))
+    assert [e["period"] for e in events] == ["09/2026"], "once the history is fresh too, only the previous month is announced"

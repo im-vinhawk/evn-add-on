@@ -317,17 +317,33 @@ def test_the_unpaid_list_is_asked_at_most_once_in_two_hours(modules, monkeypatch
     assert len(calls) == 2 and third == ([], True)
 
 
-def test_a_failed_fetch_falls_back_to_the_last_good_copy_and_is_not_fresh(modules, monkeypatch) -> None:
+def test_a_failed_fetch_falls_back_to_the_last_good_copy_and_waits_before_asking_again(modules, monkeypatch) -> None:
     client, clock = _client(modules)
-    _script(modules, monkeypatch, client, [
+    calls, _ = _script(modules, monkeypatch, client, [
         {"data": [_unpaid_row()]}, modules.api.EvnApiError("HTTP 500", status=500), {"data": []},
     ])
     good = asyncio.run(client.async_unpaid_bills_with_source(CODE))
     clock["now"] += 7300
     stale = asyncio.run(client.async_unpaid_bills_with_source(CODE))
-    assert stale[0] == good[0] and stale[1] is False
-    again = asyncio.run(client.async_unpaid_bills_with_source(CODE))
-    assert again == ([], True), "after a failure the next call asks EVN again instead of waiting two hours"
+    assert stale[0] == good[0] and stale[1] is False and len(calls) == 2
+    clock["now"] += 1800
+    assert asyncio.run(client.async_unpaid_bills_with_source(CODE)) == stale and len(calls) == 2, "no new request within the cadence"
+    clock["now"] += 5400
+    assert asyncio.run(client.async_unpaid_bills_with_source(CODE)) == ([], True) and len(calls) == 3
+
+
+def test_a_code_that_keeps_being_refused_is_not_asked_every_refresh(modules, monkeypatch) -> None:
+    client, clock = _client(modules)
+    calls, _ = _script(modules, monkeypatch, client, [modules.api.EvnApiError("HTTP 400", status=400)] * 3 + [{"data": []}])
+    for _ in range(2):
+        with pytest.raises(modules.api.EvnApiError):
+            asyncio.run(client.async_unpaid_bills(CODE))
+        clock["now"] += 1800
+    assert len(calls) == 1
+    clock["now"] += 5400
+    with pytest.raises(modules.api.EvnApiError):
+        asyncio.run(client.async_unpaid_bills(CODE))
+    assert len(calls) == 2
 
 
 def test_a_code_that_was_never_read_raises(modules, monkeypatch) -> None:

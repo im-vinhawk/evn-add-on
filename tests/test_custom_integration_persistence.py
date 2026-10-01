@@ -728,12 +728,13 @@ def test_an_unpaid_failure_keeps_the_code_and_marks_the_payment_state_unknown(mo
         {"PB000001": [_bill_row(8, 240000)], "PB000002": [_bill_row(8, 100)]}, {}, failing_unpaid=["PB000002"],
     )
     data, _ = _unpaid_data(modules, client)
-    assert data["partial_errors"] == {"PB000002": "unpaid_bills"}
+    assert data["partial_errors"] == {} and data["step_errors"] == {"PB000002": "unpaid_bills"}
     second = data["meters"]["PB000002"]
     assert second["bills"][0]["total_amount"] == 100 and second["current_month_consumption"] == 1.0
     assert (second["unpaid_count"], second["unpaid_amount"], second["unpaid_fresh"]) == (None, None, False)
     assert data["aggregate"]["unpaid_amount"] is None, "a partial total would look complete"
-    assert data["aggregate"]["is_partial"] is True and data["aggregate"]["successful_customer_codes"] == ["PB000001", "PB000002"]
+    assert data["aggregate"]["is_partial"] is False, "the code's figures are in the totals, so the total is not partial"
+    assert data["aggregate"]["successful_customer_codes"] == ["PB000001", "PB000002"]
 
 
 def test_a_payment_between_polls_wins_over_a_cached_unpaid_list(modules) -> None:
@@ -818,7 +819,7 @@ def test_an_outage_failure_keeps_the_code_and_leaves_the_outages_unknown(modules
         {"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {}, failing_outages=["PB000002"],
     )
     data, _ = _outage_data(modules, monkeypatch, client)
-    assert data["partial_errors"] == {"PB000002": "outages"}
+    assert data["partial_errors"] == {} and data["step_errors"] == {"PB000002": "outages"}
     second = data["meters"]["PB000002"]
     assert second["bills"][0]["total_amount"] == 100 and second["current_month_consumption"] == 1.0
     assert (second["next_planned_outage"], second["upcoming_outage_count"], second["outages"]) == (None, None, [])
@@ -830,7 +831,7 @@ def test_a_first_failure_is_the_one_reported_when_two_steps_fail(modules, monkey
         failing_unpaid=["PB000002"], failing_outages=["PB000002"],
     )
     data, _ = _outage_data(modules, monkeypatch, client)
-    assert data["partial_errors"] == {"PB000002": "unpaid_bills"}
+    assert data["step_errors"] == {"PB000002": "unpaid_bills"} and data["partial_errors"] == {}
 
 
 def test_an_outage_step_that_breaks_unexpectedly_never_fails_the_update(modules, monkeypatch) -> None:
@@ -929,10 +930,10 @@ def test_the_readings_give_the_period_when_a_bill_has_no_dates(modules) -> None:
 
     client = _TwoCodeClient(
         {"PB000001": [_bill_row(9, 250000)], "PB000002": [_bill_row(9, 250000)]}, {},
-        readings_by_code={"PB000001": [{"year": 2026, "month": 8, "ky": 1, "kwh": 90.0, "start": "2026-08-01", "end": "2026-08-31"}]},
+        readings_by_code={"PB000001": [{"year": 2026, "month": 9, "ky": 1, "kwh": 90.0, "start": "2026-09-10", "end": "2026-10-09"}]},
     )
     instance = _two_code_coordinator(modules, client)
     instance._history = _WindowHistory({"PB000001": _store(3.0), "PB000002": _store(1.0)}, date(2026, 10, 11))
     instance.data = None
     data = asyncio.run(instance._async_update_data())
-    assert data["meters"]["PB000001"]["projection"]["period_start"] == "2026-09-01"
+    assert data["meters"]["PB000001"]["projection"]["period_start"] == "2026-10-10", "the day after the readings' period, not the calendar month"

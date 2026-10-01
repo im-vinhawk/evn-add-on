@@ -128,7 +128,8 @@ def _client(modules, monkeypatch):
     client = modules.api.EvnClient(object(), state, {CODE: CODE + "009"})
     clock = {"now": 1000.0}
     client._clock = lambda: clock["now"]
-    monkeypatch.setattr(modules.api.dt_util, "now", lambda: datetime(2026, 10, 1, 9, 0, tzinfo=ICT))
+    # A Home Assistant set to UTC must not move EVN's Vietnam clock times.
+    monkeypatch.setattr(modules.api.dt_util, "now", lambda: datetime(2026, 10, 1, 2, 0, tzinfo=timezone.utc))
     return client, clock
 
 
@@ -234,3 +235,33 @@ def test_an_outage_in_progress_is_still_the_next_one_with_its_own_end(modules) -
     assert (summary["next_planned_outage"], summary["outage_end"], summary["upcoming_outage_count"]) == (
         "2026-10-02T08:00:00+07:00", "2026-10-02T18:00:00+07:00", 1,
     )
+
+
+def test_a_failed_outage_fetch_waits_before_asking_again(modules, monkeypatch) -> None:
+    client, clock = _client(modules, monkeypatch)
+    calls, _ = _script(monkeypatch, client, [
+        {"data": [_row()]}, modules.api.EvnApiError("HTTP 500", status=500), {"data": []},
+    ])
+    window = (date(2026, 10, 1), date(2026, 10, 15))
+    good = asyncio.run(client.async_outages(CODE, *window))
+    clock["now"] += 7 * 3600
+    assert asyncio.run(client.async_outages(CODE, *window)) == good
+    clock["now"] += 1800
+    assert asyncio.run(client.async_outages(CODE, *window)) == good and len(calls) == 2
+    clock["now"] += 6 * 3600
+    assert asyncio.run(client.async_outages(CODE, *window)) == [] and len(calls) == 3
+
+
+def test_a_refused_code_is_not_asked_for_outages_every_refresh(modules, monkeypatch) -> None:
+    client, clock = _client(modules, monkeypatch)
+    calls, _ = _script(monkeypatch, client, [modules.api.EvnApiError("HTTP 400", status=400)] * 2)
+    for _ in range(3):
+        with pytest.raises(modules.api.EvnApiError):
+            asyncio.run(client.async_outages(CODE, date(2026, 10, 1), date(2026, 10, 15)))
+        clock["now"] += 1800
+    assert len(calls) == 1
+
+
+def test_the_status_is_a_short_code(modules) -> None:
+    long = modules.calculation.normalize_outages([_row(status="X" * 200)], ICT)[0]["status"]
+    assert len(long) <= 4

@@ -17,6 +17,8 @@ from .tariff import TARIFF_ROWS, TIER_WIDTHS
 
 # How many of the newest days with data set the daily rate.
 RATE_DAYS = 7
+# A safety bound on stepping over periods whose bill is missing.
+MAX_PERIOD_STEPS = 24
 
 
 def _iso_day(value: Any) -> date | None:
@@ -31,37 +33,46 @@ def _last_of_month(day: date) -> date:
 
 
 def _newest_period(bills: Sequence[Mapping[str, Any]], readings: Sequence[Mapping[str, Any]]) -> tuple[date | None, date] | None:
-    """(start or None, end) of the newest bill with an end date, else of the newest reading; None if neither."""
-    keyed = [(bill_period_parts(bill), bill) for bill in bills if isinstance(bill, Mapping)]
-    dated = sorted(
-        ((parts, _iso_day(bill.get("period_start")), _iso_day(bill.get("period_end"))) for parts, bill in keyed if parts is not None),
-        key=lambda item: item[0],
-    )
-    dated = [item for item in dated if item[2] is not None]
-    if dated:
-        return dated[-1][1], dated[-1][2]
-    rows = sorted(
-        ((row.get("year", 0), row.get("month", 0), row.get("ky", 0)), _iso_day(row.get("start")), _iso_day(row.get("end")))
-        for row in readings if isinstance(row, Mapping)
-    )
-    rows = [item for item in rows if item[2] is not None]
-    return (rows[-1][1], rows[-1][2]) if rows else None
+    """(start or None, end) of the known period that ends last, from the bills and the monthly readings; None if none."""
+    found: list[tuple[date, date | None]] = []
+    for bill in bills:
+        if isinstance(bill, Mapping) and bill_period_parts(bill) is not None and _iso_day(bill.get("period_end")):
+            found.append((_iso_day(bill.get("period_end")), _iso_day(bill.get("period_start"))))
+    for row in readings:
+        if isinstance(row, Mapping) and _iso_day(row.get("end")):
+            found.append((_iso_day(row.get("end")), _iso_day(row.get("start"))))
+    if not found:
+        return None
+    end, start = max(found, key=lambda item: item[0])
+    return start, end
 
 
-def running_period(bills: Sequence[Mapping[str, Any]], readings: Sequence[Mapping[str, Any]], today: date) -> tuple[date, date]:
-    """The period after the newest known one.
-
-    A whole calendar month is followed by the whole next calendar month; any other period by one of the same
-    length.  Without a known period it is the current calendar month.
-    """
-    newest = _newest_period(bills, readings)
-    if newest is None:
-        return today.replace(day=1), _last_of_month(today)
-    previous_start, previous_end = newest
+def _following(previous_start: date | None, previous_end: date) -> tuple[date, date]:
+    """The period after one: a whole calendar month by the whole next one, any other by one of the same length."""
     start = previous_end + timedelta(days=1)
     if previous_start is None or previous_start > previous_end or is_calendar_month(previous_start, previous_end):
         return start, _last_of_month(start)
     return start, start + (previous_end - previous_start)
+
+
+def running_period(
+    bills: Sequence[Mapping[str, Any]], readings: Sequence[Mapping[str, Any]], today: date, data_until: date | None = None,
+) -> tuple[date, date]:
+    """The period after the newest known one, stepped forward while daily data already lies past its window.
+
+    A bill is listed some days after its period ends, so the newest listed period can be old: data past the
+    window of the period that follows it proves that period is over too.  Without a known period it is the
+    current calendar month.
+    """
+    newest = _newest_period(bills, readings)
+    if newest is None:
+        return today.replace(day=1), _last_of_month(today)
+    start, end = _following(*newest)
+    for _ in range(MAX_PERIOD_STEPS):
+        if data_until is None or data_until <= end + timedelta(days=BILL_DAY_OFFSET):
+            break
+        start, end = _following(start, end)
+    return start, end
 
 
 def _tier(collected_kwh: float, start: date, end: date, model: PriceModel) -> dict[str, Any]:
@@ -94,11 +105,11 @@ def project_running_period(
     stored = sorted(day for day in days if _iso_day(day) is not None)
     if not stored:
         return None
-    start, end = running_period(bills, readings, today)
+    data_until = _iso_day(stored[-1])
+    start, end = running_period(bills, readings, today, data_until)
     window_start, window_end = start + timedelta(days=BILL_DAY_OFFSET), end + timedelta(days=BILL_DAY_OFFSET)
     in_window = [days[day] for day in stored if window_start <= _iso_day(day) <= window_end]
     collected = round(sum(in_window), 2)
-    data_until = _iso_day(stored[-1])
     rate_days = [days[day] for day in stored[-RATE_DAYS:]]
     rate = round(sum(rate_days) / len(rate_days), 2)
     remaining = max((window_end - max(data_until, window_start - timedelta(days=1))).days, 0)

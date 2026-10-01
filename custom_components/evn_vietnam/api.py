@@ -21,7 +21,7 @@ from .calculation import (
 )
 from .const import (
     DAILY_HISTORY_DAYS, DEFAULT_TIMEOUT, MONTHLY_READINGS_CACHE_SECONDS, NATIONAL_BASE_URL, REGIONAL_GATEWAYS,
-    OUTAGE_REFRESH, UNPAID_REFRESH,
+    EVN_TIMEZONE, OUTAGE_REFRESH, UNPAID_REFRESH,
 )
 from .models import (
     SessionState,
@@ -144,6 +144,9 @@ class EvnClient:
         self._unpaid_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         # code -> (monotonic fetched_at, outages) of the last successful planned-outage fetch.
         self._outage_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+        # code -> monotonic time before which a failed unpaid / outage request is not repeated (the cadence).
+        self._unpaid_retry: dict[str, float] = {}
+        self._outage_retry: dict[str, float] = {}
 
     @staticmethod
     def new_device_id() -> str:
@@ -537,16 +540,24 @@ class EvnClient:
         """
         key = customer_code.strip().upper()
         cached = self._unpaid_cache.get(key)
-        if cached is not None and self._clock() - cached[0] < UNPAID_REFRESH.total_seconds():
+        now = self._clock()
+        if cached is not None and now - cached[0] < UNPAID_REFRESH.total_seconds():
             return [dict(row) for row in cached[1]], True
+        if now < self._unpaid_retry.get(key, 0):
+            # A failed request is not repeated every refresh: wait one cadence.
+            if cached is None:
+                raise EvnApiError("EVN unpaid bills were unavailable a moment ago")
+            return [dict(row) for row in cached[1]], False
         try:
             bills = await self._async_fetch_unpaid_bills(key)
         except EvnApiError:
+            self._unpaid_retry[key] = now + UNPAID_REFRESH.total_seconds()
             if cached is None:
                 raise
             _LOGGER.debug("EVN unpaid bills unavailable; showing the last successful fetch")
             return [dict(row) for row in cached[1]], False
-        self._unpaid_cache[key] = (self._clock(), [dict(row) for row in bills])
+        self._unpaid_retry.pop(key, None)
+        self._unpaid_cache[key] = (now, [dict(row) for row in bills])
         return bills, True
 
     async def _async_fetch_unpaid_bills(self, customer_code: str) -> list[dict[str, Any]]:
@@ -569,16 +580,23 @@ class EvnClient:
         """
         key = customer_code.strip().upper()
         cached = self._outage_cache.get(key)
-        if cached is not None and self._clock() - cached[0] < OUTAGE_REFRESH.total_seconds():
+        now = self._clock()
+        if cached is not None and now - cached[0] < OUTAGE_REFRESH.total_seconds():
+            return [dict(row) for row in cached[1]]
+        if now < self._outage_retry.get(key, 0):
+            if cached is None:
+                raise EvnApiError("EVN planned outages were unavailable a moment ago")
             return [dict(row) for row in cached[1]]
         try:
             outages = await self._async_fetch_outages(key, start, end)
         except EvnApiError:
+            self._outage_retry[key] = now + OUTAGE_REFRESH.total_seconds()
             if cached is None:
                 raise
             _LOGGER.debug("EVN planned outages unavailable; showing the last successful fetch")
             return [dict(row) for row in cached[1]]
-        self._outage_cache[key] = (self._clock(), [dict(row) for row in outages])
+        self._outage_retry.pop(key, None)
+        self._outage_cache[key] = (now, [dict(row) for row in outages])
         return outages
 
     async def _async_fetch_outages(self, customer_code: str, start: date, end: date) -> list[dict[str, str]]:
@@ -589,7 +607,7 @@ class EvnClient:
             payload, ("data", "danhSachNgungCapDien", "items"), (("TGIAN_BDAU",), ("TGIAN_KTHUC",)),
         )
         self._record_shape("outages", rows)
-        return normalize_outages(rows, dt_util.now().tzinfo)
+        return normalize_outages(rows, EVN_TIMEZONE)
 
     async def async_monthly_readings(self, customer_code: str) -> list[dict[str, Any]]:
         """Monthly meter readings since January of last year; they carry each bill's real kWh.

@@ -401,7 +401,7 @@ def normalize_outages(rows: Iterable[Any], tz: tzinfo | None) -> list[dict[str, 
         if start is None or end is None:
             continue
         status = row.get("TTHAI_HOAN")
-        result.append({"start": start, "end": end, "status": "" if status is None else str(status).strip()})
+        result.append({"start": start, "end": end, "status": "" if status is None else str(status).strip()[:4]})
     return sorted(result, key=lambda item: item["start"])
 
 

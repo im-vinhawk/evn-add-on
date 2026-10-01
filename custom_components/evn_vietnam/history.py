@@ -159,6 +159,10 @@ class DailyHistory:
                 fresh_keys, unpaid_seen = _fresh_periods(bills, overview)
                 if not fresh_keys:
                     continue  # a cached copy never announces anything
+                if not planned.get(code) and overview.get("bills_fresh") is not True:
+                    # Nothing seen yet and the paid history is only a cached copy: seeding from the unpaid list
+                    # alone would let the history announce every old period on the next poll.
+                    continue
                 _, periods, results = annotate_bills(bills, code_days(self._data, code), threshold_kwh)
                 if not periods:
                     continue  # nothing was seen: an empty list must not mark the code as seeded

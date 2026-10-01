@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 DOMAIN = "evn_vietnam"
 NAME = "EVN Vietnam"
@@ -49,6 +49,8 @@ UNPAID_REFRESH = timedelta(hours=2)
 # Planned outages: how far ahead they are asked for, and how often per code.
 OUTAGE_LOOKAHEAD_DAYS = 14
 OUTAGE_REFRESH = timedelta(hours=6)
+# EVN writes outage times on Vietnam's clock, whatever time zone Home Assistant is set to.
+EVN_TIMEZONE = timezone(timedelta(hours=7))
 # Historical daily backfill: how far back, how many months one refresh may fetch (for one code only),
 # and the pause before each EVN request so the backfill never hammers the service.
 MAX_BACKFILL_MONTHS = 36
