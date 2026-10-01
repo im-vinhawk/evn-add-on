@@ -53,8 +53,24 @@ class FakeNode {
   }
 }
 
+// The card reads "today" from the clock; tests pin it and the browser calendar so
+// day-edge cases are deterministic. Tests move the clock through `clock.ms`.
+process.env.TZ = 'Asia/Ho_Chi_Minh';
+const clock = { ms: Date.parse('2026-08-30T05:00:00Z') };
+class FakeDate extends Date {
+  constructor(...args) {
+    if (args.length === 0) super(clock.ms);
+    else super(...args);
+  }
+
+  static now() {
+    return clock.ms;
+  }
+}
+
 const registered = new Map();
 const context = {
+  Date: FakeDate,
   HTMLElement: FakeNode,
   document: {
     createElement: (tagName) => new FakeNode(tagName),
@@ -729,6 +745,241 @@ function hasOwnInnerHtml(node) {
   await flush();
   assert.equal(plainCalls.length, 1);
   assert.ok(Number.isFinite(Date.parse(plainCalls[0].start_time)) && Number.isFinite(Date.parse(plainCalls[0].end_time)));
+
+  // 8. Month edge: the rolling chart ends at today, not at the latest known row
+  clock.ms = Date.parse('2026-10-01T03:00:00Z'); // 10:00 on 1 October in Asia/Ho_Chi_Minh
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const septemberRows = (lastDay) => Array.from({ length: lastDay }, (_, i) => ({
+    date: `2026-09-${pad2(i + 1)}`,
+    consumption: 10 + (i % 3),
+  }));
+  const barDates = (card) => findAllNodes(card.shadowRoot, isChartBar).map((b) => b.attributes['aria-label'].slice(0, 10));
+  const emptyBarIndexes = (card) => findAllNodes(card.shadowRoot, isChartBar)
+    .map((b, idx) => (String(b.className).split(/\s+/).includes('bar-empty') ? idx : -1))
+    .filter((idx) => idx >= 0);
+  const tileValue = (card, label) => {
+    const tile = findNode(card.shadowRoot, (n) => n.className === 'metric-card' && n.children[0].textContent === label);
+    assert.ok(tile, `the ${label} tile must render`);
+    return tile.children[1].textContent;
+  };
+
+  const dayOneCard = newCompareCard(compareHass(undefined, { daily_history: septemberRows(30) }));
+  let dates = barDates(dayOneCard);
+  assert.equal(dates.length, 30, 'day 1 still draws 30 columns');
+  assert.equal(dates[0], '2026-09-02', 'the window starts 29 days before today');
+  assert.equal(dates[29], '2026-10-01', 'the chart ends at today even without an October row');
+  assert.deepEqual(emptyBarIndexes(dayOneCard), [29], 'only today is missing when September is complete');
+  assert.equal(tileValue(dayOneCard, 'Hôm qua'), '12 kWh', 'yesterday on day 1 is the last day of the previous month');
+  assert.equal(tileValue(dayOneCard, 'Hôm nay'), '—', 'a day without a row is a dash, never 0');
+
+  const lateCard = newCompareCard(compareHass(undefined, { daily_history: septemberRows(29) }));
+  dates = barDates(lateCard);
+  assert.equal(dates[29], '2026-10-01', 'the chart ends at today when 30/09 is also absent');
+  assert.equal(dates[28], '2026-09-30');
+  assert.deepEqual(emptyBarIndexes(lateCard), [28, 29], '30/09 and 01/10 are both drawn as missing');
+  assert.equal(tileValue(lateCard, 'Hôm qua'), '—', 'an absent yesterday is a dash, never a fake 0');
+  assert.ok(!texts(lateCard).includes('0 kWh') && !texts(lateCard).includes('0,0 kWh'));
+
+  const staleCard = newCompareCard(compareHass(undefined, { daily_history: [{ date: '2026-08-20', consumption: 12 }] }));
+  assert.equal(barDates(staleCard).at(-1), '2026-10-01', 'stale data does not drag the chart end back');
+
+  // 9. Month picker
+  const septStats = (skip = []) => ({ [ENERGY_ID]: monthRows(2026, 9, 30, () => 10, skip) });
+  const monthSelectOf = (card) => findNode(card.shadowRoot, (n) => n.className === 'month-selector');
+  const pickMonth = (card, value) => {
+    const sel = monthSelectOf(card);
+    assert.ok(sel, 'the chart header must hold the month selector');
+    sel.value = value;
+    sel.dispatchEvent({ type: 'change', target: { value } });
+  };
+  const rangeButtonsOf = (card) => findAllNodes(card.shadowRoot, (n) => n.tagName === 'button' && String(n.className).includes('range-btn'));
+  const monthCalls = (list, start, end) => list.filter((m) => m.start_time === start && m.end_time === end);
+  const SEP_START = '2026-08-31T17:00:00.000Z';
+  const SEP_END = '2026-09-30T17:00:00.000Z';
+
+  const pickCalls = [];
+  const pickCard = newCompareCard(compareHass(async (m) => {
+    pickCalls.push(m);
+    return septStats([15]);
+  }, { daily_history: septemberRows(30) }));
+  await flush();
+  const picker = monthSelectOf(pickCard);
+  assert.equal(picker.attributes['aria-label'], 'Chọn khoảng thời gian của biểu đồ', 'the picker carries an accessible name');
+  assert.equal(picker.tagName, 'select');
+  assert.deepEqual(
+    [picker.children[0].textContent, picker.children[1].textContent, picker.children[2].textContent, picker.children[13].textContent],
+    ['30 ngày gần nhất', 'Tháng 10/2026', 'Tháng 09/2026', 'Tháng 10/2025'],
+    'rolling default, the current month, the completed months back to the same month last year',
+  );
+  assert.equal(picker.children.length, 14, '1 rolling entry + current month + 12 completed months');
+  assert.deepEqual(picker.children.map((o) => o.value).slice(0, 3), ['', '2026-10', '2026-09']);
+  assert.equal(rangeButtonsOf(pickCard).length, 3, 'rolling mode keeps the 7/14/30 buttons');
+  assert.equal(monthCalls(pickCalls, SEP_START, SEP_END).length, 0, 'nothing is loaded until a month is picked');
+
+  pickMonth(pickCard, '2026-09');
+  assert.ok(texts(pickCard).includes('Đang tải…'), 'month mode shows a loading note while the statistics load');
+  await flush();
+  const septCalls = monthCalls(pickCalls, SEP_START, SEP_END);
+  assert.equal(septCalls.length, 1, 'one statistics request for the picked month');
+  assert.equal(septCalls[0].type, 'recorder/statistics_during_period');
+  assert.equal(septCalls[0].period, 'day');
+  assert.equal(JSON.stringify(septCalls[0].types), JSON.stringify(['change']));
+  assert.equal(JSON.stringify(septCalls[0].statistic_ids), JSON.stringify([ENERGY_ID]));
+  dates = barDates(pickCard);
+  assert.equal(dates.length, 30, 'September has 30 columns');
+  assert.equal(dates[0], '2026-09-01', 'day 1 lands on the first bar');
+  assert.equal(dates[29], '2026-09-30', 'the last day lands on the last bar');
+  assert.deepEqual(emptyBarIndexes(pickCard), [14], 'the day the statistics lack is drawn as missing');
+  assert.equal(rangeButtonsOf(pickCard).length, 0, 'month mode hides the 7/14/30 buttons');
+  assert.ok(texts(pickCard).includes('Tổng tháng: 290 kWh'), 'the month total sums the days that have data');
+  assert.equal(monthSelectOf(pickCard).children.find((o) => o.selected).value, '2026-09', 'the picker shows the selection');
+
+  pickMonth(pickCard, '');
+  assert.equal(rangeButtonsOf(pickCard).length, 3, 'back to rolling mode the buttons return');
+  assert.equal(barDates(pickCard).at(-1), '2026-10-01');
+  pickMonth(pickCard, '2026-09');
+  await flush();
+  assert.equal(monthCalls(pickCalls, SEP_START, SEP_END).length, 1, 're-selecting a loaded month is served from the cache');
+  pickCard.hass = compareHass(async (m) => { pickCalls.push(m); return septStats([15]); }, { daily_history: septemberRows(30) });
+  await flush();
+  assert.equal(monthCalls(pickCalls, SEP_START, SEP_END).length, 1, 'a new hass object with the same data asks nothing more');
+
+  // A month boundary in the statistics lands on the right bars: the 1st of the current month.
+  const octCalls = [];
+  const octCard = newCompareCard(compareHass(async (m) => {
+    octCalls.push(m);
+    return { [ENERGY_ID]: [statRow('2026-10-01', 5)] };
+  }, { daily_history: septemberRows(30) }));
+  pickMonth(octCard, '2026-10');
+  await flush();
+  dates = barDates(octCard);
+  assert.equal(dates.length, 31, 'October has 31 columns');
+  assert.equal(dates[0], '2026-10-01');
+  assert.equal(dates[30], '2026-10-31');
+  assert.deepEqual(emptyBarIndexes(octCard), Array.from({ length: 30 }, (_, i) => i + 1), 'only 01/10 has data');
+  assert.equal(monthCalls(octCalls, '2026-09-30T17:00:00.000Z', '2026-10-31T17:00:00.000Z').length, 1);
+  assert.ok(texts(octCard).includes('Tổng tháng: 5 kWh'));
+
+  // A month with no statistics or a failing recorder shows the muted note, not a blank chart.
+  const failMonthCalls = [];
+  const failMonthCard = newCompareCard(compareHass(async (m) => {
+    failMonthCalls.push(m);
+    throw new Error('no recorder');
+  }));
+  pickMonth(failMonthCard, '2026-09');
+  await flush();
+  assert.ok(texts(failMonthCard).includes('Chưa có lịch sử'));
+  assert.equal(findAllNodes(failMonthCard.shadowRoot, isChartBar).length, 0, 'no bars without statistics');
+  const failedBefore = monthCalls(failMonthCalls, SEP_START, SEP_END).length;
+  failMonthCard.render();
+  await flush();
+  assert.equal(monthCalls(failMonthCalls, SEP_START, SEP_END).length, failedBefore, 'a failed month is not retried on every render');
+
+  const noWsMonth = newCompareCard(compareHass(undefined));
+  assert.doesNotThrow(() => pickMonth(noWsMonth, '2026-09'), 'a hass without callWS must not break month mode');
+  assert.ok(texts(noWsMonth).includes('Chưa có lịch sử'));
+
+  // Picking another month asks once for that month only.
+  pickMonth(pickCard, '2026-08');
+  await flush();
+  assert.equal(monthCalls(pickCalls, '2026-07-31T17:00:00.000Z', SEP_START).length, 1, 'August is loaded once');
+  assert.equal(barDates(pickCard).length, 31, 'August has 31 columns');
+
+  // 10. Reconciliation line (month mode) and bill table columns
+  const reconBill = (status, extra = {}) => ({
+    period: 'Tháng 9/2026',
+    year: 2026,
+    month: 9,
+    ky: 1,
+    total_kwh: 120,
+    total_amount: 300000,
+    is_paid: true,
+    period_start: '2026-09-01',
+    period_end: '2026-09-30',
+    collected_kwh: 120.4,
+    diff_kwh: 0.4,
+    missing_days: 0,
+    reconcile_status: status,
+    paired_with: null,
+    ...extra,
+  });
+  const reconCases = [
+    ['match', {}, 'Hoá đơn 120 kWh · Thu thập 120,4 kWh · Lệch +0,4 kWh · Khớp'],
+    ['boundary', { collected_kwh: 126, diff_kwh: 6, paired_with: 'bill_x' },
+      'Hoá đơn 120 kWh · Thu thập 126 kWh · Lệch +6 kWh · Lệch ranh giới kỳ, đã bù với kỳ liền kề'],
+    ['incomplete', { collected_kwh: 100.5, diff_kwh: -19.5, missing_days: 2 },
+      'Hoá đơn 120 kWh · Thu thập 100,5 kWh · Lệch -19,5 kWh · Thiếu dữ liệu ngày'],
+    ['mismatch', { collected_kwh: 104.5, diff_kwh: -15.5 },
+      'Hoá đơn 120 kWh · Thu thập 104,5 kWh · Lệch -15,5 kWh · Lệch'],
+    ['no_kwh', { total_kwh: null, collected_kwh: 100, diff_kwh: null },
+      'Hoá đơn — · Thu thập 100 kWh · Lệch — · Chưa có kWh hoá đơn'],
+  ];
+  const reconLinesOf = (card) => findAllNodes(card.shadowRoot, (n) => String(n.className).split(/\s+/).includes('recon-line'))
+    .map((n) => n.textContent);
+  const viewAttrs = {
+    perCode: {},
+    aggregate: { customer_code: '__aggregate__', selected_customer_codes: ['PB000001', 'PB000002'] },
+  };
+  for (const [viewName, viewExtra] of Object.entries(viewAttrs)) {
+    for (const [status, extra, expected] of reconCases) {
+      const card = newCompareCard(compareHass(async () => septStats(), {
+        ...viewExtra,
+        daily_history: septemberRows(30),
+        monthly_history: [
+          reconBill(status, extra),
+          reconBill(null, { ky: 2, collected_kwh: null, diff_kwh: null, missing_days: null }),
+          reconBill('match', { year: 2026, month: 8, period: 'Tháng 8/2026' }),
+        ],
+      }));
+      await flush();
+      assert.deepEqual(reconLinesOf(card), [], `${viewName}/${status}: rolling mode shows no reconciliation line`);
+      pickMonth(card, '2026-09');
+      await flush();
+      assert.deepEqual(
+        reconLinesOf(card),
+        [expected],
+        `${viewName}/${status}: one line for the selected month's bill with a status, none for a null status or another month`,
+      );
+      const warn = findAllNodes(card.shadowRoot, (n) => String(n.className).split(/\s+/).includes('recon-warn'));
+      assert.equal(warn.length > 0, status === 'mismatch', `${viewName}/${status}: only a mismatch carries the warning style`);
+    }
+  }
+
+  const lineCard = newCompareCard(compareHass(async () => septStats(), {
+    daily_history: septemberRows(30),
+    monthly_history: [
+      reconBill('match', { ky: 1 }),
+      reconBill('mismatch', { ky: 2, collected_kwh: 90, diff_kwh: -30 }),
+      { period: 'Tháng 9/2026', total_kwh: 50 },
+    ],
+  }));
+  pickMonth(lineCard, '2026-09');
+  await flush();
+  assert.equal(reconLinesOf(lineCard).length, 2, 'one line per bill row with a status; rows without the new fields are ignored');
+  pickMonth(failMonthCard, '2026-09');
+  assert.deepEqual(reconLinesOf(failMonthCard), [], 'no bill rows, no line');
+
+  // Bill table columns
+  const tableCard = newCompareCard(compareHass(undefined, {
+    daily_history: [],
+    monthly_history: [
+      reconBill('mismatch', { collected_kwh: 104.5, diff_kwh: -15.5 }),
+      reconBill('match', { year: 2026, month: 8, period: 'Tháng 8/2026', collected_kwh: 119.6, diff_kwh: -0.4 }),
+      reconBill(null, { year: 2026, month: 7, period: 'Tháng 7/2026', collected_kwh: null, diff_kwh: null }),
+      { period: 'Tháng 6/2026', total_kwh: 80, total_amount: 200000 },
+    ],
+  }));
+  const headers = findAllNodes(tableCard.shadowRoot, (n) => n.tagName === 'th').map((n) => n.textContent);
+  assert.deepEqual(headers, ['Kỳ thanh toán', 'Sản lượng', 'Số tiền', 'Trạng thái', 'Thu thập', 'Lệch']);
+  const bodyRows = findAllNodes(tableCard.shadowRoot, (n) => n.tagName === 'tr').slice(1);
+  const cellTexts = (row) => row.children.map((td) => td.textContent);
+  assert.deepEqual(cellTexts(bodyRows[0]).slice(4), ['104,5 kWh', '-15,5 kWh'], 'collected and signed difference in kWh');
+  assert.deepEqual(cellTexts(bodyRows[1]).slice(4), ['119,6 kWh', '-0,4 kWh']);
+  assert.deepEqual(cellTexts(bodyRows[2]).slice(4), ['-', '-'], 'a row without reconciliation shows a hyphen');
+  assert.deepEqual(cellTexts(bodyRows[3]).slice(4), ['-', '-'], 'an old payload without the new fields still renders');
+  assert.ok(String(bodyRows[0].children[5].className).includes('recon-warn'), 'a mismatch row warns on its difference cell');
+  assert.ok(!String(bodyRows[1].children[5].className).includes('recon-warn'), 'a matching row does not warn');
+  assert.ok(!hasOwnInnerHtml(tableCard.shadowRoot) && !hasOwnInnerHtml(pickCard.shadowRoot), 'new UI only uses textContent');
 })().catch((error) => {
   console.error(error);
   process.exit(1);

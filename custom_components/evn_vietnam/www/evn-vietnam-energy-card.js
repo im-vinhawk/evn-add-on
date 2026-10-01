@@ -12,6 +12,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     this._selectedViewId = null;
     this._selectedRangeDays = 30;
     this._selectedDay = '';
+    this._selectedMonth = '';
     this._compareCache = new Map();
   }
 
@@ -131,10 +132,10 @@ class EvnVietnamEnergyCard extends HTMLElement {
       if (!iso) continue;
       byDate.set(iso, item);
     }
-    const known = [...byDate.keys()].sort();
-    if (known.length === 0) return [];
+    if (byDate.size === 0) return [];
     const days = Math.max(1, Number(rangeDays) || 30);
-    const end = known[known.length - 1];
+    // The window ends today (Home Assistant's calendar), so a day EVN has not published yet is a gap, not the end.
+    const end = this._zonedIsoDate(Date.now());
     const start = this._shiftIsoDate(end, -(days - 1));
     const series = [];
     for (let iso = start; iso <= end; iso = this._shiftIsoDate(iso, 1)) {
@@ -384,7 +385,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     );
 
     // 5. Daily Energy Chart
-    cardContent.appendChild(this._renderChartSection(dailyHistory));
+    cardContent.appendChild(this._renderChartSection(dailyHistory, attrs, mainEntity.last_updated, monthlyHistory));
 
     // 6. Official Bill History Table
     cardContent.appendChild(this._renderBillTableSection(monthlyHistory));
@@ -783,7 +784,10 @@ class EvnVietnamEnergyCard extends HTMLElement {
   // The selected day: a clicked bar while it is still on the chart, else the latest day with data.
   _selectedCompareDay(dailyHistory) {
     const rows = Array.isArray(dailyHistory) ? dailyHistory : [];
-    if (this._selectedDay && this._calendarBars(rows, 30).some((bar) => bar.date === this._selectedDay)) {
+    if (this._selectedDay && (
+      (this._selectedMonth && this._selectedDay.startsWith(this._selectedMonth))
+      || this._calendarBars(rows, 30).some((bar) => bar.date === this._selectedDay)
+    )) {
       return this._selectedDay;
     }
     const dated = rows
@@ -896,8 +900,93 @@ class EvnVietnamEnergyCard extends HTMLElement {
     return section;
   }
 
+  // --- Month picker (recorder statistics) ---
+  // The current month, then the 12 completed months before it, newest first.
+  _monthOptions(todayIso) {
+    const [year, month] = String(todayIso).split('-').map(Number);
+    const options = [];
+    for (let back = 0; back < 13; back += 1) {
+      const index = year * 12 + (month - 1) - back;
+      const optYear = Math.floor(index / 12);
+      const optMonth = (index % 12) + 1;
+      const mm = String(optMonth).padStart(2, '0');
+      options.push({ value: `${optYear}-${mm}`, year: optYear, month: optMonth, label: `Tháng ${mm}/${optYear}` });
+    }
+    return options;
+  }
+
+  _loadMonth(key, ids, year, month) {
+    const nextYear = month === 12 ? year + 1 : year;
+    const nextMonth = month === 12 ? 1 : month + 1;
+    Promise.resolve()
+      .then(() => this._hass.callWS({
+        type: 'recorder/statistics_during_period',
+        start_time: this._zonedMidnight(year, month, 1).toISOString(),
+        end_time: this._zonedMidnight(nextYear, nextMonth, 1).toISOString(),
+        statistic_ids: [ids.energy],
+        period: 'day',
+        types: ['change'],
+      }))
+      .then((result) => {
+        const rows = this._statRowsToDays(result && result[ids.energy]);
+        this._compareCache.set(key, rows.length > 0 ? { status: 'ready', data: rows } : { status: 'error' });
+      })
+      .catch(() => {
+        this._compareCache.set(key, { status: 'error' });
+      })
+      .then(() => this.render());
+  }
+
+  // One bar per calendar day of the month; a day the statistics lack is a gap, never 0.
+  _renderMonthBars(rows, year, month) {
+    const byDate = new Map();
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      if (!row || row.value === null || row.value === undefined || row.value === '') return;
+      const num = Number(row.value);
+      if (Number.isFinite(num)) byDate.set(String(row.date), num);
+    });
+    const mm = String(month).padStart(2, '0');
+    const lastDay = new Date(year, month, 0).getDate();
+    const series = [];
+    for (let day = 1; day <= lastDay; day += 1) {
+      const iso = `${year}-${mm}-${String(day).padStart(2, '0')}`;
+      const known = byDate.has(iso);
+      const consumption = known ? this._chartValue({ consumption: byDate.get(iso) }) : 0;
+      series.push({ date: iso, consumption, kwh: consumption, missing: !known });
+    }
+    return series;
+  }
+
+  _formatSignedKwh(val) {
+    if (val === null || val === undefined || val === '' || !Number.isFinite(Number(val))) return '—';
+    const num = Number(val);
+    const sign = num > 0 ? '+' : num < 0 ? '-' : '';
+    return `${sign}${this._formatNumber(Math.abs(num), 1)} kWh`;
+  }
+
+  _renderReconcileLine(bill) {
+    const words = {
+      match: 'Khớp',
+      boundary: 'Lệch ranh giới kỳ, đã bù với kỳ liền kề',
+      incomplete: 'Thiếu dữ liệu ngày',
+      mismatch: 'Lệch',
+      no_kwh: 'Chưa có kWh hoá đơn',
+    };
+    const status = bill && typeof bill.reconcile_status === 'string' ? bill.reconcile_status : '';
+    if (!Object.prototype.hasOwnProperty.call(words, status)) return null;
+    const line = document.createElement('div');
+    line.className = status === 'mismatch' ? 'recon-line recon-warn' : 'recon-line';
+    line.textContent = [
+      `Hoá đơn ${this._formatKwh(bill.total_kwh)}`,
+      `Thu thập ${this._formatKwh(bill.collected_kwh)}`,
+      `Lệch ${this._formatSignedKwh(bill.diff_kwh)}`,
+      words[status],
+    ].join(' · ');
+    return line;
+  }
+
   // --- SVG Chart Renderer ---
-  _renderChartSection(dailyHistory) {
+  _renderChartSection(dailyHistory, attrs, lastUpdated, monthlyHistory) {
     const section = document.createElement('div');
     section.className = 'chart-container';
 
@@ -911,6 +1000,26 @@ class EvnVietnamEnergyCard extends HTMLElement {
     titleEl.className = 'chart-title';
     titleEl.textContent = 'Sản lượng theo ngày (kWh)';
     titleBox.appendChild(titleEl);
+
+    // Rolling window or one calendar month (kept per card instance)
+    const today = this._zonedIsoDate(Date.now());
+    const monthChoices = this._monthOptions(today);
+    const picked = monthChoices.find((o) => o.value === this._selectedMonth) || null;
+    const monthSelect = document.createElement('select');
+    monthSelect.className = 'month-selector';
+    monthSelect.setAttribute('aria-label', 'Chọn khoảng thời gian của biểu đồ');
+    [{ value: '', label: '30 ngày gần nhất' }, ...monthChoices].forEach((choice) => {
+      const option = document.createElement('option');
+      option.value = choice.value;
+      option.textContent = choice.label;
+      if (choice.value === (picked ? picked.value : '')) option.selected = true;
+      monthSelect.appendChild(option);
+    });
+    monthSelect.addEventListener('change', (e) => {
+      this._selectedMonth = e && e.target ? e.target.value : monthSelect.value;
+      this.render();
+    });
+    titleBox.appendChild(monthSelect);
 
     // Range segmented controls (7, 14, 30 days)
     const rangeControls = document.createElement('div');
@@ -932,7 +1041,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
       });
       rangeControls.appendChild(btn);
     });
-    titleBox.appendChild(rangeControls);
+    if (!picked) titleBox.appendChild(rangeControls);
     header.appendChild(titleBox);
 
     const tooltipEl = document.createElement('span');
@@ -942,8 +1051,43 @@ class EvnVietnamEnergyCard extends HTMLElement {
 
     section.appendChild(header);
 
-    const rangeDays = this._selectedRangeDays || 30;
-    const filteredData = this._calendarBars(dailyHistory, rangeDays);
+    let filteredData;
+    let reconLines = [];
+    if (picked) {
+      reconLines = (Array.isArray(monthlyHistory) ? monthlyHistory : [])
+        .filter((bill) => bill && Number(bill.year) === picked.year && Number(bill.month) === picked.month)
+        .map((bill) => this._renderReconcileLine(bill))
+        .filter(Boolean);
+      const finishWithNote = (message) => {
+        section.appendChild(this._compareNote(message));
+        reconLines.forEach((line) => section.appendChild(line));
+        return section;
+      };
+      const ids = this._statisticsIds(attrs);
+      if (!ids.energy || !this._hass || typeof this._hass.callWS !== 'function') {
+        return finishWithNote('Chưa có lịch sử');
+      }
+      // Only the running month still changes, so only it is keyed to the entity update.
+      const key = ['month', ids.energy, picked.value, today, picked.value === today.slice(0, 7) ? (lastUpdated || '') : ''].join('|');
+      let entry = this._compareCache.get(key);
+      if (!entry) {
+        entry = { status: 'loading' };
+        this._compareCache.set(key, entry);
+        while (this._compareCache.size > 16) {
+          this._compareCache.delete(this._compareCache.keys().next().value);
+        }
+        this._loadMonth(key, ids, picked.year, picked.month);
+      }
+      if (entry.status === 'loading') return finishWithNote('Đang tải…');
+      if (entry.status !== 'ready') return finishWithNote('Chưa có lịch sử');
+      filteredData = this._renderMonthBars(entry.data, picked.year, picked.month);
+      const monthTotal = document.createElement('div');
+      monthTotal.className = 'month-total';
+      monthTotal.textContent = `Tổng tháng: ${this._formatKwh(filteredData.reduce((sum, item) => sum + item.consumption, 0))}`;
+      section.appendChild(monthTotal);
+    } else {
+      filteredData = this._calendarBars(dailyHistory, this._selectedRangeDays || 30);
+    }
     const selectedDay = this._selectedCompareDay(dailyHistory);
 
     if (filteredData.length === 0) {
@@ -1103,6 +1247,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     });
 
     section.appendChild(svg);
+    reconLines.forEach((line) => section.appendChild(line));
     return section;
   }
 
@@ -1134,7 +1279,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     const thead = document.createElement('thead');
     const headRow = document.createElement('tr');
 
-    ['Kỳ thanh toán', 'Sản lượng', 'Số tiền', 'Trạng thái'].forEach((text) => {
+    ['Kỳ thanh toán', 'Sản lượng', 'Số tiền', 'Trạng thái', 'Thu thập', 'Lệch'].forEach((text) => {
       const th = document.createElement('th');
       th.textContent = text;
       headRow.appendChild(th);
@@ -1187,6 +1332,18 @@ class EvnVietnamEnergyCard extends HTMLElement {
       pill.textContent = isPaid ? 'Đã thanh toán' : 'Chưa thanh toán';
       tdStatus.appendChild(pill);
       tr.appendChild(tdStatus);
+
+      // Reconciliation against the collected daily data; a row without a status has none.
+      const reconciled = typeof bill.reconcile_status === 'string' && bill.reconcile_status !== '';
+      const tdCollected = document.createElement('td');
+      const collectedText = reconciled ? this._formatKwh(bill.collected_kwh) : '—';
+      tdCollected.textContent = collectedText === '—' ? '-' : collectedText;
+      tr.appendChild(tdCollected);
+      const tdDiff = document.createElement('td');
+      const diffText = reconciled ? this._formatSignedKwh(bill.diff_kwh) : '—';
+      tdDiff.textContent = diffText === '—' ? '-' : diffText;
+      if (bill.reconcile_status === 'mismatch') tdDiff.className = 'recon-warn';
+      tr.appendChild(tdDiff);
 
       tbody.appendChild(tr);
     });
@@ -1274,7 +1431,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
         gap: 8px;
         flex-wrap: wrap;
       }
-      .view-selector {
+      .view-selector, .month-selector {
         font-family: inherit;
         font-size: 12px;
         font-weight: 500;
@@ -1286,7 +1443,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
         cursor: pointer;
         outline: none;
       }
-      .view-selector:focus {
+      .view-selector:focus, .month-selector:focus {
         border-color: var(--evn-accent, #1976d2);
         box-shadow: 0 0 0 1px var(--evn-accent, #1976d2);
       }
@@ -1460,6 +1617,19 @@ class EvnVietnamEnergyCard extends HTMLElement {
         font-size: 12px;
         font-variant-numeric: tabular-nums;
         color: var(--secondary-text-color, #6b7280);
+      }
+      .month-total, .recon-line {
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        color: var(--secondary-text-color, #6b7280);
+        margin-bottom: 6px;
+      }
+      .recon-line {
+        margin: 8px 0 0;
+      }
+      .recon-warn {
+        color: var(--warning-color, #b45309);
+        font-weight: 600;
       }
       .compare-hint, .compare-muted {
         font-size: 12px;
