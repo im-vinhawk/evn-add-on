@@ -356,3 +356,13 @@ def test_the_cache_returns_copies(modules, monkeypatch) -> None:
 
 def test_the_cadence_constant_is_two_hours(modules) -> None:
     assert modules.const.UNPAID_REFRESH == timedelta(hours=2)
+
+
+def test_the_aggregate_period_is_unpaid_when_any_code_is_whatever_the_others_are(modules) -> None:
+    calc = modules.calculation
+    paid = _merge(modules, [_paid_row(month=9, total=100)], [])
+    unknown = _merge(modules, [{"THANG": 9, "NAM": 2026, "KY": 1, "TONG_TIEN": 5}], [])
+    unpaid = _merge(modules, [], [_unpaid_row(month=9, owed=70, due="05/10/2026")])
+    for order in ([unknown, unpaid], [unpaid, unknown], [paid, unknown, unpaid], [unpaid, paid, unknown]):
+        row = calc.aggregate_bills(order)[0]
+        assert (row["payment_status"], row["is_paid"], row["amount_owed"], row["due_date"]) == ("unpaid", False, 70, "2026-10-05")

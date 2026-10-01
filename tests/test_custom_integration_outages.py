@@ -217,3 +217,20 @@ def test_the_client_logs_no_place_name_or_reason(modules, monkeypatch, caplog) -
 
 def test_the_window_constants(modules) -> None:
     assert modules.const.OUTAGE_LOOKAHEAD_DAYS == 14 and modules.const.OUTAGE_REFRESH == timedelta(hours=6)
+
+
+def test_an_outage_that_crosses_local_midnight_is_upcoming_on_both_sides_of_it(modules) -> None:
+    calc = modules.calculation
+    outages = calc.normalize_outages([_row(start="04/10/2026 23:30", end="05/10/2026 01:00")], ICT)
+    assert calc.upcoming_outages(outages, datetime(2026, 10, 4, 23, 0, tzinfo=ICT))
+    assert calc.upcoming_outages(outages, datetime(2026, 10, 5, 0, 30, tzinfo=ICT)), "in progress after midnight"
+    assert not calc.upcoming_outages(outages, datetime(2026, 10, 5, 1, 0, 1, tzinfo=ICT))
+
+
+def test_an_outage_in_progress_is_still_the_next_one_with_its_own_end(modules) -> None:
+    calc = modules.calculation
+    outages = calc.normalize_outages([_row(start="02/10/2026 08:00", end="02/10/2026 18:00")], ICT)
+    summary = calc.outage_summary(calc.upcoming_outages(outages, datetime(2026, 10, 2, 12, 0, tzinfo=ICT)), loaded=True)
+    assert (summary["next_planned_outage"], summary["outage_end"], summary["upcoming_outage_count"]) == (
+        "2026-10-02T08:00:00+07:00", "2026-10-02T18:00:00+07:00", 1,
+    )

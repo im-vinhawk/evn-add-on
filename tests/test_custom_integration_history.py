@@ -1277,3 +1277,12 @@ def test_the_unpaid_events_and_state_never_hold_the_code(modules) -> None:
     history, seen = _history(modules, store=_FakeStore(_upgrade_store()), today=date(2026, 10, 1))
     events = _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS), aliases={"PB000001": "Nhà PB000001"})
     assert "PB000001" not in repr(events) and "PB000001" not in repr(seen.store.saved[-1]["bills"]["PB000001"])
+
+
+def test_a_fresh_install_with_three_unpaid_periods_announces_only_the_previous_month(modules) -> None:
+    """No earlier state at all: the store has days but no seen periods, and the paid history is empty."""
+    history, seen = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 1))
+    events = _bill_update(history, _unpaid_meter(_ARREARS))
+    assert [e["period"] for e in events] == ["09/2026"]
+    assert set(seen.store.saved[-1]["bills"]["PB000001"]) == {"2026-07-1", "2026-08-1", "2026-09-1"}
+    assert seen.store.saved[-1]["unpaid_seeded"] == {"PB000001": True}
