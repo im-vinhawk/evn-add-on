@@ -519,3 +519,63 @@ def test_a_code_with_no_bill_for_the_period_does_not_block_the_aggregate_reconci
     april = _annotated("Tháng 4/2026", 80.0, status="match", collected=80.5, diff=0.5, month=4)
     rows = {row["period"]: row for row in calculation.aggregate_bills([[march, april], [march]])}
     assert rows["Tháng 4/2026"]["collected_kwh"] == 80.5 and rows["Tháng 3/2026"]["collected_kwh"] == 200.0
+
+
+# ---------------------------------------------------------------- meter indices on readings and bills
+
+def _indexed(year, month, ky, kwh, start, end, old, new, **extra):
+    return {**_reading(year, month, ky, kwh, start, end), "CHISO_CU": old, "CHISO_MOI": new, "SO_CTO": "METER-SECRET-77", **extra}
+
+
+def test_readings_keep_the_start_and_end_index_but_never_the_meter_number(modules) -> None:
+    calculation, _ = modules
+    rows = calculation.normalize_readings([
+        _indexed(2026, 9, 1, 100, "01/09/2026", "30/09/2026", 1200, "1300.5"),
+        _indexed(2026, 8, 1, 90, "01/08/2026", "31/08/2026", None, "oops"),
+    ])
+    assert (rows[0]["index_start"], rows[0]["index_end"]) == (1200.0, 1300.5)
+    assert (rows[1]["index_start"], rows[1]["index_end"]) == (None, None)
+    assert "METER-SECRET-77" not in repr(rows)
+
+
+def test_a_bill_gets_the_indices_of_its_single_reading_and_none_otherwise(modules) -> None:
+    calculation, _ = modules
+    readings = calculation.normalize_readings([
+        _indexed(2026, 9, 1, 100, "01/09/2026", "30/09/2026", 1200, 1300),
+        _indexed(2026, 8, 1, 60, "01/08/2026", "15/08/2026", 1000, 1060),
+        _indexed(2026, 8, 1, 30, "16/08/2026", "31/08/2026", 5, 35),
+    ])
+    bills = calculation.attach_readings(calculation.normalize_bills([_bill(2026, 9), _bill(2026, 8), _bill(2026, 7)]), readings)
+    assert [(b["index_start"], b["index_end"]) for b in bills] == [(1200.0, 1300.0), (None, None), (None, None)], (
+        "after a meter swap the two readings belong to different meters, so no index is shown"
+    )
+
+
+# ---------------------------------------------------------------- the latest daily index reads 31 days
+
+def test_the_overview_reads_the_latest_index_from_the_last_31_days(modules, monkeypatch) -> None:
+    _, api = modules
+    from datetime import date
+
+    monkeypatch.setattr(api.dt_util, "now", lambda: datetime(2026, 10, 1, 9, 0))
+    state = api.SessionState("user", "tok", "ref", "dev", "PB000001", "PB000001")
+    client = api.EvnClient(object(), state, {"PB000001": "PB000001009"})
+    client._meter_points["PB000001"] = "PB000001009"
+    asked = []
+
+    async def daily(code, start, end):
+        return []
+
+    async def monthly(code, month, year, point):
+        return 0.0
+
+    async def readings(code, start, end, point):
+        asked.append((start, end))
+        return [{"NGAY": "30/09/2026", "CHISO_MOI": 1300.5}]
+
+    monkeypatch.setattr(client, "async_daily", daily)
+    monkeypatch.setattr(client, "_async_monthly_fallback", monthly)
+    monkeypatch.setattr(client, "_async_readings", readings)
+    overview = asyncio.run(client.async_overview("PB000001"))
+    assert asked == [(date(2026, 9, 1), date(2026, 10, 1))], "31 days ending today, not from day 1 of a month with no reading yet"
+    assert (overview["latest_index"], overview["latest_date"]) == (1300.5, "30/09/2026")

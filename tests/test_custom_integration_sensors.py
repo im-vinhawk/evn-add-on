@@ -337,3 +337,27 @@ def test_no_projection_is_an_unknown_state_with_no_invented_attributes(modules) 
     data["meters"][CODE].update({"projected_period_amount": None, "projection": None})
     sensor = _by_key(_entities(modules, _entry(), data), CODE)["projected_period_amount"]
     assert sensor.native_value is None and "tier" not in sensor.extra_state_attributes
+
+
+# ---------------------------------------------------------------- what the card reads from the month sensor
+
+def test_the_month_sensor_carries_what_the_card_needs_without_new_entity_ids(modules) -> None:
+    data = _outage_overview(_meter_data(modules))
+    data["meters"][CODE].update({
+        "projected_period_amount": 202338, "projection": dict(_PROJECTION), "latest_index": 1300.5, "latest_date": "30/09/2026",
+    })
+    month = _by_key(_entities(modules, _entry(), data), CODE)["current_month_consumption"]
+    attrs = month.extra_state_attributes
+    assert (attrs["unpaid_count"], attrs["unpaid_amount"], attrs["next_due_date"], attrs["unpaid_fresh"]) == (1, 250000, "2026-10-15", True)
+    assert attrs["projection"] == _PROJECTION
+    assert (attrs["next_planned_outage"], attrs["outage_end"], attrs["upcoming_outage_count"]) == (
+        "2026-10-05T08:00:00+07:00", "2026-10-05T11:30:00+07:00", 2,
+    )
+    assert (attrs["latest_reading"], attrs["latest_reading_date"]) == (1300.5, "30/09/2026")
+
+
+def test_the_total_month_sensor_has_the_unpaid_figures_but_no_outage_or_projection_detail(modules) -> None:
+    month = _by_key(_entities(modules, _entry(), _meter_data(modules)), "__aggregate__")["current_month_consumption"]
+    attrs = month.extra_state_attributes
+    assert (attrs["unpaid_count"], attrs["unpaid_amount"]) == (1, 250000)
+    assert "next_planned_outage" not in attrs

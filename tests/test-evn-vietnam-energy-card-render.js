@@ -1,104 +1,8 @@
 #!/usr/bin/env node
 
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const vm = require('node:vm');
+const { Card, clock, findNode, containsTag, collectTextContents, registered } = require('./card-test-harness.js');
 
-class FakeNode {
-  constructor(tagName = '') {
-    this.tagName = tagName;
-    this.children = [];
-    this.attributes = {};
-    this.className = '';
-    this.textContent = '';
-    this.value = '';
-    this._listeners = {};
-  }
-
-  get firstChild() {
-    return this.children[0] || null;
-  }
-
-  appendChild(child) {
-    this.children.push(child);
-    return child;
-  }
-
-  removeChild(child) {
-    this.children.splice(this.children.indexOf(child), 1);
-  }
-
-  setAttribute(name, value) {
-    this.attributes[name] = String(value);
-    if (name === 'class') {
-      this.className = String(value);
-    }
-  }
-
-  addEventListener(type, handler) {
-    this._listeners[type] = this._listeners[type] || [];
-    this._listeners[type].push(handler);
-  }
-
-  dispatchEvent(event) {
-    if (!event.stopPropagation) event.stopPropagation = () => {};
-    if (!event.preventDefault) event.preventDefault = () => {};
-    const handlers = this._listeners[event.type] || [];
-    handlers.forEach((h) => h(event));
-  }
-
-  attachShadow() {
-    this.shadowRoot = new FakeNode();
-    return this.shadowRoot;
-  }
-}
-
-// The card reads "today" from the clock; tests pin it and the browser calendar so
-// day-edge cases are deterministic. Tests move the clock through `clock.ms`.
-process.env.TZ = 'Asia/Ho_Chi_Minh';
-const clock = { ms: Date.parse('2026-08-30T05:00:00Z') };
-class FakeDate extends Date {
-  constructor(...args) {
-    if (args.length === 0) super(clock.ms);
-    else super(...args);
-  }
-
-  static now() {
-    return clock.ms;
-  }
-}
-
-const registered = new Map();
-const context = {
-  Date: FakeDate,
-  HTMLElement: FakeNode,
-  document: {
-    createElement: (tagName) => new FakeNode(tagName),
-    createElementNS: (_, tagName) => new FakeNode(tagName),
-    createTextNode: (text) => Object.assign(new FakeNode('#text'), { textContent: String(text) }),
-  },
-  customElements: {
-    get: (name) => registered.get(name),
-    define: (name, value) => registered.set(name, value),
-  },
-  window: {},
-  Intl,
-  Number,
-  String,
-  Array,
-  Set,
-  Math,
-  Boolean,
-  Object,
-};
-
-vm.runInNewContext(
-  fs.readFileSync('custom_components/evn_vietnam/www/evn-vietnam-energy-card.js', 'utf8'),
-  context,
-  { filename: 'evn-vietnam-energy-card.js' },
-);
-
-const Card = registered.get('evn-vietnam-energy-card');
 assert.ok(Card, 'the custom card must register itself');
 assert.equal(
   Object.getOwnPropertyDescriptor(Card, 'properties'),
@@ -106,27 +10,6 @@ assert.equal(
   'a vanilla HTMLElement card must not advertise Lit reactive properties',
 );
 
-function findNode(node, predicate) {
-  if (predicate(node)) return node;
-  for (const child of node.children) {
-    const found = findNode(child, predicate);
-    if (found) return found;
-  }
-  return null;
-}
-
-function containsTag(node, tagName) {
-  return node.children.some((child) => child.tagName === tagName || containsTag(child, tagName));
-}
-
-function collectTextContents(node) {
-  let texts = [];
-  if (node.textContent) texts.push(node.textContent);
-  for (const child of node.children) {
-    texts.push(...collectTextContents(child));
-  }
-  return texts;
-}
 
 // 1. Incomplete configuration drafts
 const incompleteCard = new Card();
@@ -758,7 +641,7 @@ function hasOwnInnerHtml(node) {
     .map((b, idx) => (String(b.className).split(/\s+/).includes('bar-empty') ? idx : -1))
     .filter((idx) => idx >= 0);
   const tileValue = (card, label) => {
-    const tile = findNode(card.shadowRoot, (n) => n.className === 'metric-card' && n.children[0].textContent === label);
+    const tile = findNode(card.shadowRoot, (n) => n.className === 'metric-card' && n.children[0].textContent.startsWith(label));
     assert.ok(tile, `the ${label} tile must render`);
     return tile.children[1].textContent;
   };
@@ -770,7 +653,7 @@ function hasOwnInnerHtml(node) {
   assert.equal(dates[29], '2026-10-01', 'the chart ends at today even without an October row');
   assert.deepEqual(emptyBarIndexes(dayOneCard), [29], 'only today is missing when September is complete');
   assert.equal(tileValue(dayOneCard, 'Hôm qua'), '12 kWh', 'yesterday on day 1 is the last day of the previous month');
-  assert.equal(tileValue(dayOneCard, 'Hôm nay'), '—', 'a day without a row is a dash, never 0');
+  assert.equal(tileValue(dayOneCard, 'Ngày mới nhất'), '12 kWh', 'the newest-day tile replaces the never-published today tile');
 
   const lateCard = newCompareCard(compareHass(undefined, { daily_history: septemberRows(29) }));
   dates = barDates(lateCard);

@@ -123,6 +123,15 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
             attrs["daily_history"] = item.get("daily_history", [])
             attrs["monthly_history"] = item.get("monthly_history", [])
             attrs["latest_reading"] = item.get("latest_index")
+            attrs["latest_reading_date"] = item.get("latest_date")
+            # What the card's tabs read, so a dashboard needs no entity id beyond the month sensor.
+            for name in ("unpaid_count", "unpaid_amount", "next_due_date"):
+                attrs[name] = item.get(name)
+            attrs["unpaid_fresh"] = item.get("unpaid_fresh", False)
+            if self._customer_code != "__aggregate__":
+                attrs["projection"] = item.get("projection")
+                for name in ("next_planned_outage", "outage_end", "outage_status", "upcoming_outage_count"):
+                    attrs[name] = item.get(name)
             attrs["history_fetched_at"] = item.get("history_fetched_at", "")
             attrs["statistics_id"] = TOTAL_ENERGY_ID if self._customer_code == "__aggregate__" else energy_statistic_id(self._customer_code)
             attrs["cost_statistics_id"] = TOTAL_COST_ID if self._customer_code == "__aggregate__" else cost_statistic_id(self._customer_code)

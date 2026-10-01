@@ -421,6 +421,15 @@ def outage_summary(outages: Sequence[Mapping[str, Any]], *, loaded: bool) -> dic
     }
 
 
+def _index_number(value: Any) -> float | None:
+    """A meter index as a finite number, else None; the meter number itself is never read."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
 def normalize_readings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Reduce EVN monthly meter-reading rows to the fields a bill needs."""
     result = []
@@ -433,6 +442,8 @@ def normalize_readings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]
             "kwh": as_float(row.get("DIEN_TTHU")),
             "start": to_iso_date(row.get("NGAY_DKY")),
             "end": to_iso_date(row.get("NGAY_CKY")),
+            "index_start": _index_number(row.get("CHISO_CU")),
+            "index_end": _index_number(row.get("CHISO_MOI")),
         })
     return result
 
@@ -463,6 +474,9 @@ def attach_readings(
         # A period's readings belong to its first bill; a further invoice for the
         # same period must not add the same kWh again.
         rows = grouped.pop((bill.get("NAM"), bill.get("THANG"), bill.get("KY")), None)
+        # After a meter swap the rows belong to different meters, so only a single reading gives indices.
+        single = rows[0] if rows and len(rows) == 1 else {}
+        joined["index_start"], joined["index_end"] = single.get("index_start"), single.get("index_end")
         if rows:
             joined["total_kwh"] = round(sum(row["kwh"] for row in rows), 2)
             starts = [day for day in (_parse_iso_date(row["start"]) for row in rows) if day]

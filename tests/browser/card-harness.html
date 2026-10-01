@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EVN card harness</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #fafafa; font-family: sans-serif; }
+    /* A Home Assistant view: the card gets the width of the viewport minus the view padding. */
+    #view { padding: 8px; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <div id="view"></div>
+  <pre id="measure"></pre>
+  <script>
+    // Synthetic data only. ?mode=overview|usage|bills|meter|default and ?today=YYYY-MM-DD pick what is drawn.
+    const params = new URLSearchParams(location.search);
+    const mode = params.get('mode') || 'default';
+    const today = params.get('today') || '2026-10-01';
+    // Headless Chrome will not open a window narrower than about 500 px, so a phone is a 390 px wide view inside it.
+    if (params.get('w')) document.getElementById('view').style.width = `${Number(params.get('w'))}px`;
+    const fixedNow = Date.parse(`${today}T03:00:00Z`);
+    Date.now = () => fixedNow;
+
+    // Home Assistant's ha-card is a block element; an unknown element would be inline.
+    customElements.define('ha-card', class extends HTMLElement {
+      constructor() {
+        super();
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = '<style>:host{display:block}</style><slot></slot>';
+      }
+    });
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const shift = (iso, days) => {
+      const d = new Date(`${iso}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + days);
+      return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+    };
+    const newest = shift(today, -1);
+    const daily = (kwh, skipNewest) => Array.from({ length: 30 }, (_, i) => shift(newest, -(29 - i)))
+      .filter((date, i, all) => !(skipNewest && i === all.length - 1))
+      .map((date) => ({ date, consumption: kwh, kwh }));
+    const lastMonth = shift(`${today.slice(0, 7)}-01`, -1);
+    const bill = (over = {}) => ({
+      period: `Tháng ${Number(lastMonth.slice(5, 7))}/${lastMonth.slice(0, 4)}`, year: Number(lastMonth.slice(0, 4)), month: Number(lastMonth.slice(5, 7)),
+      ky: 1, total_kwh: 100, total_amount: 250000, payment_status: 'paid', is_paid: true, payment_checked: true,
+      paid_on: today, due_date: '', amount_owed: null, period_start: `${lastMonth.slice(0, 7)}-01`, period_end: lastMonth,
+      collected_kwh: 100.4, diff_kwh: 0.4, missing_days: 0, reconcile_status: 'match', index_start: 1200, index_end: 1300, ...over,
+    });
+    const codeAttrs = (code, over) => ({
+      customer_code: code, customer_alias: '', daily_history: daily(3), monthly_history: [bill()], latest_reading: 1300.5,
+      latest_reading_date: `${pad(Number(newest.slice(8, 10)))}/${newest.slice(5, 7)}/${newest.slice(0, 4)}`,
+      unpaid_count: 0, unpaid_amount: 0, next_due_date: null, unpaid_fresh: true, projection: null, next_planned_outage: null,
+      statistics_id: `evn_vietnam:${code.toLowerCase()}_daily_energy`, cost_statistics_id: `evn_vietnam:${code.toLowerCase()}_daily_cost`, ...over,
+    });
+    const states = {
+      'sensor.total': { state: '0', last_updated: today, attributes: {
+        customer_code: '__aggregate__', selected_customer_codes: ['A', 'B', 'C', 'D'], successful_customer_codes: ['A', 'B', 'C', 'D'],
+        daily_history: daily(12), monthly_history: [bill({ total_amount: 640000 })], statistics_id: 'evn_vietnam:total_daily_energy',
+        cost_statistics_id: 'evn_vietnam:total_daily_cost', unpaid_count: 2, unpaid_amount: 330000, next_due_date: shift(today, 9),
+      } },
+      'sensor.a': { state: '0', last_updated: today, attributes: codeAttrs('A', {}) },
+      'sensor.b': { state: '0', last_updated: today, attributes: codeAttrs('B', {
+        daily_history: daily(3, true), unpaid_count: 1, unpaid_amount: 180000, next_due_date: shift(today, 9),
+        monthly_history: [bill({ payment_status: 'unpaid', is_paid: false, due_date: shift(today, 9), total_amount: 180000, reconcile_status: 'mismatch', diff_kwh: -10, collected_kwh: 90 })],
+        projection: { projected_amount: 210000, tier: 2, kwh_to_next_tier: 30 },
+        next_planned_outage: `${shift(today, 3)}T08:00:00+07:00`, outage_end: `${shift(today, 3)}T11:30:00+07:00`,
+      }) },
+      'sensor.c': { state: '0', last_updated: today, attributes: codeAttrs('C', {
+        unpaid_count: 1, unpaid_amount: 150000, next_due_date: shift(today, 10),
+        monthly_history: [bill({ payment_status: 'unpaid', is_paid: false, due_date: shift(today, 10), payment_checked: false, reconcile_status: 'incomplete', missing_days: 10, total_amount: 150000 })],
+      }) },
+      'sensor.d': { state: 'unavailable', attributes: {} },
+    };
+    const views = [
+      { id: 'aggregate', label: 'Tổng', entity: 'sensor.total' },
+      { id: 'a', label: 'Nhà chính', entity: 'sensor.a' }, { id: 'b', label: 'Cửa hàng', entity: 'sensor.b' },
+      { id: 'c', label: 'Kho', entity: 'sensor.c' }, { id: 'd', label: 'Nhà phụ', entity: 'sensor.d' },
+    ];
+  </script>
+  <script src="../../custom_components/evn_vietnam/www/evn-vietnam-energy-card.js"></script>
+  <script>
+    const card = document.createElement('evn-vietnam-energy-card');
+    document.getElementById('view').appendChild(card);
+    const config = { type: 'custom:evn-vietnam-energy-card', entity: 'sensor.total', customer_views: views, bills_path: '/evn-energy/hoa-don' };
+    if (mode !== 'default') config.mode = mode;
+    card.setConfig(config);
+    card.hass = { states, config: { time_zone: 'Asia/Ho_Chi_Minh' }, callWS: async () => ({}) };
+
+    // Wait for the card's own asynchronous re-renders, then write what a person would see into the page.
+    setTimeout(() => {
+      const root = card.shadowRoot;
+      const tiles = [...root.querySelectorAll('.metric-value')];
+      const rows = [...root.querySelectorAll('.stack-table tbody tr')];
+      const measure = {
+        mode,
+        innerWidth: window.innerWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+        noHorizontalScroll: document.documentElement.scrollWidth <= window.innerWidth
+          && document.getElementById('view').scrollWidth <= document.getElementById('view').clientWidth,
+        viewWidth: document.getElementById('view').clientWidth,
+        tileCount: tiles.length,
+        emptyTiles: tiles.filter((t) => t.textContent.trim() === '').length,
+        tableRows: rows.length,
+        stackedRows: rows.filter((tr) => getComputedStyle(tr).display === 'block').length,
+        headerHidden: [...root.querySelectorAll('.stack-table thead')].every((th) => getComputedStyle(th).display === 'none'),
+        cardWidth: Math.round(card.getBoundingClientRect().width),
+      };
+      document.getElementById('measure').textContent = JSON.stringify(measure);
+    }, 400);
+  </script>
+</body>
+</html>

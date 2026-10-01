@@ -466,7 +466,9 @@ class EvnClient:
             month_kwh = await self._async_monthly_fallback(customer_code, today.month, today.year, meter_point)
         latest_index, latest_date = None, ""
         try:
-            readings = await self._async_readings(customer_code, start, today, meter_point)
+            readings = await self._async_readings(
+                customer_code, today - timedelta(days=DAILY_HISTORY_DAYS - 1), today, meter_point
+            )
             if readings and isinstance(readings[-1], dict):
                 latest = readings[-1]
                 latest_index = latest.get("CHISO_MOI") or latest.get("CHISO_CUOI")

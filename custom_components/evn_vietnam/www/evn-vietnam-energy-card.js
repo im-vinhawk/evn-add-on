@@ -282,6 +282,14 @@ class EvnVietnamEnergyCard extends HTMLElement {
       return;
     }
 
+    const mode = this._mode();
+    if (mode) {
+      cardContent.appendChild(this._renderTabs(mode, views.length > 0 ? views : [activeView]));
+      cardEl.appendChild(cardContent);
+      this.shadowRoot.appendChild(cardEl);
+      return;
+    }
+
     const activeEntityId = activeView.entity;
     const mainEntity = this._hass.states[activeEntityId];
     if (!mainEntity) {
@@ -375,7 +383,8 @@ class EvnVietnamEnergyCard extends HTMLElement {
         costStateValue,
         dailyHistory,
         activeView.today_entity,
-        activeView.yesterday_entity
+        activeView.yesterday_entity,
+        attrs
       )
     );
 
@@ -567,43 +576,16 @@ class EvnVietnamEnergyCard extends HTMLElement {
     return banner;
   }
 
-  _renderSummaryGrid(currentMonthState, costStateValue, dailyHistory, todayEntityId, yesterdayEntityId) {
+  _renderSummaryGrid(currentMonthState, costStateValue, dailyHistory, todayEntityId, yesterdayEntityId, attrs = null) {
     const grid = document.createElement('div');
     grid.className = 'metrics-grid';
 
-    // 1. Today Value
-    let todayVal = null;
-    const targetTodayEntity = todayEntityId || (this._config && this._config.today_entity);
-    if (
-      targetTodayEntity &&
-      this._hass &&
-      this._hass.states &&
-      this._hass.states[targetTodayEntity]
-    ) {
-      const st = this._hass.states[targetTodayEntity].state;
-      if (st !== 'unavailable' && st !== 'unknown') {
-        const num = Number(st);
-        if (Number.isFinite(num)) {
-          todayVal = num;
-        }
-      }
-    }
-    if (todayVal === null) {
-      const now = new Date();
-      const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-      const found = Array.isArray(dailyHistory)
-        ? dailyHistory.find((item) => item && typeof item === 'object' && item.date === todayStr)
-        : null;
-      if (found) {
-        const raw = found.consumption !== undefined && found.consumption !== null ? found.consumption : found.kwh;
-        if (raw !== undefined && raw !== null && raw !== '') {
-          const num = Number(raw);
-          if (Number.isFinite(num)) {
-            todayVal = num;
-          }
-        }
-      }
-    }
+    // 1. Newest day with data. "Today" is never published, so this replaces the always-empty today tile.
+    const newest = this._newestDay(dailyHistory);
+    const todayVal = newest ? newest.value : null;
+    const selected = attrs && Array.isArray(attrs.selected_customer_codes) ? attrs.selected_customer_codes.length : 0;
+    const reported = newest && Array.isArray(newest.row.customer_codes) ? newest.row.customer_codes.length : selected;
+    const newestNote = newest ? this._missingCodesNote(selected - reported, selected) : '';
 
     // 2. Yesterday Value
     let yesterdayVal = null;
@@ -649,10 +631,22 @@ class EvnVietnamEnergyCard extends HTMLElement {
     const rawCost = Number(costStateValue);
     const costVal = Number.isFinite(rawCost) ? rawCost : null;
 
-    grid.appendChild(this._createMetricTile('Hôm nay', this._formatKwh(todayVal)));
+    // A month with no day of data yet is "no figure", not 0: EVN publishes about a day late.
+    const monthHasData = this._hasMonthDays(dailyHistory, this._monthPrefix());
+    const lateNote = 'EVN đăng trễ ~1 ngày';
+    const monthShown = monthHasData || (monthVal !== null && monthVal > 0);
+    const costShown = monthHasData || (costVal !== null && costVal > 0);
+
+    grid.appendChild(this._noteTile(
+      newest ? `Ngày mới nhất (${this._formatDateLabel(newest.date)})` : 'Ngày mới nhất', this._formatKwh(todayVal), newestNote,
+    ));
     grid.appendChild(this._createMetricTile('Hôm qua', this._formatKwh(yesterdayVal)));
-    grid.appendChild(this._createMetricTile('Tháng này', this._formatKwh(monthVal), true));
-    grid.appendChild(this._createMetricTile('Chi phí ước tính', this._formatVnd(costVal), true));
+    grid.appendChild(monthShown
+      ? this._createMetricTile('Tháng này', this._formatKwh(monthVal), true)
+      : this._noteTile('Tháng này', 'Chưa có số', lateNote, true));
+    grid.appendChild(costShown
+      ? this._createMetricTile('Chi phí ước tính', this._formatVnd(costVal), true)
+      : this._noteTile('Chi phí ước tính', 'Chưa có số', lateNote, true));
 
     return grid;
   }
@@ -1312,25 +1306,9 @@ class EvnVietnamEnergyCard extends HTMLElement {
       tdVnd.textContent = this._formatVnd(vndVal);
       tr.appendChild(tdVnd);
 
-      // Status
-      let isPaid = false;
-      if (bill.isPaid !== undefined) {
-        isPaid = Boolean(bill.isPaid);
-      } else if (bill.is_paid !== undefined) {
-        isPaid = Boolean(bill.is_paid);
-      } else if (typeof bill.status === 'string') {
-        const s = bill.status.toLowerCase();
-        isPaid = s === 'paid' || s.includes('đã thanh toán');
-      } else if (typeof bill.payment_status === 'string') {
-        const s = bill.payment_status.toLowerCase();
-        isPaid = s === 'paid' || s.includes('đã thanh toán');
-      }
-
+      // Status: a payment state EVN did not give is "Không rõ", never "paid".
       const tdStatus = document.createElement('td');
-      const pill = document.createElement('span');
-      pill.className = isPaid ? 'pill-paid' : 'pill-unpaid';
-      pill.textContent = isPaid ? 'Đã thanh toán' : 'Chưa thanh toán';
-      tdStatus.appendChild(pill);
+      tdStatus.appendChild(this._paymentPill(bill, false));
       tr.appendChild(tdStatus);
 
       // Reconciliation against the collected daily data; a row without a status has none.
@@ -1351,6 +1329,772 @@ class EvnVietnamEnergyCard extends HTMLElement {
     table.appendChild(tbody);
     container.appendChild(table);
     return container;
+  }
+
+  // --- Payment state, shared by every layout ---
+  // kind: paid | unpaid | unknown. An unknown state is never shown as paid.
+  _paymentState(bill) {
+    const source = bill && typeof bill === 'object' ? bill : {};
+    const status = typeof source.payment_status === 'string' ? source.payment_status.toLowerCase() : '';
+    let kind = status === 'paid' || status === 'unpaid' ? status : '';
+    if (!kind) {
+      const legacy = source.isPaid !== undefined ? source.isPaid : source.is_paid;
+      if (typeof legacy === 'boolean') {
+        kind = legacy ? 'paid' : 'unpaid';
+      } else if (typeof source.status === 'string') {
+        const s = source.status.toLowerCase();
+        kind = s === 'paid' || s.includes('đã thanh toán') ? 'paid' : 'unknown';
+      } else {
+        kind = 'unknown';
+      }
+    }
+    const paidOn = this._isoDate(source.paid_on);
+    const due = this._isoDate(source.due_date);
+    return { kind, paidOn, due, unchecked: kind === 'unpaid' && source.payment_checked === false };
+  }
+
+  _paymentText(state, compact) {
+    if (state.kind === 'paid') {
+      const word = compact ? 'Đã TT' : 'Đã thanh toán';
+      return state.paidOn && compact ? `${word} · ${this._formatDateLabel(state.paidOn)}` : word;
+    }
+    if (state.kind === 'unpaid') {
+      const word = compact ? 'Chưa TT' : 'Chưa thanh toán';
+      const due = state.due ? ` · hạn ${this._formatDateLabel(state.due)}` : '';
+      return `${word}${due}${state.unchecked ? ' · chưa kiểm lại' : ''}`;
+    }
+    return 'Không rõ';
+  }
+
+  _paymentPill(bill, compact) {
+    const state = this._paymentState(bill);
+    const pill = document.createElement('span');
+    pill.className = state.kind === 'paid' ? 'pill-paid' : state.kind === 'unpaid' ? 'pill-unpaid' : 'pill pill-unknown';
+    pill.textContent = this._paymentText(state, compact);
+    return pill;
+  }
+
+  // --- Day-1 rule and missing codes ---
+  _finiteKwh(item) {
+    if (!item || typeof item !== 'object') return null;
+    const raw = item.consumption !== undefined && item.consumption !== null ? item.consumption : item.kwh;
+    if (raw === null || raw === undefined || raw === '') return null;
+    const num = Number(raw);
+    return Number.isFinite(num) && num >= 0 ? num : null;
+  }
+
+  // Newest dated row with a usable value: { date, value, row } or null.
+  _newestDay(dailyHistory) {
+    let best = null;
+    (Array.isArray(dailyHistory) ? dailyHistory : []).forEach((row) => {
+      const date = this._isoDate(row && row.date);
+      const value = this._finiteKwh(row);
+      if (date && value !== null && (!best || date > best.date)) best = { date, value, row };
+    });
+    return best;
+  }
+
+  _hasMonthDays(dailyHistory, monthPrefix) {
+    return (Array.isArray(dailyHistory) ? dailyHistory : []).some((row) => {
+      const date = this._isoDate(row && row.date);
+      return date && date.startsWith(monthPrefix) && this._finiteKwh(row) !== null;
+    });
+  }
+
+  _monthPrefix() {
+    return this._zonedIsoDate(Date.now()).slice(0, 7);
+  }
+
+  _missingCodesNote(missing, total) {
+    return missing > 0 && total > 0 ? `thiếu ${missing}/${total} mã, EVN chưa đăng` : '';
+  }
+
+  _noteTile(label, valueText, note, isAccent = false) {
+    const tile = this._createMetricTile(label, valueText, isAccent);
+    if (note) {
+      const noteEl = document.createElement('div');
+      noteEl.className = 'metric-note';
+      noteEl.textContent = note;
+      tile.appendChild(noteEl);
+    }
+    return tile;
+  }
+
+  // --- Tab layouts (config.mode): overview | usage | bills | meter ---
+  _mode() {
+    const mode = this._config && this._config.mode;
+    return mode === 'overview' || mode === 'usage' || mode === 'bills' || mode === 'meter' ? mode : '';
+  }
+
+  _isGenericLabel(label) {
+    return /^\s*(Mã\s*KH|Khách\s*hàng)\s*\d*\s*$/i.test(label || '');
+  }
+
+  // A name for a code in the tabs: its own label, else its nickname, else customer_N. Never the code.
+  _rowLabel(row, position) {
+    const label = row.view && typeof row.view.label === 'string' ? row.view.label.trim() : '';
+    if (label && !this._isGenericLabel(label)) return label;
+    const alias = typeof row.attrs.customer_alias === 'string' ? row.attrs.customer_alias.trim() : '';
+    return alias || `customer_${position}`;
+  }
+
+  _codeRows(views) {
+    const states = (this._hass && this._hass.states) || {};
+    const all = views.map((view) => {
+      const state = states[view.entity];
+      const attrs = state && typeof state.attributes === 'object' && state.attributes !== null ? state.attributes : {};
+      const usable = Boolean(state) && state.state !== 'unavailable' && state.state !== 'unknown';
+      return {
+        view, state, attrs, usable, isAggregate: attrs.customer_code === '__aggregate__',
+        daily: Array.isArray(attrs.daily_history) ? attrs.daily_history : [],
+        bills: (Array.isArray(attrs.monthly_history) ? attrs.monthly_history : []).filter((bill) => bill && typeof bill === 'object'),
+      };
+    });
+    const aggregate = all.find((row) => row.isAggregate) || null;
+    let codes = all.filter((row) => !row.isAggregate);
+    if (codes.length === 0 && aggregate) codes = [aggregate];
+    const partial = aggregate && aggregate.attrs.partial_errors && typeof aggregate.attrs.partial_errors === 'object'
+      ? aggregate.attrs.partial_errors
+      : {};
+    codes.forEach((row, index) => {
+      row.label = this._rowLabel(row, index + 1);
+      const code = typeof row.attrs.customer_code === 'string' ? row.attrs.customer_code : '';
+      row.error = !row.usable ? 'unavailable' : (code && typeof partial[code] === 'string' ? partial[code] : '');
+    });
+    return { codes, aggregate };
+  }
+
+  _renderTabs(mode, views) {
+    const wrap = document.createElement('div');
+    wrap.className = `tab-layout tab-${mode}`;
+    const titles = { overview: 'Tổng quan', usage: 'Sản lượng', bills: 'Hoá đơn & đối chiếu', meter: 'Chỉ số công tơ' };
+    const header = document.createElement('div');
+    header.className = 'card-header';
+    const title = document.createElement('div');
+    title.className = 'card-title';
+    title.textContent = (this._config && this._config.title) || 'Điện năng EVN';
+    const sub = document.createElement('span');
+    sub.className = 'customer-badge';
+    sub.textContent = titles[mode];
+    const box = document.createElement('div');
+    box.className = 'title-box';
+    box.appendChild(title);
+    box.appendChild(sub);
+    header.appendChild(box);
+    wrap.appendChild(header);
+
+    const { codes, aggregate } = this._codeRows(views);
+    if (codes.length === 0) {
+      wrap.appendChild(this._createStateBox('Chưa có dữ liệu khách hàng.'));
+      return wrap;
+    }
+    const render = { overview: '_renderOverviewTab', usage: '_renderUsageTab', bills: '_renderBillsTab', meter: '_renderMeterTab' }[mode];
+    this[render](wrap, codes, aggregate);
+    return wrap;
+  }
+
+  _section(title) {
+    const container = document.createElement('div');
+    container.className = 'table-container';
+    if (title) {
+      const titleEl = document.createElement('div');
+      titleEl.className = 'section-title';
+      titleEl.textContent = title;
+      container.appendChild(titleEl);
+    }
+    return container;
+  }
+
+  // A table whose rows stack as label/value cards on a narrow container. columns: header texts.
+  _stackTable(columns) {
+    const table = document.createElement('table');
+    table.className = 'bill-table stack-table';
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    columns.forEach((text) => {
+      const th = document.createElement('th');
+      th.setAttribute('scope', 'col');
+      th.textContent = text;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    table.appendChild(tbody);
+    table.addRow = (cells, className = '') => {
+      const tr = document.createElement('tr');
+      if (className) tr.className = className;
+      cells.forEach((cell, index) => {
+        const td = document.createElement('td');
+        td.setAttribute('data-label', columns[index] || '');
+        if (cell && typeof cell === 'object' && cell.tagName) {
+          td.appendChild(cell);
+        } else {
+          td.textContent = cell === null || cell === undefined ? '—' : String(cell);
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+      return tr;
+    };
+    return table;
+  }
+
+  _banner(kind, text, link) {
+    const banner = document.createElement('div');
+    banner.className = `mode-banner banner-${kind}`;
+    banner.setAttribute('role', 'status');
+    const span = document.createElement('span');
+    span.textContent = text;
+    banner.appendChild(span);
+    const path = this._config && typeof this._config.bills_path === 'string' ? this._config.bills_path.trim() : '';
+    // Only an in-app path is linked: never a scheme such as javascript:.
+    if (link && /^\/[A-Za-z0-9_\-./]*$/.test(path)) {
+      const anchor = document.createElement('a');
+      anchor.className = 'banner-link';
+      anchor.setAttribute('href', path);
+      anchor.textContent = link;
+      banner.appendChild(anchor);
+    }
+    return banner;
+  }
+
+  _num(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  }
+
+  // The newest day any code has, the sum over the codes that have it, and how many lack it.
+  _newestDayAcross(codes) {
+    let date = '';
+    codes.forEach((row) => {
+      const found = this._newestDay(row.daily);
+      if (found && found.date > date) date = found.date;
+    });
+    return date ? { date, ...this._dayAcross(codes, date) } : null;
+  }
+
+  _dayAcross(codes, date) {
+    let sum = 0;
+    let have = 0;
+    codes.forEach((row) => {
+      const match = row.daily.find((item) => this._isoDate(item && item.date) === date && this._finiteKwh(item) !== null);
+      if (match) {
+        sum += this._finiteKwh(match);
+        have += 1;
+      }
+    });
+    return { sum: have > 0 ? sum : null, missing: codes.length - have, total: codes.length };
+  }
+
+  _latestDayTiles(codes) {
+    const newest = this._newestDayAcross(codes);
+    if (!newest) {
+      return [
+        this._noteTile('Ngày mới nhất', '—', 'Chưa có dữ liệu ngày'),
+        this._noteTile('Ngày trước đó', '—', ''),
+      ];
+    }
+    const before = this._shiftIsoDate(newest.date, -1);
+    const prior = this._dayAcross(codes, before);
+    return [
+      this._noteTile(`Ngày mới nhất (${this._formatDateLabel(newest.date)})`, this._formatKwh(newest.sum), this._missingCodesNote(newest.missing, newest.total)),
+      this._noteTile(
+        `Ngày trước đó (${this._formatDateLabel(before)})`, this._formatKwh(prior.sum),
+        prior.sum === null ? '' : this._missingCodesNote(prior.missing, prior.total),
+      ),
+    ];
+  }
+
+  // Sum of the codes' states of one entity key; null while none is a number.
+  _sumStates(codes, pick) {
+    let sum = 0;
+    let have = 0;
+    codes.forEach((row) => {
+      const value = this._num(pick(row));
+      if (value !== null) {
+        sum += value;
+        have += 1;
+      }
+    });
+    return have > 0 ? sum : null;
+  }
+
+  _costState(row) {
+    const id = row.view.cost_entity;
+    const entity = id && this._hass.states[id];
+    if (!entity || entity.state === 'unavailable' || entity.state === 'unknown') return null;
+    const costAttrs = typeof entity.attributes === 'object' && entity.attributes !== null ? entity.attributes : {};
+    return this._sameCustomerScope(row.attrs, costAttrs) ? entity.state : null;
+  }
+
+  _rollingMonthTiles(codes) {
+    const prefix = this._monthPrefix();
+    const monthNo = prefix.slice(5, 7);
+    const hasDays = codes.some((row) => this._hasMonthDays(row.daily, prefix));
+    const kwh = this._sumStates(codes, (row) => (row.usable ? row.state.state : null));
+    const cost = this._sumStates(codes, (row) => this._costState(row));
+    const kwhShown = hasDays || (kwh !== null && kwh > 0);
+    return [
+      kwhShown ? this._noteTile(`Tháng ${monthNo}`, this._formatKwh(kwh), '', true) : this._noteTile(`Tháng ${monthNo}`, 'Chưa có số', 'EVN đăng trễ ~1 ngày', true),
+      (hasDays || (cost !== null && cost > 0))
+        ? this._noteTile(`Chi phí ước tính T${monthNo}`, this._formatVnd(cost), '', true)
+        : this._noteTile(`Chi phí ước tính T${monthNo}`, 'Chưa có số', 'EVN đăng trễ ~1 ngày', true),
+    ];
+  }
+
+  _pickedMonth() {
+    const today = this._zonedIsoDate(Date.now());
+    return this._monthOptions(today).find((o) => o.value === this._selectedMonth) || null;
+  }
+
+  // --- usage ---
+  _renderUsageTab(wrap, codes, aggregate) {
+    const chartRow = aggregate || codes[0];
+    const picked = this._pickedMonth();
+    const chartMonthly = chartRow.bills;
+    const chart = chartRow.usable
+      ? this._renderChartSection(chartRow.daily, chartRow.attrs, chartRow.state.last_updated, chartMonthly)
+      : this._createStateBox('Không có dữ liệu để vẽ biểu đồ.');
+    const grid = document.createElement('div');
+    grid.className = 'metrics-grid';
+    const tiles = picked ? this._pastMonthTiles(codes, chartRow, picked) : [...this._latestDayTiles(codes), ...this._rollingMonthTiles(codes)];
+    tiles.forEach((tile) => grid.appendChild(tile));
+    wrap.appendChild(grid);
+    wrap.appendChild(chart);
+  }
+
+  _monthStats(chartRow, picked) {
+    const ids = this._statisticsIds(chartRow.attrs);
+    const today = this._zonedIsoDate(Date.now());
+    const key = ['month', ids.energy, picked.value, today, picked.value === today.slice(0, 7) ? (chartRow.state.last_updated || '') : ''].join('|');
+    const entry = ids.energy ? this._compareCache.get(key) : null;
+    return entry && entry.status === 'ready' ? entry.data : null;
+  }
+
+  _monthBills(codes, picked) {
+    return codes.map((row) => row.bills.filter((bill) => Number(bill.year) === picked.year && Number(bill.month) === picked.month));
+  }
+
+  _costStatistics(chartRow, picked) {
+    const ids = this._statisticsIds(chartRow.attrs);
+    if (!ids.cost || !this._hass || typeof this._hass.callWS !== 'function') return null;
+    const today = this._zonedIsoDate(Date.now());
+    const key = ['monthcost', ids.cost, picked.value, today, picked.value === today.slice(0, 7) ? (chartRow.state.last_updated || '') : ''].join('|');
+    let entry = this._compareCache.get(key);
+    if (!entry) {
+      entry = { status: 'loading' };
+      this._compareCache.set(key, entry);
+      while (this._compareCache.size > 16) {
+        this._compareCache.delete(this._compareCache.keys().next().value);
+      }
+      const nextYear = picked.month === 12 ? picked.year + 1 : picked.year;
+      const nextMonth = picked.month === 12 ? 1 : picked.month + 1;
+      Promise.resolve()
+        .then(() => this._hass.callWS({
+          type: 'recorder/statistics_during_period',
+          start_time: this._zonedMidnight(picked.year, picked.month, 1).toISOString(),
+          end_time: this._zonedMidnight(nextYear, nextMonth, 1).toISOString(),
+          statistic_ids: [ids.cost],
+          period: 'day',
+          types: ['change'],
+        }))
+        .then((result) => {
+          const rows = this._statRowsToDays(result && result[ids.cost]);
+          this._compareCache.set(key, rows.length > 0 ? { status: 'ready', data: rows } : { status: 'error' });
+        })
+        .catch(() => {
+          this._compareCache.set(key, { status: 'error' });
+        })
+        .then(() => this.render());
+    }
+    return entry;
+  }
+
+  _pastMonthTiles(codes, chartRow, picked) {
+    const mm = String(picked.month).padStart(2, '0');
+    const rows = this._monthStats(chartRow, picked);
+    const lastDay = new Date(picked.year, picked.month, 0).getDate();
+    let total = null;
+    let known = [];
+    if (rows) {
+      const byDate = new Map();
+      rows.forEach((row) => {
+        const num = this._num(row && row.value);
+        if (num !== null && String(row.date).startsWith(`${picked.year}-${mm}-`)) byDate.set(String(row.date), num);
+      });
+      known = [...byDate.entries()];
+      total = known.reduce((sum, [, value]) => sum + value, 0);
+    }
+    const peak = known.reduce((best, item) => (!best || item[1] > best[1] ? item : best), null);
+    const bills = this._monthBills(codes, picked);
+    const billed = bills.filter((list) => list.length > 0);
+    const amounts = billed.map((list) => list.reduce((sum, bill) => sum + (this._num(bill.total_amount) || 0), 0));
+    const billKwh = billed.reduce((sum, list) => sum + (this._num(list[0].total_kwh) || 0), 0);
+    let moneyTile;
+    if (billed.length > 0) {
+      const lacking = codes.length - billed.length;
+      moneyTile = this._noteTile(
+        `Tiền điện T${mm}`, this._formatVnd(amounts.reduce((sum, v) => sum + v, 0)),
+        `theo hoá đơn kỳ ${picked.month} · ${this._formatKwh(billKwh)}${lacking > 0 ? ` · thiếu ${lacking}/${codes.length} hoá đơn` : ''}`, true,
+      );
+    } else {
+      const cost = this._costStatistics(chartRow, picked);
+      const costRows = cost && cost.status === 'ready' ? cost.data : null;
+      const estimate = costRows ? costRows.reduce((sum, row) => sum + (this._num(row && row.value) || 0), 0) : null;
+      moneyTile = this._noteTile(
+        `Tiền điện T${mm}`, estimate !== null && estimate > 0 ? `≈ ${this._formatVnd(estimate)}` : '—',
+        cost && cost.status === 'loading' ? 'Đang tải…' : 'chưa có hoá đơn', true,
+      );
+    }
+    return [
+      this._noteTile(`Tổng T${mm}`, total === null ? '—' : this._formatKwh(total), total === null ? 'Chưa có lịch sử' : `${known.length}/${lastDay} ngày`, true),
+      moneyTile,
+      this._noteTile('TB/ngày', known.length > 0 ? this._formatKwh(total / known.length) : '—', ''),
+      this._noteTile('Ngày cao nhất', peak ? this._formatKwh(peak[1]) : '—', peak ? this._formatDateLabel(peak[0]) : ''),
+    ];
+  }
+
+  // --- bills ---
+  _billPeriods(codes) {
+    const found = new Map();
+    codes.forEach((row) => row.bills.forEach((bill) => {
+      const year = Number(bill.year);
+      const month = Number(bill.month);
+      if (Number.isInteger(year) && Number.isInteger(month) && month >= 1 && month <= 12) {
+        found.set(`${year}-${String(month).padStart(2, '0')}`, { value: `${year}-${String(month).padStart(2, '0')}`, year, month });
+      }
+    }));
+    return [...found.values()].sort((a, b) => (a.value < b.value ? 1 : -1))
+      .map((p) => ({ ...p, label: `Tháng ${String(p.month).padStart(2, '0')}/${p.year}` }));
+  }
+
+  // One code's bill for a period: reconciliation from the row that has it, amount and payment over all rows.
+  _periodBill(row, period) {
+    const list = row.bills.filter((bill) => Number(bill.year) === period.year && Number(bill.month) === period.month);
+    if (list.length === 0) return null;
+    const main = list.find((bill) => typeof bill.reconcile_status === 'string' && bill.reconcile_status) || list[0];
+    const states = list.map((bill) => this._paymentState(bill));
+    const worst = states.find((s) => s.kind === 'unpaid') || states.find((s) => s.kind === 'unknown') || states[0];
+    const dues = states.filter((s) => s.kind === 'unpaid' && s.due).map((s) => s.due).sort();
+    return {
+      main,
+      amount: list.reduce((sum, bill) => sum + (this._num(bill.total_amount) || 0), 0),
+      payment: { ...worst, due: dues[0] || worst.due, unchecked: states.some((s) => s.unchecked) },
+      status: typeof main.reconcile_status === 'string' ? main.reconcile_status : '',
+    };
+  }
+
+  _daysInclusive(startIso, endIso) {
+    const start = this._isoDate(startIso);
+    const end = this._isoDate(endIso);
+    if (!start || !end || end < start) return null;
+    return Math.round((Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`)) / 86400000) + 1;
+  }
+
+  _reasonText(bill, error) {
+    if (error) return 'không kiểm được';
+    if (!bill) return 'chưa có hoá đơn kỳ này';
+    const main = bill.main;
+    const total = this._daysInclusive(main.period_start, main.period_end);
+    const missing = this._num(main.missing_days);
+    switch (bill.status) {
+      case 'incomplete':
+        return total !== null && missing !== null ? `chưa đủ ngày (${total - missing}/${total})` : 'chưa đủ ngày';
+      case 'no_kwh': return 'chưa có kWh hoá đơn';
+      case 'no_period': return 'hoá đơn không có kỳ rõ ràng';
+      case '': return 'chưa đối chiếu';
+      default: return '';
+    }
+  }
+
+  // Complete = a result that adds up, and finite bill, collected and difference figures.
+  _isComplete(bill) {
+    if (!bill) return false;
+    const main = bill.main;
+    return ['match', 'mismatch', 'boundary'].includes(bill.status)
+      && this._num(main.total_kwh) !== null && this._num(main.collected_kwh) !== null && this._num(main.diff_kwh) !== null;
+  }
+
+  _resultPill(bill, error) {
+    const pill = document.createElement('span');
+    let kind = 'muted';
+    let text = this._reasonText(bill, error);
+    if (!error && bill) {
+      if (bill.status === 'match') { kind = 'ok'; text = 'Khớp'; }
+      else if (bill.status === 'boundary') { kind = 'ok'; text = 'Khớp theo cặp kỳ'; }
+      else if (bill.status === 'mismatch') { kind = 'warn'; text = 'Lệch'; }
+      else if (text) { text = text.charAt(0).toUpperCase() + text.slice(1); }
+    } else if (text) {
+      text = text.charAt(0).toUpperCase() + text.slice(1);
+    }
+    pill.className = `pill pill-${kind}`;
+    pill.textContent = text || '—';
+    return pill;
+  }
+
+  _periodText(main) {
+    const start = this._isoDate(main.period_start);
+    const end = this._isoDate(main.period_end);
+    return start && end ? `${this._formatDateLabel(start)}–${this._formatDateLabel(end)}` : '—';
+  }
+
+  _detailCell(label, bill, error) {
+    const cell = document.createElement('div');
+    cell.className = 'code-cell';
+    const name = document.createElement('span');
+    name.className = 'code-name';
+    name.textContent = label;
+    cell.appendChild(name);
+    if (bill && !error) {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = 'Chi tiết';
+      details.appendChild(summary);
+      const main = bill.main;
+      const total = this._daysInclusive(main.period_start, main.period_end);
+      const missing = this._num(main.missing_days);
+      const lines = [];
+      if (total !== null && missing !== null) lines.push(`Đã thu thập ${total - missing}/${total} ngày`);
+      if (bill.status === 'mismatch') lines.push(`Lệch ${this._formatSignedKwh(main.diff_kwh)} so với hoá đơn`);
+      if (bill.status === 'boundary') lines.push('Lệch ranh giới kỳ, đã bù với kỳ liền kề');
+      if (bill.status === 'incomplete') lines.push('Thiếu dữ liệu ngày nên chưa kết luận');
+      if (bill.status === 'no_kwh') lines.push('Hoá đơn chưa có kWh để so');
+      const note = document.createElement('div');
+      note.className = 'detail-note';
+      note.textContent = lines.length > 0 ? lines.join(' · ') : 'Không có thêm chi tiết';
+      details.appendChild(note);
+      cell.appendChild(details);
+    }
+    return cell;
+  }
+
+  _renderBillsTab(wrap, codes) {
+    const periods = this._billPeriods(codes);
+    if (periods.length === 0) {
+      wrap.appendChild(this._createStateBox('Chưa có thông tin hoá đơn'));
+      return;
+    }
+    const period = periods.find((p) => p.value === this._selectedBillPeriod) || periods[0];
+
+    const picker = document.createElement('select');
+    picker.className = 'month-selector period-selector';
+    picker.setAttribute('aria-label', 'Chọn kỳ hoá đơn');
+    periods.forEach((p) => {
+      const option = document.createElement('option');
+      option.value = p.value;
+      option.textContent = p.label;
+      if (p.value === period.value) option.selected = true;
+      picker.appendChild(option);
+    });
+    picker.addEventListener('change', (e) => {
+      this._selectedBillPeriod = e && e.target ? e.target.value : picker.value;
+      this.render();
+    });
+    const controls = document.createElement('div');
+    controls.className = 'header-controls';
+    controls.appendChild(picker);
+    wrap.appendChild(controls);
+
+    const items = codes.map((row) => ({ row, bill: this._periodBill(row, period) }));
+    const complete = items.filter((item) => this._isComplete(item.bill) && !item.row.error);
+    const sum = (pick) => complete.reduce((total, item) => total + pick(item.bill.main), 0);
+    const billed = items.filter((item) => item.bill);
+    const totalAmount = billed.reduce((total, item) => total + item.bill.amount, 0);
+    const unpaidCodes = billed.filter((item) => item.bill.payment.kind === 'unpaid').length;
+    const withoutBill = items.length - billed.length;
+
+    const grid = document.createElement('div');
+    grid.className = 'metrics-grid';
+    grid.appendChild(this._noteTile(
+      'Tổng tiền', billed.length > 0 ? this._formatVnd(totalAmount) : '—',
+      `${unpaidCodes} mã chưa thanh toán${withoutBill > 0 ? ` · ${withoutBill} mã chưa có hoá đơn` : ''}`, true,
+    ));
+    const completeNote = `${complete.length}/${items.length} mã đủ dữ liệu`;
+    grid.appendChild(this._noteTile('kWh hoá đơn', complete.length > 0 ? this._formatKwh(sum((m) => this._num(m.total_kwh))) : '—', completeNote));
+    grid.appendChild(this._noteTile('kWh thu thập', complete.length > 0 ? this._formatKwh(sum((m) => this._num(m.collected_kwh))) : '—', completeNote));
+    grid.appendChild(this._noteTile('Chênh lệch', complete.length > 0 ? this._formatSignedKwh(sum((m) => this._num(m.diff_kwh))) : '—', completeNote));
+    wrap.appendChild(grid);
+
+    const excluded = items.filter((item) => item.row.error || !this._isComplete(item.bill));
+    if (excluded.length > 0) {
+      const note = document.createElement('div');
+      note.className = 'mode-banner banner-info excluded-note';
+      note.textContent = `Chưa tính vào tổng kWh: ${excluded.map((item) => `${item.row.label} (${this._reasonText(item.bill, item.row.error) || 'chưa đủ dữ liệu'})`).join('; ')}`;
+      wrap.appendChild(note);
+    }
+
+    const section = this._section(`Hoá đơn ${period.label}`);
+    const table = this._stackTable(['Khách hàng', 'Kỳ', 'Hoá đơn', 'Thu thập', 'Chênh lệch', 'Kết quả', 'Số tiền', 'Thanh toán']);
+    items.forEach(({ row, bill }) => {
+      const main = bill ? bill.main : null;
+      table.addRow([
+        this._detailCell(row.label, bill, row.error),
+        main ? this._periodText(main) : '—',
+        main ? this._formatKwh(main.total_kwh) : '—',
+        main && main.collected_kwh !== null && main.collected_kwh !== undefined ? this._formatKwh(main.collected_kwh) : '—',
+        main && main.diff_kwh !== null && main.diff_kwh !== undefined ? this._formatSignedKwh(main.diff_kwh) : '—',
+        this._resultPill(bill, row.error),
+        bill ? this._formatVnd(bill.amount) : '—',
+        bill ? this._paymentPill({ payment_status: bill.payment.kind, paid_on: bill.payment.paidOn, due_date: bill.payment.due, payment_checked: bill.payment.unchecked ? false : true }, true) : '—',
+      ]);
+    });
+    table.addRow([
+      'Tổng', '', complete.length > 0 ? this._formatKwh(sum((m) => this._num(m.total_kwh))) : '—',
+      complete.length > 0 ? this._formatKwh(sum((m) => this._num(m.collected_kwh))) : '—',
+      complete.length > 0 ? this._formatSignedKwh(sum((m) => this._num(m.diff_kwh))) : '—', '',
+      billed.length > 0 ? this._formatVnd(totalAmount) : '—', '',
+    ], 'total-row');
+    section.appendChild(table);
+    wrap.appendChild(section);
+
+    const help = document.createElement('div');
+    help.className = 'compare-hint';
+    help.textContent = 'Kỳ hoá đơn [đầu, cuối] được đối chiếu với các ngày [đầu − 1, cuối − 1] đã thu thập. Chỉ tính vào tổng những mã có kết quả Khớp, Lệch hoặc Lệch ranh giới và đủ số liệu.';
+    wrap.appendChild(help);
+  }
+
+  // --- meter ---
+  _renderMeterTab(wrap, codes) {
+    const section = this._section('Chỉ số công tơ theo kỳ hoá đơn mới nhất');
+    const table = this._stackTable(['Khách hàng', 'Chỉ số đầu kỳ', 'Chỉ số cuối kỳ', 'Ngày chốt', 'Sản lượng kỳ', 'Chỉ số mới nhất']);
+    codes.forEach((row) => {
+      const dated = row.bills.filter((bill) => this._isoDate(bill.period_end));
+      const newest = dated.sort((a, b) => (this._isoDate(a.period_end) < this._isoDate(b.period_end) ? 1 : -1))[0] || null;
+      const latest = this._num(row.attrs.latest_reading);
+      const latestDate = typeof row.attrs.latest_reading_date === 'string' ? row.attrs.latest_reading_date : '';
+      table.addRow([
+        row.label,
+        newest && this._num(newest.index_start) !== null ? this._formatNumber(newest.index_start, 1) : '—',
+        newest && this._num(newest.index_end) !== null ? this._formatNumber(newest.index_end, 1) : '—',
+        newest ? this._formatDateLabel(this._isoDate(newest.period_end)) : '—',
+        newest ? this._formatKwh(newest.total_kwh) : '—',
+        latest !== null ? `${this._formatNumber(latest, 1)}${latestDate ? ` (${latestDate.slice(0, 5)})` : ''}` : '—',
+      ]);
+    });
+    section.appendChild(table);
+    wrap.appendChild(section);
+  }
+
+  // --- overview ---
+  _zonedClock(ms) {
+    const date = this._zonedIsoDate(ms);
+    const zone = this._timeZone();
+    let hour;
+    let minute;
+    try {
+      if (zone) {
+        const p = this._zonedParts(ms, zone);
+        hour = p.hour % 24;
+        minute = p.minute;
+      }
+    } catch (e) {
+      hour = undefined;
+    }
+    if (hour === undefined) {
+      const d = new Date(ms);
+      hour = d.getHours();
+      minute = d.getMinutes();
+    }
+    const pad = (n) => String(n).padStart(2, '0');
+    return { date, hm: `${pad(hour)}:${pad(minute)}` };
+  }
+
+  _outageText(row) {
+    const start = Date.parse(row.attrs.next_planned_outage);
+    const end = Date.parse(row.attrs.outage_end);
+    if (!Number.isFinite(start)) return '';
+    const from = this._zonedClock(start);
+    const to = Number.isFinite(end) ? this._zonedClock(end) : null;
+    const range = to ? `${from.hm}–${to.hm}` : from.hm;
+    return `${this._formatDateLabel(from.date)} ${range}`;
+  }
+
+  _upcomingOutages(codes, days) {
+    const now = Date.now();
+    return codes
+      .filter((row) => row.usable && typeof row.attrs.next_planned_outage === 'string')
+      .map((row) => ({ row, start: Date.parse(row.attrs.next_planned_outage), end: Date.parse(row.attrs.outage_end) }))
+      .filter((item) => Number.isFinite(item.start) && item.start - now <= days * 86400000 && (Number.isFinite(item.end) ? item.end : item.start) >= now)
+      .sort((a, b) => a.start - b.start);
+  }
+
+  _newestBill(row) {
+    const keyed = row.bills.filter((bill) => Number.isInteger(Number(bill.year)) && Number.isInteger(Number(bill.month)));
+    return keyed.sort((a, b) => (Number(a.year) * 12 + Number(a.month) < Number(b.year) * 12 + Number(b.month) ? 1 : -1))[0] || null;
+  }
+
+  _renderOverviewTab(wrap, codes) {
+    const usable = codes.filter((row) => row.usable);
+    const unpaidRows = usable.filter((row) => this._num(row.attrs.unpaid_count) > 0);
+    if (unpaidRows.length > 0) {
+      const count = unpaidRows.reduce((sum, row) => sum + this._num(row.attrs.unpaid_count), 0);
+      const owed = unpaidRows.reduce((sum, row) => sum + (this._num(row.attrs.unpaid_amount) || 0), 0);
+      const dues = unpaidRows.map((row) => this._isoDate(row.attrs.next_due_date)).filter(Boolean).sort();
+      wrap.appendChild(this._banner(
+        'warn',
+        `${count} hoá đơn chưa thanh toán · còn nợ ${this._formatVnd(owed)}${dues.length > 0 ? ` · hạn gần nhất ${this._formatDateLabel(dues[0])}` : ''}`,
+        'Xem hoá đơn',
+      ));
+    }
+    const outages = this._upcomingOutages(codes, 7);
+    if (outages.length > 0) {
+      const first = outages[0];
+      wrap.appendChild(this._banner(
+        'info',
+        `Dự kiến ngừng cấp điện: ${first.row.label} · ${this._outageText(first.row)}${outages.length > 1 ? ` (+${outages.length - 1} lịch khác)` : ''}`,
+        '',
+      ));
+    }
+
+    const grid = document.createElement('div');
+    grid.className = 'metrics-grid';
+    const newest = this._latestDayTiles(codes)[0];
+    grid.appendChild(newest);
+    const monthTile = this._rollingMonthTiles(codes)[0];
+    grid.appendChild(monthTile.children[0].textContent.startsWith('Tháng')
+      ? this._renamedTile(monthTile, 'Tháng hiện tại') : monthTile);
+    const projections = usable.map((row) => row.attrs.projection).filter((p) => p && typeof p === 'object');
+    const amounts = projections.map((p) => this._num(p.projected_amount));
+    const projectionKnown = usable.length > 0 && projections.length === usable.length && amounts.every((v) => v !== null);
+    const hints = projections
+      .filter((p) => this._num(p.kwh_to_next_tier) !== null && this._num(p.tier) !== null)
+      .sort((a, b) => a.kwh_to_next_tier - b.kwh_to_next_tier);
+    const hintRow = hints.length > 0 ? usable.find((row) => row.attrs.projection === hints[0]) : null;
+    const projectionNote = `dự kiến, không phải hoá đơn${hintRow ? ` · ${hintRow.label}: còn ${this._formatNumber(hints[0].kwh_to_next_tier, 1)} kWh nữa sang bậc ${Number(hints[0].tier) + 1}` : ''}`;
+    grid.appendChild(this._noteTile(
+      'Dự kiến kỳ này', projectionKnown ? `≈ ${this._formatVnd(amounts.reduce((sum, v) => sum + v, 0))}` : '—',
+      projectionKnown ? projectionNote : 'dự kiến: chưa đủ số liệu cho mọi mã', true,
+    ));
+    const newestBills = usable.map((row) => ({ row, bill: this._newestBill(row) })).filter((item) => item.bill);
+    const matched = newestBills.filter((item) => item.bill.reconcile_status === 'match' || item.bill.reconcile_status === 'boundary').length;
+    grid.appendChild(this._noteTile('Đối chiếu kỳ gần nhất', newestBills.length > 0 ? `${matched}/${newestBills.length} khớp` : '—', ''));
+    wrap.appendChild(grid);
+
+    const section = this._section('Từng khách hàng');
+    const table = this._stackTable(['Khách hàng', 'Ngày mới nhất', 'Dữ liệu đến', 'Hoá đơn gần nhất', 'Thanh toán', 'Đối chiếu', 'Ngừng cấp điện kế tiếp']);
+    codes.forEach((row) => {
+      const found = this._newestDay(row.daily);
+      const bill = this._newestBill(row);
+      const periodBill = bill ? this._periodBill(row, { year: Number(bill.year), month: Number(bill.month) }) : null;
+      table.addRow([
+        row.label,
+        found ? this._formatKwh(found.value) : '—',
+        found ? this._formatDateLabel(found.date) : '—',
+        periodBill ? this._formatVnd(periodBill.amount) : '—',
+        periodBill ? this._paymentPill({ payment_status: periodBill.payment.kind, paid_on: periodBill.payment.paidOn, due_date: periodBill.payment.due, payment_checked: periodBill.payment.unchecked ? false : true }, true) : (row.error ? 'Không kiểm được' : '—'),
+        this._resultPill(periodBill, row.error),
+        row.usable && typeof row.attrs.next_planned_outage === 'string' ? this._outageText(row) : '—',
+      ]);
+    });
+    section.appendChild(table);
+    wrap.appendChild(section);
+  }
+
+  _renamedTile(tile, label) {
+    tile.children[0].textContent = label;
+    return tile;
   }
 
   // --- Scoped CSS Styles ---
@@ -1701,6 +2445,107 @@ class EvnVietnamEnergyCard extends HTMLElement {
         font-weight: 500;
         background: rgba(239, 68, 68, 0.15);
         color: #b91c1c;
+      }
+      .pill {
+        display: inline-block;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 500;
+      }
+      .pill-unknown, .pill-muted {
+        background: var(--secondary-background-color, rgba(0, 0, 0, 0.06));
+        color: var(--secondary-text-color, #4b5563);
+      }
+      .pill-ok {
+        background: rgba(16, 185, 129, 0.15);
+        color: #047857;
+      }
+      .pill-warn {
+        background: rgba(245, 158, 11, 0.18);
+        color: #92400e;
+      }
+      .metric-note {
+        margin-top: 4px;
+        font-size: 11px;
+        color: var(--secondary-text-color, #6b7280);
+      }
+      .mode-banner {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        border-radius: 6px;
+        padding: 8px 12px;
+        font-size: 12px;
+        border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.12));
+      }
+      .banner-warn {
+        background: #fffbeb;
+        color: #92400e;
+        border-color: #fcd34d;
+      }
+      .banner-info {
+        background: var(--secondary-background-color, rgba(0, 0, 0, 0.04));
+        color: var(--primary-text-color, #111827);
+      }
+      .banner-link {
+        color: var(--evn-accent, #1976d2);
+        font-weight: 600;
+      }
+      .tab-layout {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-width: 0;
+      }
+      .tab-layout .table-container {
+        container-type: inline-size;
+        overflow-x: visible;
+      }
+      .code-cell details summary {
+        cursor: pointer;
+        font-size: 11px;
+        color: var(--secondary-text-color, #6b7280);
+      }
+      .detail-note {
+        font-size: 11px;
+        color: var(--secondary-text-color, #6b7280);
+        margin-top: 4px;
+      }
+      .code-name {
+        font-weight: 600;
+      }
+      .total-row td {
+        font-weight: 600;
+        border-top: 1px solid var(--divider-color, rgba(0, 0, 0, 0.2));
+      }
+      @container (max-width: 560px) {
+        .stack-table thead {
+          display: none;
+        }
+        .stack-table, .stack-table tbody, .stack-table tr {
+          display: block;
+          width: 100%;
+        }
+        .stack-table tr {
+          border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.12));
+          border-radius: 8px;
+          padding: 6px 10px;
+          margin-bottom: 8px;
+        }
+        .stack-table td {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          border-bottom: none;
+          padding: 4px 0;
+        }
+        .stack-table td::before {
+          content: attr(data-label);
+          color: var(--secondary-text-color, #6b7280);
+          flex: 0 0 auto;
+        }
       }
       .empty-state {
         text-align: center;
