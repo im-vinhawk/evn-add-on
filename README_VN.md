@@ -17,6 +17,8 @@ Hướng dẫn HACS/GitHub bằng tiếng Anh: [README.md](README.md).
 - Điện năng và chi phí ước tính theo ngày được lưu thành thống kê dài hạn cho bảng Năng lượng, cùng ô so sánh ngày với cùng ngày tháng trước trên thẻ.
 - Hóa đơn và chỉ số công tơ giữ bản tốt gần nhất khi một yêu cầu tới EVN thất bại.
 - kWh của mỗi hóa đơn được đối chiếu với kWh theo ngày đã thu thập, và mỗi kỳ hóa đơn mới phát sự kiện `evn_vietnam_bill`.
+- Hóa đơn chưa thanh toán được đọc cùng lịch sử đã thanh toán: mỗi hóa đơn có trạng thái thanh toán thật (`paid`, `unpaid` hoặc `unknown`, không bao giờ mặc định là "đã thanh toán"), hạn thanh toán và số tiền còn nợ; hóa đơn được thông báo ngay khi EVN phát hành, không đợi đến khi đã trả.
+- Lịch ngừng cấp điện theo kế hoạch trong 14 ngày tới, dự kiến chi phí của kỳ hóa đơn đang chạy kèm cảnh báo trước bậc giá kế tiếp, và thẻ có bốn kiểu hiển thị (`mode`) cho dashboard bốn tab.
 
 ## Yêu cầu
 
@@ -93,6 +95,21 @@ Biểu đồ mặc định là 30 ngày gần nhất kết thúc ở hôm nay th
 
 Bên dưới phần tóm tắt, một ô so sánh ngày đã chọn với cùng ngày của tháng trước và với mức trung bình ngày của tháng trước, theo kWh và, nếu có, theo chi phí. Ngày mặc định là ngày mới nhất có dữ liệu; bấm vào một cột của biểu đồ để chọn ngày khác. Ngày thiếu dữ liệu hiển thị `—`, không bao giờ là 0, và ngày 29 đến 31 không có ngày tương ứng trong tháng ngắn hơn. Ô này đọc các thống kê ở trên; khi chưa có thì hiển thị dòng mờ "Chưa có lịch sử".
 
+### Các kiểu hiển thị của thẻ (`mode`)
+
+Thẻ nhận tùy chọn `mode`, để dashboard dùng một thẻ cho mỗi tab. [docs/evn-dashboard-tabs.example.yaml](docs/evn-dashboard-tabs.example.yaml) là dashboard bốn view.
+
+| `mode` | Hiển thị |
+|---|---|
+| `overview` | biểu ngữ hóa đơn chưa thanh toán (số lượng, tổng nợ, hạn gần nhất, liên kết tới `bills_path`) và biểu ngữ ngừng cấp điện trong 7 ngày tới; ngày mới nhất, tháng đến nay, dự kiến kỳ đang chạy ("dự kiến", kèm gợi ý bậc giá) và đối chiếu gần nhất; mỗi mã một dòng |
+| `usage` | ô ngày mới nhất và tháng, hoặc với tháng chọn trong danh sách: tổng, tiền điện (theo hóa đơn nếu có, nếu không thì "≈" từ thống kê chi phí), trung bình ngày và ngày cao nhất; rồi biểu đồ theo ngày |
+| `bills` | với một kỳ hóa đơn chọn: mỗi mã có kỳ, kWh hóa đơn, kWh thu thập, chênh lệch, kết quả (Khớp, Lệch, Chưa đủ ngày), số tiền và trạng thái thanh toán, cùng các tổng |
+| `meter` | mỗi mã có chỉ số đầu và cuối của kỳ mới nhất, ngày chốt và kWh của kỳ, và chỉ số theo ngày mới nhất |
+
+Không có `mode`, hoặc giá trị không hợp lệ, thẻ giữ bố cục như trước. Ở mọi kiểu, tháng chưa có ngày nào hiển thị "Chưa có số · EVN đăng trễ ~1 ngày" thay vì 0, "Hôm nay" được thay bằng "Ngày mới nhất (dd/mm)", và trạng thái thanh toán EVN không cung cấp hiển thị "Không rõ". `bills_path` (ví dụ `/evn-energy/hoa-don`) chỉ được tạo liên kết khi là đường dẫn bên trong Home Assistant.
+
+Ở kiểu `bills`, tổng kWh chỉ cộng các mã có kết quả Khớp, Lệch hoặc Lệch ranh giới và đủ số liệu hợp lệ về kWh hóa đơn, thu thập và chênh lệch; mọi mã khác được nêu tên dưới các ô tổng cùng lý do ("chưa đủ ngày (n/N)", "chưa có kWh hoá đơn", "không kiểm được" …). Tổng tiền cộng mọi số tiền hóa đơn là số. Bảng xếp thành thẻ nhãn/giá trị khi vùng chứa hẹp (điện thoại). Các tab gọi mỗi mã bằng `label` của view, biệt danh, hoặc `customer_N`; không bao giờ in mã khách hàng.
+
 ## Bảo mật
 
 - Không commit hoặc chia sẻ mật khẩu, token, JWT, Home Assistant backup, raw EVN response, tên khách hàng, số điện thoại hoặc danh sách mã khách hàng.
@@ -146,7 +163,7 @@ Ngưỡng là tùy chọn **Bill check tolerance (kWh)** (Configure; 0 đến 10
 
 ### Sự kiện hóa đơn mới
 
-Lần đầu một kỳ hóa đơn được thấy, integration phát một sự kiện Home Assistant `evn_vietnam_bill`. Trong mười ngày sau đó, trạng thái hoặc số tiền của kỳ thay đổi (ví dụ kỳ `incomplete` thành `match` khi một ngày báo muộn tới, hoặc có hóa đơn thứ hai) sẽ phát thêm một sự kiện với `reason: update`. Sau mười ngày kỳ được khóa lại.
+Lần đầu một kỳ hóa đơn được thấy (kể cả khi còn chưa thanh toán), integration phát một sự kiện Home Assistant `evn_vietnam_bill`. Trong mười ngày sau đó, trạng thái hoặc số tiền của kỳ thay đổi (ví dụ kỳ `incomplete` thành `match` khi một ngày báo muộn tới, hoặc có hóa đơn thứ hai) sẽ phát thêm một sự kiện với `reason: update`. Sau mười ngày kỳ được khóa lại.
 
 | Trường | Ý nghĩa |
 |---|---|
@@ -165,6 +182,8 @@ Lần đầu một kỳ hóa đơn được thấy, integration phát một sự
 
 Sự kiện không bao giờ mang mã khách hàng. Việc phát là tối đa một lần: trạng thái đã thấy được lưu trước khi phát sự kiện, nên nếu sập giữa chừng thì mất đúng một thông báo thay vì lặp lại. Chỉ danh sách hóa đơn mới lấy được mới tính; bản lưu tạm (khi EVN lỗi) không bao giờ khởi tạo hay phát. Ở danh sách mới đầu tiên sau khi cài hoặc nâng cấp, các kỳ cũ được ghi nhận im lặng và chỉ tháng trước hoặc muộn hơn được thông báo.
 
+Sự kiện có thêm `payment_status`, `due_date` và `amount_owed` (`null` khi không rõ). Trả hóa đơn về sau không phải là tin mới và không phát gì. Lần đầu đọc danh sách chưa thanh toán (kể cả khi nâng cấp từ 0.4.0), các kỳ cũ được ghi nhận im lặng và chỉ tháng trước hoặc muộn hơn được thông báo.
+
 ```yaml
 automation:
   - alias: EVN bill notice
@@ -181,6 +200,35 @@ automation:
             difference {{ trigger.event.data.diff_kwh }} kWh ({{ trigger.event.data.status }}).
 ```
 
+### Trạng thái thanh toán và hóa đơn chưa thanh toán
+
+Lịch sử hóa đơn của EVN chỉ liệt kê hóa đơn đã thanh toán, nên add-on còn đọc danh sách hóa đơn đang chờ thanh toán (`tracuu/hoadon-thanhtoan`) và gộp hai nguồn theo kỳ hóa đơn (năm, tháng, số kỳ).
+
+- Mỗi dòng hóa đơn có `payment_status` (`paid`, `unpaid` hoặc `unknown`), `is_paid` (`true`, `false` hoặc `null`), `due_date`, `amount_owed` (số tiền còn phải trả), `paid_on` và `payment_checked`. Mã trạng thái của EVN quyết định (`DATT` đã thanh toán, `CHUATT` chưa); có ngày thanh toán cũng chứng minh `paid`; mọi trường hợp khác là `unknown`, không bao giờ là "đã thanh toán".
+- Kỳ có trong danh sách chưa thanh toán vừa đọc thì lấy theo danh sách đó. Dòng lịch sử đã thanh toán thắng một dòng chưa thanh toán chỉ là bản lưu tạm (hóa đơn trả giữa hai lần làm mới sẽ là `paid`). Dòng chưa thanh toán lưu tạm mà không có gì mâu thuẫn vẫn là `unpaid` với `payment_checked: false`; thẻ ghi "chưa kiểm lại".
+- Danh sách chưa thanh toán được hỏi tối đa hai giờ một lần cho mỗi mã, và một lần sau khi khởi động; khi EVN lỗi thì dùng bản tốt gần nhất. Mã không đọc được danh sách này lần nào sẽ có `partial_errors` là `unpaid_bills`, vẫn giữ phần dữ liệu còn lại và trạng thái thanh toán là `unknown`.
+- Sensor cho từng mã và cho sensor tổng: `unpaid_amount` (số tiền VND còn nợ; `0` khi không có hóa đơn chưa thanh toán, không rõ khi danh sách chưa tải được) và `next_due_date` (sensor ngày). Month sensor còn có `unpaid_count`, `unpaid_amount`, `next_due_date` và `unpaid_fresh` cho thẻ.
+- Mọi sensor có thuộc tính `evn_role` (`meter` hoặc `aggregate`) và `evn_entry` (id config entry). Cả hai không định danh người nào; automation có thể chọn `evn_role == 'meter'` để mỗi công tơ đúng một sensor, dù có bao nhiêu config entry.
+
+### Lịch ngừng cấp điện
+
+Với mỗi mã, add-on hỏi EVN lịch ngừng cấp điện theo kế hoạch từ hôm nay đến 14 ngày tới (`tracuu/ngungcapdien`), tối đa sáu giờ một lần, giữ bản tốt gần nhất. Mỗi mã có sensor thời điểm `next_planned_outage` (không rõ khi không có) với thuộc tính `end`, `status` (mã ngắn của EVN), `upcoming_count` và `outages`, danh sách `{start, end, status}` không được recorder lưu. Lý do, khu vực và tên thiết bị của EVN là văn bản tự do có thể chứa tên địa điểm hoặc người, nên bị bỏ trước khi lưu bất cứ đâu. Mã không đọc được lịch có `partial_errors` là `outages`; dữ liệu khác giữ nguyên.
+
+### Dự kiến kỳ đang chạy
+
+Với mỗi mã, add-on ước tính hóa đơn của kỳ đang chạy từ kWh theo ngày đã lưu:
+
+- Kỳ bắt đầu vào ngày sau khi kỳ gần nhất đã biết kết thúc. Một tháng lịch trọn vẹn được nối tiếp bằng tháng lịch kế tiếp trọn vẹn; kỳ khác được nối tiếp bằng một kỳ cùng độ dài.
+- kWh đã thu thập là các ngày đã lưu trong cửa sổ của kỳ (cùng cửa sổ lùi một ngày như phần đối chiếu hóa đơn); tốc độ là trung bình bảy ngày mới nhất có dữ liệu; kWh dự kiến = đã thu thập + tốc độ × số ngày còn lại.
+- Số tiền dùng mô hình giá của mã. Mã dùng mô hình bậc thang chỉ có số tiền khi kỳ là một tháng lịch trọn vẹn; kỳ khác không có (`projected_amount: null`) và không có gì được tính theo tỷ lệ.
+- Với mã có mô hình bậc thang đã được xác minh, trong tháng lịch không đổi giá, dự kiến còn cho biết bậc đang ở (`tier`), số kWh còn lại trước bậc kế tiếp (`kwh_to_next_tier`) và giá bậc đó chưa VAT (`next_tier_price`).
+
+Sensor `projected_period_amount` mang các giá trị này trong thuộc tính (`period_start`, `expected_end`, `data_until`, `collected_kwh`, `rate_kwh_per_day`, `projected_kwh`, `projected_amount`, `method`, `calendar_month`, `tier`, `kwh_to_next_tier`, `next_tier_price`). Nó không có state class nên ước tính không vào thống kê dài hạn, và sensor tổng không rõ khi một mã không rõ. Đây là ước tính, không phải hóa đơn.
+
+### Quyền riêng tư của dữ liệu mới
+
+Các dòng hóa đơn chưa thanh toán và lịch ngừng điện còn chứa tên, địa chỉ, id hóa đơn, đơn vị quản lý, số công tơ và điểm đo của khách hàng. Không cái nào được chép vào thuộc tính, sự kiện, dòng log, diagnostics hay fixture kiểm thử; diagnostics chỉ ghi tên khóa và kiểu giá trị của từng dòng thô. Mã khách hàng vẫn ở những chỗ đã có (entity id, tên thiết bị, thuộc tính `customer_code`); phần mới không lặp lại nó.
+
 ## Giới hạn đã biết
 
 - EVN OTP và liên kết khách hàng mới chưa được hỗ trợ vì upstream hiện lỗi NPE.
@@ -190,6 +238,9 @@ automation:
 - Đối chiếu hóa đơn giả định độ lệch một ngày nêu trên; nó được đo trên một tài khoản duy nhất.
 - Các thuộc tính lịch sử ngày, lịch sử tháng và hóa đơn không được recorder lưu (thẻ đọc từ trạng thái hiện tại), nhờ đó mỗi trạng thái nằm dưới giới hạn kích thước thuộc tính của Home Assistant.
 - Hóa đơn mà EVN chưa báo kWh được thông báo với `no_kwh`, sau đó cập nhật.
+- Không bảo đảm mọi mã khách hàng của một tài khoản đều trả lời yêu cầu hóa đơn chưa thanh toán và lịch ngừng điện qua việc chuyển mã; mã nào không trả lời sẽ có trạng thái thanh toán `unknown` và lịch ngừng điện không rõ, không bao giờ là "đã thanh toán".
+- Các mã trạng thái khác `DATT` và `CHUATT` của EVN (trả một phần, quá hạn) được hiển thị là `unknown`.
+- Dự kiến giả định kỳ kế tiếp dài bằng kỳ trước (hoặc là tháng lịch kế tiếp); nếu EVN chốt độ dài khác thì ngày kết thúc dự kiến lệch cho đến hóa đơn kế tiếp.
 
 ## Prompt cho agent
 
@@ -209,4 +260,7 @@ Verify that per-meter sensors and the selected aggregate are available, that the
 pytest -q
 node --check custom_components/evn_vietnam/www/evn-vietnam-energy-card.js
 node tests/test-evn-vietnam-energy-card-render.js
+node tests/test-evn-vietnam-energy-card-modes.js
 ```
+
+`tests/test_card_layout_browser.py` mở từng kiểu hiển thị của thẻ trong Chrome hoặc Chromium chạy nền ở chiều ngang máy tính và điện thoại (không cuộn ngang, hàng bảng xếp chồng, không ô trống) và được bỏ qua khi cả hai chưa cài.

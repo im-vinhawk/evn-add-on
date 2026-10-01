@@ -17,6 +17,8 @@ For Vietnamese instructions, see [README_VN.md](README_VN.md).
 - Daily kWh and estimated cost kept as long-term statistics for the Energy dashboard, plus a day-versus-last-month tile in the card.
 - Bills and meter readings keep their last good copy when an EVN request fails.
 - Each bill's kWh is checked against the collected daily kWh, and every new billing period fires the `evn_vietnam_bill` event.
+- Bills that still await payment are read next to the paid history: every bill has its real payment state (`paid`, `unpaid` or `unknown`, never a default "paid"), its due date and the amount still owed, and a bill is announced when EVN issues it, not after it is paid.
+- Planned power outages for the next 14 days, a projection of the running billing period's cost with a warning before the next price tier, and a card with four layouts (`mode`) for a four-tab dashboard.
 
 ## Requirements
 
@@ -93,6 +95,21 @@ The default chart shows the last 30 days ending today in Home Assistant's calend
 
 Below the summary, a tile compares the selected day with the same day of the previous month and with the previous month's daily average, for kWh and, when available, cost. The day defaults to the latest day with data; click a chart bar to pick another. A missing day shows `—`, never 0, and the 29th to 31st have no counterpart in a shorter month. The tile reads the statistics above; without them it shows a muted "Chưa có lịch sử".
 
+### Card layouts (`mode`)
+
+The card takes an optional `mode`, so a dashboard can use one card per tab. [docs/evn-dashboard-tabs.example.yaml](docs/evn-dashboard-tabs.example.yaml) is a four-view dashboard.
+
+| `mode` | Shows |
+|---|---|
+| `overview` | a banner for unpaid bills (count, total owed, earliest due date, a link to `bills_path`) and for a planned outage within 7 days; the newest day, the month so far, the projection of the running period ("dự kiến", with the tier hint) and the latest reconciliation; one row per code |
+| `usage` | the latest-day and month tiles, or, for a month picked in the drop-down, its total, electricity bill (the bill when there is one, otherwise "≈" from the cost statistics), daily average and busiest day; then the daily chart |
+| `bills` | for a chosen billing period: per code the period, bill kWh, collected kWh, difference, result (Khớp, Lệch, Chưa đủ ngày), amount and payment state, and the totals |
+| `meter` | per code the start and end index of the newest period, its closing date and kWh, and the latest daily index |
+
+Without `mode`, or with an unknown value, the card keeps the layout it always had. In every layout a month with no day of data reads "Chưa có số · EVN đăng trễ ~1 ngày" instead of 0, "Hôm nay" is replaced by "Ngày mới nhất (dd/mm)", and a payment state EVN did not give reads "Không rõ". `bills_path` (for example `/evn-energy/hoa-don`) is only linked when it is a path inside Home Assistant.
+
+In the `bills` layout the kWh totals add up only the codes whose result is Khớp, Lệch or Lệch ranh giới with finite bill, collected and difference figures; every other code is named under the tiles with its reason ("chưa đủ ngày (n/N)", "chưa có kWh hoá đơn", "không kiểm được" …). The amount total adds every bill amount that is a number. Tables stack as label/value cards on a narrow container (a phone). The tabs name a code by its view `label`, its nickname, or `customer_N`; they never print the code.
+
 ## Security
 
 - Never commit or share passwords, tokens, JWTs, Home Assistant backups, raw EVN responses, customer names, phones, or customer rosters.
@@ -162,8 +179,9 @@ The first time a billing period is seen, the integration fires one Home Assistan
 | `compensates_previous` | `true` when the period is the later half of a `boundary` pair |
 | `total_amount`, `calculated_amount` | the bill's VND (summed over its invoices) and the add-on's own price |
 | `threshold_kwh` | the tolerance used |
+| `payment_status`, `due_date`, `amount_owed` | the payment state, the due date (`null` when unknown) and the amount still owed (`null` when unknown) |
 
-The event never carries the customer code. Delivery is at most once: the seen state is saved before the event is fired, so a crash in between loses that one notice rather than repeating it. Only a fresh bill list counts; a cached copy (EVN failing) never seeds or fires. On the first fresh list after installing or upgrading, older periods are recorded silently and only the previous calendar month or later is announced.
+The event never carries the customer code. Delivery is at most once: the seen state is saved before the event is fired, so a crash in between loses that one notice rather than repeating it. Only a fresh bill list counts; a cached copy (EVN failing) never seeds or fires. On the first fresh list after installing or upgrading, older periods are recorded silently and only the previous calendar month or later is announced; the same holds the first time the unpaid list is read, so upgrading from 0.4.0 does not announce old arrears. A bill is announced when EVN issues it (while it is still unpaid), and paying it later is not news: it fires nothing.
 
 ```yaml
 automation:
@@ -181,6 +199,35 @@ automation:
             difference {{ trigger.event.data.diff_kwh }} kWh ({{ trigger.event.data.status }}).
 ```
 
+### Payment state and unpaid bills
+
+EVN lists a bill in its history only once it is paid, so the add-on also reads the list of bills awaiting payment (`tracuu/hoadon-thanhtoan`) and merges the two by billing period (year, month, period number).
+
+- Every bill row carries `payment_status` (`paid`, `unpaid` or `unknown`), `is_paid` (`true`, `false` or `null`), `due_date`, `amount_owed` (what is still to pay), `paid_on` and `payment_checked`. EVN's status code decides (`DATT` paid, `CHUATT` unpaid); a payment date also proves `paid`; anything else is `unknown`, never "paid".
+- A period in the fresh unpaid list stands for itself. A paid history row beats an unpaid row that is only a cached copy (a bill paid between two polls reads `paid`). A cached unpaid row nothing contradicts stays `unpaid` with `payment_checked: false`; the card says "chưa kiểm lại".
+- The unpaid list is asked for at most once every two hours per code and once after a start; when EVN fails the last good copy stands in. A code whose unpaid list cannot be read at all appears in `partial_errors` as `unpaid_bills`, keeps the rest of its data, and has `unknown` payment states.
+- Sensors per code and for the total: `unpaid_amount` (VND still owed; `0` when nothing is unpaid, unknown when the list never loaded) and `next_due_date` (a date sensor). The month sensor also carries `unpaid_count`, `unpaid_amount`, `next_due_date` and `unpaid_fresh` for the card.
+- Every sensor has the attributes `evn_role` (`meter` or `aggregate`) and `evn_entry` (the config entry id). Neither identifies a person; an automation can select `evn_role == 'meter'` to get exactly one sensor per meter whatever the number of config entries.
+
+### Planned outages
+
+For each code the add-on asks EVN for the planned outages from today to 14 days ahead (`tracuu/ngungcapdien`), at most once every six hours, keeping the last good copy. Each code gets a `next_planned_outage` timestamp sensor (unknown when none) with the attributes `end`, `status` (EVN's short code), `upcoming_count` and `outages`, a list of `{start, end, status}` that the recorder does not store. EVN's reason, area and equipment name are free text that can name places or people, so they are dropped before anything stores them. A code whose outages cannot be read appears in `partial_errors` as `outages`; its other data stays.
+
+### Projection of the running period
+
+For each code the add-on estimates the bill of the period that is running now, from the stored daily kWh:
+
+- The period starts the day after the newest known period ends. A whole calendar month is followed by the whole next calendar month; any other period by one of the same length.
+- Collected kWh are the stored days of the period's window (the same one-day-earlier window as the bill check); the rate is the average of the newest seven days with data; projected kWh = collected + rate × days left.
+- The amount uses the code's price model. A code on the tier model gets an amount only for a whole calendar month; any other period gets none (`projected_amount: null`) and nothing is prorated.
+- For a code whose tier model is verified, in a calendar month without a price change, the projection also gives the tier reached (`tier`), the kWh left before the next tier (`kwh_to_next_tier`) and that tier's price before VAT (`next_tier_price`).
+
+The `projected_period_amount` sensor carries these as attributes (`period_start`, `expected_end`, `data_until`, `collected_kwh`, `rate_kwh_per_day`, `projected_kwh`, `projected_amount`, `method`, `calendar_month`, `tier`, `kwh_to_next_tier`, `next_tier_price`). It has no state class, so the estimate never enters long-term statistics, and the total is unknown as soon as one code's amount is. It is an estimate, never a bill.
+
+### Privacy of the new data
+
+The unpaid-bill and outage rows also hold the customer's name, address, invoice id, distribution unit, meter number and meter point. None of them is copied into any attribute, event, log line, diagnostics output or test fixture; diagnostics record only the key names and value types of each raw row. The customer code stays where it already was (entity ids, device names, the `customer_code` attribute); nothing new repeats it.
+
 ## Known limitations
 
 - EVN OTP and linking a new customer are not supported because the upstream flow currently fails with an NPE.
@@ -190,6 +237,9 @@ automation:
 - The bill check assumes the one-day offset above; it was measured on a single account.
 - The daily history, monthly history and bills attributes are not stored by the recorder (the card reads them from the live state), which keeps every state under Home Assistant's attribute size limit.
 - A bill whose kWh EVN has not published yet is announced as `no_kwh`, then updated.
+- Whether every customer code of an account answers the unpaid and outage requests through the customer switch is not guaranteed; a code that does not shows `unknown` payment states and an unknown outage, never "paid".
+- EVN's status codes other than `DATT` and `CHUATT` (partial payment, overdue) are shown as `unknown`.
+- The projection assumes the next period is as long as the previous one (or the next calendar month); if EVN bills a different length, the expected end is off until the next bill.
 
 ## Agent prompt
 
@@ -209,4 +259,7 @@ Verify that per-meter sensors and the selected aggregate are available, that the
 pytest -q
 node --check custom_components/evn_vietnam/www/evn-vietnam-energy-card.js
 node tests/test-evn-vietnam-energy-card-render.js
+node tests/test-evn-vietnam-energy-card-modes.js
 ```
+
+`tests/test_card_layout_browser.py` opens every card layout in headless Chrome or Chromium at desktop and phone width (no horizontal scroll, stacked table rows, no empty tile) and is skipped when neither is installed.

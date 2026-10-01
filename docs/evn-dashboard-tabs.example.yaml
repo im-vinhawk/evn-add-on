@@ -1,0 +1,57 @@
+# Four tabs, one full-width card each (overview, usage, bills, meter).
+#
+# Replace every sensor.evn_* placeholder with entity IDs from Developer Tools → States. The card reads the
+# unpaid-bill, planned-outage and projection figures from the same month sensor as the chart, so no other
+# entity ID is needed. `bills_path` is the path of the bills tab in this dashboard: the unpaid banner of the
+# overview links to it (/<dashboard url>/<view path>). A card without `mode` keeps the single-view layout of
+# docs/evn-dashboard.example.yaml.
+title: EVN Energy
+views:
+  - title: Tổng quan
+    path: tong-quan
+    type: panel
+    cards:
+      - type: custom:evn-vietnam-energy-card
+        mode: overview
+        bills_path: /evn-energy/hoa-don
+        title: EVN Energy
+        entity: sensor.evn_total_current_month_consumption
+        customer_views: &customer_views
+          - id: aggregate
+            entity: sensor.evn_total_current_month_consumption
+            cost_entity: sensor.evn_total_estimated_current_month_cost
+          - id: meter_one
+            label: Nhà chính
+            entity: sensor.evn_pb000001_current_month_consumption
+            cost_entity: sensor.evn_pb000001_estimated_current_month_cost
+          - id: meter_two
+            label: Cửa hàng
+            entity: sensor.evn_pb000002_current_month_consumption
+            cost_entity: sensor.evn_pb000002_estimated_current_month_cost
+  - title: Sản lượng
+    path: san-luong
+    type: panel
+    cards:
+      - type: custom:evn-vietnam-energy-card
+        mode: usage
+        title: EVN Energy
+        entity: sensor.evn_total_current_month_consumption
+        customer_views: *customer_views
+  - title: Hoá đơn & đối chiếu
+    path: hoa-don
+    type: panel
+    cards:
+      - type: custom:evn-vietnam-energy-card
+        mode: bills
+        title: EVN Energy
+        entity: sensor.evn_total_current_month_consumption
+        customer_views: *customer_views
+  - title: Chỉ số công tơ
+    path: chi-so
+    type: panel
+    cards:
+      - type: custom:evn-vietnam-energy-card
+        mode: meter
+        title: EVN Energy
+        entity: sensor.evn_total_current_month_consumption
+        customer_views: *customer_views
