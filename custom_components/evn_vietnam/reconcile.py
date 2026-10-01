@@ -143,8 +143,11 @@ def reconcile_all(periods: Sequence[Mapping[str, Any]], days: Mapping[str, float
         start = _iso_day(period["period_start"])
         if start is None or result["status"] in ("match", "no_kwh"):
             continue
-        previous = by_end.get((start - timedelta(days=1)).isoformat())
-        if previous is None or previous["key"] == result["key"] or previous["status"] == "boundary":
+        before = by_end.get((start - timedelta(days=1)).isoformat())
+        if before is None or before["key"] == result["key"]:
+            continue
+        previous = results[before["key"]]  # current result: it may have been paired already
+        if previous["status"] == "boundary":
             continue
         paired = reconcile_period(period, days, threshold_kwh, previous=previous)
         if paired["status"] == "boundary":
