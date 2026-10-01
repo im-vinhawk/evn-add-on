@@ -215,7 +215,7 @@ def test_bill_id_is_opaque_stable_and_per_code(rec) -> None:
 
 
 @pytest.mark.parametrize("nickname", [
-    "pb000001", "Nhà PB000099 cũ", "kho-pc123456", "xHN0012345y", "PB000001-copy",
+    "pb000001", "Nhà PB000099 cũ", "kho-pc000012", "xHN0000123y", "PB000001-copy",
 ])
 def test_a_nickname_that_holds_a_code_falls_back_to_the_masked_last_four(rec, nickname) -> None:
     assert rec.safe_label(CODE, nickname) == "…0001"
