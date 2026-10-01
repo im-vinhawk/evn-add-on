@@ -8,7 +8,7 @@ household kWh value.
 from __future__ import annotations
 
 import calendar
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, tzinfo
 from decimal import ROUND_HALF_UP, Decimal
 import logging
 import re
@@ -363,6 +363,50 @@ def unpaid_summary(bills: Iterable[Mapping[str, Any]], *, loaded: bool) -> dict[
     return {
         "unpaid_count": len(unpaid), "unpaid_amount": owed,
         "next_due_date": min((str(bill["due_date"]) for bill in unpaid if bill.get("due_date")), default=None),
+    }
+
+
+_OUTAGE_TIME = "%d/%m/%Y %H:%M"
+
+
+def _outage_time(value: Any, tz: tzinfo | None) -> str | None:
+    try:
+        return datetime.strptime(str(value).strip(), _OUTAGE_TIME).replace(tzinfo=tz).isoformat()
+    except ValueError:
+        return None
+
+
+def normalize_outages(rows: Iterable[Any], tz: tzinfo | None) -> list[dict[str, str]]:
+    """Planned outages reduced to start, end (aware ISO in `tz`) and EVN's short status code.
+
+    The reason and the area are free text that can name places or people, so they are dropped here,
+    and so is any row whose times cannot be read.  Sorted by start.
+    """
+    result = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        start, end = _outage_time(row.get("TGIAN_BDAU"), tz), _outage_time(row.get("TGIAN_KTHUC"), tz)
+        if start is None or end is None:
+            continue
+        status = row.get("TTHAI_HOAN")
+        result.append({"start": start, "end": end, "status": "" if status is None else str(status).strip()})
+    return sorted(result, key=lambda item: item["start"])
+
+
+def upcoming_outages(outages: Iterable[Mapping[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """The outages that have not ended yet (one in progress still counts)."""
+    return [dict(item) for item in outages if datetime.fromisoformat(item["end"]) >= now]
+
+
+def outage_summary(outages: Sequence[Mapping[str, Any]], *, loaded: bool) -> dict[str, Any]:
+    """The next outage and how many are upcoming; unknown (not zero) until the outages were read once."""
+    if not loaded:
+        return {"next_planned_outage": None, "outage_end": None, "outage_status": None, "upcoming_outage_count": None, "outages": []}
+    first = outages[0] if outages else {}
+    return {
+        "next_planned_outage": first.get("start"), "outage_end": first.get("end"), "outage_status": first.get("status"),
+        "upcoming_outage_count": len(outages), "outages": [dict(item) for item in outages],
     }
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -37,9 +37,10 @@ _METRICS: tuple[tuple[str, str, SensorDeviceClass | None, str | None, SensorStat
     ("latest_index", "Latest meter index", None, None, None),
     ("unpaid_amount", "Unpaid bills amount", SensorDeviceClass.MONETARY, "VND", None),
     ("next_due_date", "Next bill due date", SensorDeviceClass.DATE, None, None),
+    ("next_planned_outage", "Next planned outage", SensorDeviceClass.TIMESTAMP, None, None),
 )
 # Metrics a code has but the local total does not.
-_PER_CODE_ONLY = frozenset({"latest_index"})
+_PER_CODE_ONLY = frozenset({"latest_index", "next_planned_outage"})
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -60,13 +61,22 @@ def _as_date(value: Any) -> date | None:
         return None
 
 
+def _as_datetime(value: Any) -> datetime | None:
+    """A timestamp sensor needs an aware datetime; an unusable value is unknown."""
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
     """A value exposed by the coordinator's legacy-compatible calculation."""
 
     _attr_has_entity_name = True
     # The card reads these long lists from the live state; keeping them out of the recorder keeps every
     # state under Home Assistant's attribute size limit, however many bills or periods a code has.
-    _unrecorded_attributes = frozenset({"daily_history", "monthly_history", "bills"})
+    _unrecorded_attributes = frozenset({"daily_history", "monthly_history", "bills", "outages"})
 
     def __init__(self, coordinator: EvnDataUpdateCoordinator, entry: ConfigEntry, customer_code: str, metric: tuple[str, str, SensorDeviceClass | None, str | None, SensorStateClass | None]) -> None:
         super().__init__(coordinator)
@@ -89,7 +99,9 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
     def native_value(self) -> Any:
         item = self._source
         value = item.get(self._metric) if item else None
-        return _as_date(value) if self._metric == "next_due_date" else value
+        if self._metric == "next_due_date":
+            return _as_date(value)
+        return _as_datetime(value) if self._metric == "next_planned_outage" else value
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -120,6 +132,11 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
         if self._metric == "unpaid_amount":
             attrs["unpaid_count"] = item.get("unpaid_count")
             attrs["unpaid_fresh"] = item.get("unpaid_fresh", False)
+        if self._metric == "next_planned_outage":
+            attrs["end"] = item.get("outage_end")
+            attrs["status"] = item.get("outage_status")
+            attrs["upcoming_count"] = item.get("upcoming_outage_count")
+            attrs["outages"] = item.get("outages", [])
         if self._customer_code == "__aggregate__":
             attrs["selected_customer_codes"] = item.get("selected_customer_codes", [])
             attrs["successful_customer_codes"] = item.get("successful_customer_codes", [])

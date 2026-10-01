@@ -13,12 +13,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .api import EvnApiError, EvnAuthenticationError, EvnClient, EvnCustomerSwitchError, EvnMeterPointError
-from .calculation import aggregate_selected_overviews, attach_readings, merge_bill_sources, unpaid_summary
+from .calculation import (
+    aggregate_selected_overviews, attach_readings, merge_bill_sources, outage_summary, unpaid_summary, upcoming_outages,
+)
 from .const import (
     CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE,
-    CONF_REFRESH_TOKEN, DEFAULT_RECONCILE_THRESHOLD_KWH, DEFAULT_SCAN_INTERVAL, DOMAIN, EVENT_BILL,
+    CONF_REFRESH_TOKEN, DEFAULT_RECONCILE_THRESHOLD_KWH, DEFAULT_SCAN_INTERVAL, DOMAIN, EVENT_BILL, OUTAGE_LOOKAHEAD_DAYS,
     SESSION_KEEPALIVE_INTERVAL, CONF_SELECTED_CUSTOMER_CODES, CONF_CUSTOMER_ALIASES, CONF_RECONCILE_THRESHOLD_KWH,
 )
 from .daily_store import day_values
@@ -120,6 +123,7 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     bills = merge_bill_sources(history_bills, unpaid, unpaid_fresh=overview["unpaid_fresh"])
                     overview["bills"] = attach_readings(bills, await self._async_readings_or_empty(code))
                     overview.update(unpaid_summary(overview["bills"], loaded=unpaid_loaded))
+                    overview.update(await self._async_outage_summary(code, partial_errors))
                     # The legacy monthly history is derived from official bills.
                     overview["monthly_history"] = overview["bills"]
                     overview["history_fetched_at"] = self._client.history_fetched_at(code)
@@ -241,9 +245,24 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
         except EvnApiError:
             _LOGGER.debug("EVN unpaid bills unavailable; the payment state stays unknown")
-            partial_errors[code] = "unpaid_bills"
+            partial_errors.setdefault(code, "unpaid_bills")
             return [], False, False
         return rows, fresh, True
+
+    async def _async_outage_summary(self, code: str, partial_errors: dict[str, str]) -> dict[str, Any]:
+        """The next planned outage of a code; it never fails the update, and unknown stays unknown."""
+        now = dt_util.now()
+        try:
+            outages = await self._client.async_outages(code, now.date(), now.date() + timedelta(days=OUTAGE_LOOKAHEAD_DAYS))
+            return outage_summary(upcoming_outages(outages, now), loaded=True)
+        except EvnAuthenticationError:
+            raise
+        except EvnApiError:
+            _LOGGER.debug("EVN planned outages unavailable; they stay unknown")
+            partial_errors.setdefault(code, "outages")
+        except Exception as err:  # noqa: BLE001 - an outage problem must never fail the sensor update
+            _LOGGER.debug("EVN planned outages skipped (%s)", type(err).__name__)
+        return outage_summary([], loaded=False)
 
     async def _async_readings_or_empty(self, code: str) -> list[dict[str, Any]]:
         """Bills stay useful without their kWh, so a readings failure only leaves kWh unknown."""

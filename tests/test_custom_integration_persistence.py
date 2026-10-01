@@ -220,9 +220,12 @@ def _bill_client(api, readings):
     async def unpaid_with_source(_code):
         return [], True
 
+    async def outages(_code, _start, _end):
+        return []
+
     return types.SimpleNamespace(
         async_overview=overview, async_bills=bills, async_bills_with_source=bills_with_source,
-        async_unpaid_bills_with_source=unpaid_with_source,
+        async_unpaid_bills_with_source=unpaid_with_source, async_outages=outages,
         async_monthly_readings=monthly_readings, last_shapes={}, linked_customer_meter_points={},
         history_fetched_at=lambda _code: "", cached_history=lambda _code: None,
     )
@@ -253,11 +256,12 @@ class _TwoCodeClient:
 
     def __init__(
         self, bills_by_code, stamps, failing_overview=(), readings_by_code=None, cached_bills=(),
-        unpaid_by_code=None, cached_unpaid=(), failing_unpaid=(),
+        unpaid_by_code=None, cached_unpaid=(), failing_unpaid=(), outages_by_code=None, failing_outages=(),
     ):
         self.bills_by_code, self.stamps, self.failing_overview = bills_by_code, stamps, set(failing_overview)
         self.cached_bills = set(cached_bills)
         self.unpaid_by_code, self.cached_unpaid, self.failing_unpaid = unpaid_by_code or {}, set(cached_unpaid), set(failing_unpaid)
+        self.outages_by_code, self.failing_outages, self.outage_calls = outages_by_code or {}, set(failing_outages), []
         self.readings_by_code = readings_by_code or {}
         self.last_shapes, self.linked_customer_meter_points = {}, {}
         self.bills_calls: list[str] = []
@@ -278,6 +282,12 @@ class _TwoCodeClient:
         if code in self.failing_unpaid:
             raise self.api.EvnApiError("HTTP 400", status=400)
         return [dict(bill) for bill in self.unpaid_by_code.get(code, [])], code not in self.cached_unpaid
+
+    async def async_outages(self, code, start, end):
+        self.outage_calls.append((code, start, end))
+        if code in self.failing_outages:
+            raise self.api.EvnApiError("HTTP 400", status=400)
+        return [dict(item) for item in self.outages_by_code.get(code, [])]
 
     async def async_monthly_readings(self, code):
         return list(self.readings_by_code.get(code, []))
@@ -400,9 +410,12 @@ def test_update_prices_the_current_month_from_the_code_own_bills(modules) -> Non
     async def unpaid_with_source(_code):
         return [], True
 
+    async def outages(_code, _start, _end):
+        return []
+
     client = types.SimpleNamespace(
         async_overview=overview, async_bills=bills, async_bills_with_source=bills_with_source,
-        async_unpaid_bills_with_source=unpaid_with_source,
+        async_unpaid_bills_with_source=unpaid_with_source, async_outages=outages,
         async_monthly_readings=readings, last_shapes={}, linked_customer_meter_points={},
         history_fetched_at=lambda _code: "", cached_history=lambda _code: None,
     )
@@ -754,3 +767,87 @@ def test_an_expired_session_during_the_unpaid_read_asks_for_reauthentication(mod
     instance.data = None
     with pytest.raises(RuntimeError):
         asyncio.run(instance._async_update_data())
+
+
+# ------------------------------------------------------------------ planned outages in the update
+
+_ICT = __import__("datetime").timezone(__import__("datetime").timedelta(hours=7))
+
+
+def _outage(start, end, status="D"):
+    return {"start": start, "end": end, "status": status}
+
+
+def _outage_data(modules, monkeypatch, client):
+    coordinator = modules[3]
+    monkeypatch.setattr(
+        coordinator.dt_util, "now", lambda: __import__("datetime").datetime(2026, 10, 2, 12, 0, tzinfo=_ICT),
+    )
+    instance = _two_code_coordinator(modules, client)
+    instance._history = _BillHistory()
+    instance.data = None
+    return asyncio.run(instance._async_update_data()), client
+
+
+def test_the_next_planned_outage_is_read_for_the_next_fourteen_days_and_past_ones_are_dropped(modules, monkeypatch) -> None:
+    from datetime import date
+
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {},
+        outages_by_code={"PB000001": [
+            _outage("2026-10-01T08:00:00+07:00", "2026-10-01T09:00:00+07:00"),
+            _outage("2026-10-05T08:00:00+07:00", "2026-10-05T11:30:00+07:00", "K"),
+            _outage("2026-10-09T08:00:00+07:00", "2026-10-09T09:00:00+07:00"),
+        ]},
+    )
+    data, client = _outage_data(modules, monkeypatch, client)
+    assert client.outage_calls[0] == ("PB000001", date(2026, 10, 2), date(2026, 10, 16))
+    first, second = data["meters"]["PB000001"], data["meters"]["PB000002"]
+    assert first["next_planned_outage"] == "2026-10-05T08:00:00+07:00"
+    assert (first["outage_end"], first["outage_status"], first["upcoming_outage_count"]) == ("2026-10-05T11:30:00+07:00", "K", 2)
+    assert [item["start"][:10] for item in first["outages"]] == ["2026-10-05", "2026-10-09"]
+    assert (second["next_planned_outage"], second["upcoming_outage_count"]) == (None, 0)
+    assert "next_planned_outage" not in data["aggregate"], "the local total has no outage"
+
+
+def test_an_outage_failure_keeps_the_code_and_leaves_the_outages_unknown(modules, monkeypatch) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {}, failing_outages=["PB000002"],
+    )
+    data, _ = _outage_data(modules, monkeypatch, client)
+    assert data["partial_errors"] == {"PB000002": "outages"}
+    second = data["meters"]["PB000002"]
+    assert second["bills"][0]["total_amount"] == 100 and second["current_month_consumption"] == 1.0
+    assert (second["next_planned_outage"], second["upcoming_outage_count"], second["outages"]) == (None, None, [])
+
+
+def test_a_first_failure_is_the_one_reported_when_two_steps_fail(modules, monkeypatch) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {},
+        failing_unpaid=["PB000002"], failing_outages=["PB000002"],
+    )
+    data, _ = _outage_data(modules, monkeypatch, client)
+    assert data["partial_errors"] == {"PB000002": "unpaid_bills"}
+
+
+def test_an_outage_step_that_breaks_unexpectedly_never_fails_the_update(modules, monkeypatch) -> None:
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+
+    async def boom(*_args):
+        raise ValueError("odd payload")
+
+    client.async_outages = boom
+    data, _ = _outage_data(modules, monkeypatch, client)
+    assert set(data["meters"]) == {"PB000001", "PB000002"} and data["meters"]["PB000001"]["upcoming_outage_count"] is None
+
+
+def test_an_expired_session_during_the_outage_read_asks_for_reauthentication(modules, monkeypatch) -> None:
+    _, api, _, _ = modules
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+
+    async def expired(*_args):
+        raise api.EvnAuthenticationError("expired")
+
+    client.async_outages = expired
+    with pytest.raises(RuntimeError):
+        _outage_data(modules, monkeypatch, client)

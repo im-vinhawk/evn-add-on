@@ -6,8 +6,7 @@ Every code, name and figure here is synthetic.
 from __future__ import annotations
 
 import asyncio
-from datetime import date
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 import enum
 import importlib.util
 import json
@@ -138,6 +137,11 @@ def _meter_data(modules):
         "customer_code": CODE, "current_month_consumption": 10.0, "current_month_amount": 100, "bills": bills,
         "monthly_history": bills, "daily_history": [], "unpaid_fresh": True, **calc.unpaid_summary(bills, loaded=True),
     }
+    outages = calc.normalize_outages(
+        [{"TGIAN_BDAU": "05/10/2026 08:00", "TGIAN_KTHUC": "05/10/2026 11:30", "TTHAI_HOAN": "D", **ADVERSARIAL, "MA_KHANG": CODE}],
+        timezone(timedelta(hours=7)),
+    )
+    meter.update(calc.outage_summary(outages, loaded=True))
     other = {**meter, "customer_code": OTHER, "unpaid_count": 0, "unpaid_amount": 0, "next_due_date": None}
     meters = {CODE: meter, OTHER: other}
     aggregate = calc.aggregate_selected_overviews(meters, [CODE, OTHER], {})
@@ -260,3 +264,42 @@ def test_the_client_logs_and_records_no_identity_while_reading_both_lists(module
     for name, value in ADVERSARIAL.items():
         assert str(value) not in blob, f"{name} leaked into a log line or the recorded shapes"
     assert CODE not in caplog.text
+
+
+# ---------------------------------------------------------------- planned outage sensor
+
+def _outage_overview(data):
+    data["meters"][CODE].update({
+        "next_planned_outage": "2026-10-05T08:00:00+07:00", "outage_end": "2026-10-05T11:30:00+07:00",
+        "outage_status": "D", "upcoming_outage_count": 2,
+        "outages": [
+            {"start": "2026-10-05T08:00:00+07:00", "end": "2026-10-05T11:30:00+07:00", "status": "D"},
+            {"start": "2026-10-09T08:00:00+07:00", "end": "2026-10-09T09:00:00+07:00", "status": "D"},
+        ],
+    })
+    return data
+
+
+def test_each_code_has_a_planned_outage_timestamp_sensor_and_the_total_does_not(modules) -> None:
+    entities = _entities(modules, _entry())
+    sensor = _by_key(entities, CODE)["next_planned_outage"]
+    assert sensor._attr_device_class == modules.Device.TIMESTAMP and sensor._attr_state_class is None
+    assert "next_planned_outage" not in _by_key(entities, "__aggregate__")
+
+
+def test_the_state_is_an_aware_datetime_and_the_attributes_carry_only_the_times_and_the_status(modules) -> None:
+    sensor = _by_key(_entities(modules, _entry(), _outage_overview(_meter_data(modules))), CODE)["next_planned_outage"]
+    assert sensor.native_value == datetime(2026, 10, 5, 8, 0, tzinfo=timezone(timedelta(hours=7)))
+    attrs = sensor.extra_state_attributes
+    assert (attrs["end"], attrs["status"], attrs["upcoming_count"]) == ("2026-10-05T11:30:00+07:00", "D", 2)
+    assert [item["status"] for item in attrs["outages"]] == ["D", "D"]
+    assert (attrs["evn_role"], attrs["evn_entry"]) == ("meter", ENTRY_ID)
+    assert set(attrs["outages"][0]) == {"start", "end", "status"}
+
+
+def test_no_outage_is_an_unknown_state_and_the_long_list_stays_out_of_the_recorder(modules) -> None:
+    data = _meter_data(modules)
+    data["meters"][CODE].update(modules.calculation.outage_summary([], loaded=True))
+    sensor = _by_key(_entities(modules, _entry(), data), CODE)["next_planned_outage"]
+    assert sensor.native_value is None and sensor.extra_state_attributes["upcoming_count"] == 0
+    assert "outages" in sensor._unrecorded_attributes

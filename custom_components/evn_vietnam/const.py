@@ -46,6 +46,9 @@ PREVIOUS_MONTH_TAIL_RETRY = timedelta(hours=3)
 MONTHLY_READINGS_CACHE_SECONDS = 6 * 3600
 # The list of bills awaiting payment is asked for at most this often per code (and once after start).
 UNPAID_REFRESH = timedelta(hours=2)
+# Planned outages: how far ahead they are asked for, and how often per code.
+OUTAGE_LOOKAHEAD_DAYS = 14
+OUTAGE_REFRESH = timedelta(hours=6)
 # Historical daily backfill: how far back, how many months one refresh may fetch (for one code only),
 # and the pause before each EVN request so the backfill never hammers the service.
 MAX_BACKFILL_MONTHS = 36
