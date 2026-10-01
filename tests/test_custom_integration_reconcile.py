@@ -158,6 +158,15 @@ def test_a_cancelling_pair_with_missing_days_is_incomplete_not_a_boundary(rec) -
     assert results["2025-12-1"]["status"] == "mismatch", "December keeps its own result: nothing pairs with it"
 
 
+def test_a_chain_of_three_periods_pairs_only_the_first_two(rec) -> None:
+    days = _span(date(2025, 11, 30), date(2026, 2, 27), 3.0)  # collects 93.0, 93.0 and 84.0
+    bills = [_bill(2025, 12, 87.0), _bill(2026, 1, 99.0), _bill(2026, 2, 78.0)]  # diffs +6.0, -6.0, +6.0
+    periods, results = _results(rec, bills, days)
+    assert (results["2025-12-1"]["status"], results["2025-12-1"]["paired_with"]) == ("boundary", "2026-01-1")
+    assert (results["2026-01-1"]["status"], results["2026-01-1"]["paired_with"]) == ("boundary", "2025-12-1")
+    assert results["2026-02-1"]["status"] == "mismatch", "a period already explained by its neighbour is not paired again"
+
+
 def test_a_single_month_without_its_next_bill_stays_a_mismatch(rec) -> None:
     periods, results = _december_january(rec, december_kwh=87.0, january_kwh=None, skip_january=True)
     assert results["2025-12-1"]["status"] == "mismatch" and results["2025-12-1"]["paired_with"] is None
