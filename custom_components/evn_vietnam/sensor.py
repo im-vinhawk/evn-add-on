@@ -51,6 +51,9 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
     """A value exposed by the coordinator's legacy-compatible calculation."""
 
     _attr_has_entity_name = True
+    # The card reads these long lists from the live state; keeping them out of the recorder keeps every
+    # state under Home Assistant's attribute size limit, however many bills or periods a code has.
+    _unrecorded_attributes = frozenset({"daily_history", "monthly_history", "bills"})
 
     def __init__(self, coordinator: EvnDataUpdateCoordinator, entry: ConfigEntry, customer_code: str, metric: tuple[str, str, SensorDeviceClass | None, str | None, SensorStateClass | None]) -> None:
         super().__init__(coordinator)

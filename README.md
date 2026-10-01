@@ -130,7 +130,7 @@ A code billed on another price schedule, or any code after a price or VAT change
 
 ### Bill check against the collected days
 
-Each billing period of a code (month plus period number; several invoices of one period are combined) is compared with the stored daily kWh. EVN dates every daily row one day after the consumption it holds, so a bill for the period `[start, end]` is compared with the daily rows from `start − 1 day` to `end − 1 day` (`BILL_DAY_OFFSET` in `const.py`). On the data this was built against that window agreed with the bill within 1 kWh far more often than the period as EVN states it. Another EVN region might date its rows differently; if most bills of a code fall outside the tolerance, the offset needs to become an option.
+Each billing period of a code (month plus period number; several invoices of one period are combined) is compared with the stored daily kWh. On the account this was measured on, a bill for the period `[start, end]` agrees with the daily rows dated `start − 1 day` to `end − 1 day`, as if EVN dated each daily row one day before the consumption it holds; that is the window compared (`BILL_DAY_OFFSET` in `const.py`). On the data this was built against that window agreed with the bill within 1 kWh far more often than the period as EVN states it. Another EVN region might date its rows differently; if most bills of a code fall outside the tolerance, the offset needs to become an option.
 
 `collected_kwh` is the sum of the stored days of the window and `diff_kwh = collected_kwh − bill kWh`. `missing_days` counts the window days that are not stored; it is reported with every status. The status is the first rule that applies:
 
@@ -188,6 +188,7 @@ automation:
 - Home Assistant Energy Dashboard may still warn about `state_class` (`measurement` versus `total`).
 - Installation requires adding this repository as a HACS custom repository.
 - The bill check assumes the one-day offset above; it was measured on a single account.
+- The daily history, monthly history and bills attributes are not stored by the recorder (the card reads them from the live state), which keeps every state under Home Assistant's attribute size limit.
 - A bill whose kWh EVN has not published yet is announced as `no_kwh`, then updated.
 
 ## Agent prompt

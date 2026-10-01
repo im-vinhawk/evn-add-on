@@ -130,7 +130,7 @@ Vì vậy mã tính theo biểu giá khác, hoặc mọi mã sau một đợt đ
 
 ### Đối chiếu hóa đơn với số liệu đã thu thập
 
-Mỗi kỳ hóa đơn của một mã (tháng cùng số kỳ; nhiều hóa đơn của một kỳ được gộp) được so với kWh theo ngày đã lưu. EVN ghi ngày của mỗi dòng sau lượng điện năng nó chứa một ngày, nên hóa đơn của kỳ `[start, end]` được so với các dòng ngày từ `start − 1 ngày` tới `end − 1 ngày` (`BILL_DAY_OFFSET` trong `const.py`). Trên dữ liệu dùng để xây tính năng này, cửa sổ đó khớp hóa đơn trong vòng 1 kWh nhiều hơn hẳn so với kỳ như EVN ghi. Vùng EVN khác có thể ghi ngày khác; nếu phần lớn hóa đơn của một mã nằm ngoài ngưỡng, độ lệch ngày cần trở thành một tùy chọn.
+Mỗi kỳ hóa đơn của một mã (tháng cùng số kỳ; nhiều hóa đơn của một kỳ được gộp) được so với kWh theo ngày đã lưu. Trên tài khoản dùng để đo, hóa đơn của kỳ `[start, end]` khớp với các dòng ngày mang ngày từ `start − 1 ngày` tới `end − 1 ngày`, như thể EVN ghi ngày mỗi dòng trước lượng điện năng nó chứa một ngày; đó là cửa sổ được so (`BILL_DAY_OFFSET` trong `const.py`). Trên dữ liệu dùng để xây tính năng này, cửa sổ đó khớp hóa đơn trong vòng 1 kWh nhiều hơn hẳn so với kỳ như EVN ghi. Vùng EVN khác có thể ghi ngày khác; nếu phần lớn hóa đơn của một mã nằm ngoài ngưỡng, độ lệch ngày cần trở thành một tùy chọn.
 
 `collected_kwh` là tổng các ngày đã lưu của cửa sổ và `diff_kwh = collected_kwh − kWh hóa đơn`. `missing_days` đếm số ngày của cửa sổ chưa được lưu; luôn được báo kèm mọi trạng thái. Trạng thái là quy tắc đầu tiên phù hợp:
 
@@ -188,6 +188,7 @@ automation:
 - Home Assistant Energy Dashboard vẫn có thể cảnh báo `state_class` (`measurement` so với `total`).
 - Cần thêm repository này dưới dạng HACS custom repository để cài đặt.
 - Đối chiếu hóa đơn giả định độ lệch một ngày nêu trên; nó được đo trên một tài khoản duy nhất.
+- Các thuộc tính lịch sử ngày, lịch sử tháng và hóa đơn không được recorder lưu (thẻ đọc từ trạng thái hiện tại), nhờ đó mỗi trạng thái nằm dưới giới hạn kích thước thuộc tính của Home Assistant.
 - Hóa đơn mà EVN chưa báo kWh được thông báo với `no_kwh`, sau đó cập nhật.
 
 ## Prompt cho agent
