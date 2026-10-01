@@ -303,3 +303,37 @@ def test_no_outage_is_an_unknown_state_and_the_long_list_stays_out_of_the_record
     sensor = _by_key(_entities(modules, _entry(), data), CODE)["next_planned_outage"]
     assert sensor.native_value is None and sensor.extra_state_attributes["upcoming_count"] == 0
     assert "outages" in sensor._unrecorded_attributes
+
+
+# ---------------------------------------------------------------- projected period amount
+
+_PROJECTION = {
+    "period_start": "2026-10-01", "expected_end": "2026-10-31", "data_until": "2026-10-10", "collected_kwh": 33.0,
+    "rate_kwh_per_day": 3.0, "projected_kwh": 93.0, "projected_amount": 202338, "method": "tiered", "calendar_month": True,
+    "tier": 1, "kwh_to_next_tier": 17.0, "next_tier_price": 2050,
+}
+
+
+def test_each_code_and_the_total_have_a_projected_amount_that_is_money_without_a_state_class(modules) -> None:
+    entities = _entities(modules, _entry())
+    for owner in (CODE, "__aggregate__"):
+        sensor = _by_key(entities, owner)["projected_period_amount"]
+        assert (sensor._attr_device_class, sensor._attr_native_unit_of_measurement, sensor._attr_state_class) == (modules.Device.MONETARY, "VND", None)
+
+
+def test_the_projection_fields_are_the_attributes_of_the_code_sensor_only(modules) -> None:
+    data = _meter_data(modules)
+    data["meters"][CODE].update({"projected_period_amount": 202338, "projection": dict(_PROJECTION)})
+    entities = _entities(modules, _entry(), data)
+    mine = _by_key(entities, CODE)["projected_period_amount"]
+    assert mine.native_value == 202338
+    assert {key: mine.extra_state_attributes[key] for key in _PROJECTION} == _PROJECTION
+    total = _by_key(entities, "__aggregate__")["projected_period_amount"]
+    assert "tier" not in total.extra_state_attributes
+
+
+def test_no_projection_is_an_unknown_state_with_no_invented_attributes(modules) -> None:
+    data = _meter_data(modules)
+    data["meters"][CODE].update({"projected_period_amount": None, "projection": None})
+    sensor = _by_key(_entities(modules, _entry(), data), CODE)["projected_period_amount"]
+    assert sensor.native_value is None and "tier" not in sensor.extra_state_attributes

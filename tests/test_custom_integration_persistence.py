@@ -512,6 +512,9 @@ class _WindowHistory:
     def today(self):
         return self._today
 
+    def days(self, code):
+        return dict(self.store_days.get(code, {}))
+
     def compose(self, code, live_rows):
         daily_store = sys.modules[f"{PACKAGE}.daily_store"]
         return daily_store.compose_window(self.store_days[code], live_rows, self._today, 31)
@@ -851,3 +854,85 @@ def test_an_expired_session_during_the_outage_read_asks_for_reauthentication(mod
     client.async_outages = expired
     with pytest.raises(RuntimeError):
         _outage_data(modules, monkeypatch, client)
+
+
+# ------------------------------------------------------------------ running-period projection in the update
+
+def _september(month_amount=250000):
+    return {**_bill_row(9, month_amount), "period_start": "2026-09-01", "period_end": "2026-09-30"}
+
+
+def _project_data(modules, history, *, bills=None):
+    client = _TwoCodeClient(
+        {"PB000001": bills or [_september()], "PB000002": bills or [_september()]}, {},
+    )
+    instance = _two_code_coordinator(modules, client)
+    instance._history = history
+    instance.data = None
+    return asyncio.run(instance._async_update_data())
+
+
+def _store(per_day):
+    from datetime import date, timedelta
+
+    first = date(2026, 9, 30)
+    return {day.isoformat(): per_day for day in (first + timedelta(days=i) for i in range(11))}
+
+
+def test_each_code_projects_its_running_period_and_the_total_is_the_sum(modules) -> None:
+    from datetime import date
+
+    history = _WindowHistory({"PB000001": _store(3.0), "PB000002": _store(1.0)}, date(2026, 10, 11))
+    data = _project_data(modules, history)
+    first, second = data["meters"]["PB000001"], data["meters"]["PB000002"]
+    assert (first["projection"]["projected_kwh"], first["projected_period_amount"]) == (93.0, 202338)
+    assert (second["projection"]["projected_kwh"], second["projected_period_amount"]) == (31.0, 66424)
+    assert first["projection"]["period_start"] == "2026-10-01" and first["projection"]["expected_end"] == "2026-10-31"
+    assert data["aggregate"]["projected_period_amount"] == 202338 + 66424
+
+
+def test_the_projection_is_unknown_while_the_daily_history_is_unavailable(modules) -> None:
+    from datetime import date
+
+    history = _WindowHistory({"PB000001": _store(3.0), "PB000002": _store(1.0)}, date(2026, 10, 11))
+    history.available = False
+    data = _project_data(modules, history)
+    first = data["meters"]["PB000001"]
+    assert first["projection"] is None and first["projected_period_amount"] is None
+    assert data["aggregate"]["projected_period_amount"] is None
+
+
+def test_a_code_without_daily_data_has_no_projection_and_the_total_becomes_unknown(modules) -> None:
+    from datetime import date
+
+    history = _WindowHistory({"PB000001": _store(3.0), "PB000002": {}}, date(2026, 10, 11))
+    data = _project_data(modules, history)
+    assert data["meters"]["PB000002"]["projected_period_amount"] is None
+    assert data["meters"]["PB000001"]["projected_period_amount"] == 202338
+    assert data["aggregate"]["projected_period_amount"] is None
+
+
+def test_a_failing_projection_never_fails_the_update(modules) -> None:
+    from datetime import date
+
+    class History(_WindowHistory):
+        def days(self, code):
+            raise RuntimeError("boom")
+
+    history = History({"PB000001": _store(3.0), "PB000002": _store(1.0)}, date(2026, 10, 11))
+    data = _project_data(modules, history)
+    assert set(data["meters"]) == {"PB000001", "PB000002"} and data["meters"]["PB000001"]["projection"] is None
+
+
+def test_the_readings_give_the_period_when_a_bill_has_no_dates(modules) -> None:
+    from datetime import date
+
+    client = _TwoCodeClient(
+        {"PB000001": [_bill_row(9, 250000)], "PB000002": [_bill_row(9, 250000)]}, {},
+        readings_by_code={"PB000001": [{"year": 2026, "month": 8, "ky": 1, "kwh": 90.0, "start": "2026-08-01", "end": "2026-08-31"}]},
+    )
+    instance = _two_code_coordinator(modules, client)
+    instance._history = _WindowHistory({"PB000001": _store(3.0), "PB000002": _store(1.0)}, date(2026, 10, 11))
+    instance.data = None
+    data = asyncio.run(instance._async_update_data())
+    assert data["meters"]["PB000001"]["projection"]["period_start"] == "2026-09-01"

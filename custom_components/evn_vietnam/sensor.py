@@ -38,6 +38,7 @@ _METRICS: tuple[tuple[str, str, SensorDeviceClass | None, str | None, SensorStat
     ("unpaid_amount", "Unpaid bills amount", SensorDeviceClass.MONETARY, "VND", None),
     ("next_due_date", "Next bill due date", SensorDeviceClass.DATE, None, None),
     ("next_planned_outage", "Next planned outage", SensorDeviceClass.TIMESTAMP, None, None),
+    ("projected_period_amount", "Projected bill of the running period", SensorDeviceClass.MONETARY, "VND", None),
 )
 # Metrics a code has but the local total does not.
 _PER_CODE_ONLY = frozenset({"latest_index", "next_planned_outage"})
@@ -132,6 +133,8 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
         if self._metric == "unpaid_amount":
             attrs["unpaid_count"] = item.get("unpaid_count")
             attrs["unpaid_fresh"] = item.get("unpaid_fresh", False)
+        if self._metric == "projected_period_amount" and item.get("projection"):
+            attrs.update(item["projection"])
         if self._metric == "next_planned_outage":
             attrs["end"] = item.get("outage_end")
             attrs["status"] = item.get("outage_status")

@@ -100,6 +100,7 @@ def test_selected_aggregate_keeps_explicit_partial_state_when_no_selected_meter_
         "estimate_method": "tiered",
         "unpaid_count": None,
         "unpaid_amount": None,
+        "projected_period_amount": None,
         "unpaid_fresh": False,
         "next_due_date": None,
         "successful_customer_codes": [],

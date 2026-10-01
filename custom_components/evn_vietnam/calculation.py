@@ -84,6 +84,16 @@ def _is_calendar_month(start: date, end: date) -> bool:
     return start.day == 1 and end == date(start.year, start.month, calendar.monthrange(start.year, start.month)[1])
 
 
+def is_calendar_month(start: date, end: date) -> bool:
+    """True when [start, end] is one whole calendar month."""
+    return _is_calendar_month(start, end)
+
+
+def tariff_on(day: date) -> TariffRow:
+    """The tariff row in force on day; day must not precede the table."""
+    return _tariff_on(day)
+
+
 def calculate_bill_amount(kwh: float, period_start: date, period_end: date) -> int | None:
     """Reproduce an EVN residential bill in VND including VAT, or None when it is not modelled.
 
@@ -173,6 +183,7 @@ def aggregate_overviews(overviews: Iterable[Mapping[str, Any]], codes: list[str]
         ),
         "unpaid_count": _sum_known(values, "unpaid_count"),
         "unpaid_amount": _sum_known(values, "unpaid_amount"),
+        "projected_period_amount": _sum_known(values, "projected_period_amount"),
         "unpaid_fresh": bool(values) and all(item.get("unpaid_fresh") is True for item in values),
         "next_due_date": min((str(item["next_due_date"]) for item in values if item.get("next_due_date")), default=None),
     }

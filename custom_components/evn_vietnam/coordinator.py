@@ -27,6 +27,7 @@ from .const import (
 from .daily_store import day_values
 from .history import DailyHistory, create_daily_history
 from .pricing import price_overview
+from .projection import project_running_period
 from .reconcile import annotate_bills
 from .models import (
     merge_linked_customer_meter_points,
@@ -115,13 +116,15 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed("No EVN customer code is configured")
             meters: dict[str, dict[str, Any]] = {}
             partial_errors: dict[str, str] = {}
+            readings_by_code: dict[str, list[dict[str, Any]]] = {}
             for code in codes:
                 try:
                     overview = await self._client.async_overview(code)
                     history_bills, overview["bills_fresh"] = await self._client.async_bills_with_source(code)
                     unpaid, overview["unpaid_fresh"], unpaid_loaded = await self._async_unpaid_or_empty(code, partial_errors)
                     bills = merge_bill_sources(history_bills, unpaid, unpaid_fresh=overview["unpaid_fresh"])
-                    overview["bills"] = attach_readings(bills, await self._async_readings_or_empty(code))
+                    readings_by_code[code] = await self._async_readings_or_empty(code)
+                    overview["bills"] = attach_readings(bills, readings_by_code[code])
                     overview.update(unpaid_summary(overview["bills"], loaded=unpaid_loaded))
                     overview.update(await self._async_outage_summary(code, partial_errors))
                     # The legacy monthly history is derived from official bills.
@@ -147,6 +150,7 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             events = await self._async_update_history(meters, codes, aggregate_codes)
             self._fire_bill_events(events)
             self._compose_windows(meters)
+            self._add_projections(meters, readings_by_code)
             for code, overview in meters.items():
                 overview["bills"] = overview["monthly_history"] = self._reconciled(code, overview["bills"])
             aggregate = aggregate_selected_overviews(
@@ -216,6 +220,24 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 overview["today_consumption"], overview["yesterday_consumption"] = day_values(rows, today)
         except Exception as err:  # noqa: BLE001 - a history problem must never fail the sensor update
             _LOGGER.debug("EVN rolling window skipped (%s)", type(err).__name__)
+
+    def _add_projections(self, meters: dict[str, dict[str, Any]], readings_by_code: dict[str, list[dict[str, Any]]]) -> None:
+        """Estimate each code's running billing period from the stored days; unknown when they are not available."""
+        history = self._history
+        for code, overview in meters.items():
+            overview["projection"], overview["projected_period_amount"] = None, None
+            try:
+                if history is None or not history.available:
+                    continue
+                overview["projection"] = project_running_period(
+                    history.days(code), overview.get("bills", []), readings_by_code.get(code, []), history.today(),
+                    overview["price_model"],
+                )
+            except Exception as err:  # noqa: BLE001 - a projection problem must never fail the sensor update
+                _LOGGER.debug("EVN period projection skipped (%s)", type(err).__name__)
+                continue
+            if overview["projection"] is not None:
+                overview["projected_period_amount"] = overview["projection"]["projected_amount"]
 
     def _last_good_history(
         self, partial_errors: dict[str, str], meters: dict[str, dict[str, Any]]
