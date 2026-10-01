@@ -1166,3 +1166,114 @@ def test_an_empty_fresh_bill_list_leaves_the_store_untouched(modules) -> None:
     assert _bill_update(history, _bill_meter([])) == []
     assert history._data["bills"] == {}
     assert [e["period"] for e in _bill_update(history, _bill_meter([_AUG, _SEPT]))] == ["09/2026"]
+
+
+# --------------------------------------------------------- unpaid bills in the cycle
+
+def _unpaid_bill_row(year, month, kwh, *, amount=250000, owed=250000, due="2026-10-15"):
+    return {
+        **_bill_row(year, month, kwh, amount=amount), "payment_status": "unpaid", "is_paid": False, "due_date": due,
+        "amount_owed": owed, "bill_source": "unpaid", "payment_checked": True,
+    }
+
+
+def _paid_bill_row(year, month, kwh, *, amount=240000):
+    return {**_bill_row(year, month, kwh, amount=amount), "payment_status": "paid", "bill_source": "history", "payment_checked": True}
+
+
+def _unpaid_meter(bills, *, history_fresh=True, unpaid_fresh=True):
+    return {**_bill_meter(bills, fresh=history_fresh), "unpaid_fresh": unpaid_fresh}
+
+
+def _upgrade_store():
+    """A store written by the version that only knew the paid history: its periods are recorded, no unpaid flag."""
+    seen = {
+        f"2026-{month:02d}-1": {"bill_id": f"{month:012x}", "first_seen": f"2026-{month:02d}-28", "status": "match", "amount": 1000}
+        for month in (4, 5, 6)
+    }
+    return _bill_store(bills={"PB000001": seen})
+
+
+_PAID_HISTORY = [_paid_bill_row(2026, 4, 90.0), _paid_bill_row(2026, 5, 93.0), _paid_bill_row(2026, 6, 90.0)]
+_ARREARS = [_unpaid_bill_row(2026, 7, 93.0), _unpaid_bill_row(2026, 8, 93.0), _unpaid_bill_row(2026, 9, 90.0)]
+
+
+def test_a_store_without_the_unpaid_flag_loads_it_as_not_seeded_and_the_flag_round_trips(modules) -> None:
+    s = modules.store
+    assert s.empty_store()["unpaid_seeded"] == {}
+    assert s.STORE_VERSION == 1, "a higher version would need a migration function in Home Assistant's Store"
+    assert s.normalize_store({"daily": {}, "bills": {}})["unpaid_seeded"] == {}
+    again = s.normalize_store(json.loads(json.dumps({"unpaid_seeded": {"PB000001": True, "PB000002": False}})))
+    assert again["unpaid_seeded"] == {"PB000001": True}
+    for garbage in (None, [], {"unpaid_seeded": "x"}, {"unpaid_seeded": [1]}, {"unpaid_seeded": {"PB000001": "yes"}}):
+        assert s.normalize_store(garbage)["unpaid_seeded"] == {}
+
+
+def test_upgrading_with_three_unpaid_periods_announces_only_the_previous_month_once(modules) -> None:
+    store = _FakeStore(_upgrade_store())
+    history, seen = _history(modules, store=store, today=date(2026, 10, 1))
+    events = _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS))
+    assert [(e["period"], e["reason"], e["payment_status"]) for e in events] == [("09/2026", "new", "unpaid")]
+    saved = seen.store.saved[-1]
+    assert {"2026-07-1", "2026-08-1", "2026-09-1"} <= set(saved["bills"]["PB000001"]), "old arrears are remembered silently"
+    assert saved["unpaid_seeded"] == {"PB000001": True}, "the flag is saved together with the periods"
+    assert _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS)) == []
+
+
+def test_the_unpaid_list_failing_on_the_first_poll_announces_nothing_and_leaves_the_flag_off(modules) -> None:
+    history, seen = _history(modules, store=_FakeStore(_upgrade_store()), today=date(2026, 10, 1))
+    assert _bill_update(history, _unpaid_meter(_PAID_HISTORY, unpaid_fresh=False)) == []
+    assert history._data["unpaid_seeded"] == {}
+    events = _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS))
+    assert [e["period"] for e in events] == ["09/2026"]
+
+
+def test_a_cached_unpaid_list_never_announces_or_seeds(modules) -> None:
+    history, _ = _history(modules, store=_FakeStore(_upgrade_store()), today=date(2026, 10, 1))
+    assert _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS, unpaid_fresh=False)) == []
+    assert history._data["unpaid_seeded"] == {}
+    assert set(history._data["bills"]["PB000001"]) == {"2026-04-1", "2026-05-1", "2026-06-1"}
+
+
+def test_an_empty_fresh_unpaid_list_does_not_count_as_a_first_sighting(modules) -> None:
+    history, _ = _history(modules, store=_FakeStore(_upgrade_store()), today=date(2026, 10, 1))
+    assert _bill_update(history, _unpaid_meter(_PAID_HISTORY)) == []
+    assert history._data["unpaid_seeded"] == {}
+
+
+def test_a_bill_is_announced_when_issued_and_paying_it_later_fires_nothing(modules) -> None:
+    store = _FakeStore(_upgrade_store())
+    history, _ = _history(modules, store=store, today=date(2026, 10, 1))
+    _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS))
+    # a new month's bill is issued
+    issued = _unpaid_bill_row(2026, 10, 90.0, due="2026-11-15")
+    days = history._data["daily"]["PB000001"]
+    for offset in range(0, 31):
+        days[(date(2026, 9, 30) + timedelta(days=offset)).isoformat()] = 3.0
+    first = _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS + [issued]))
+    assert [(e["period"], e["reason"], e["due_date"]) for e in first] == [("10/2026", "new", "2026-11-15")]
+    paid = _paid_bill_row(2026, 10, 90.0, amount=250000)
+    assert _bill_update(history, _unpaid_meter(_PAID_HISTORY + [paid], unpaid_fresh=True)) == []
+
+
+def test_payment_between_polls_with_the_unpaid_fetch_failing_is_not_news_and_not_unpaid(modules) -> None:
+    history, _ = _history(modules, store=_FakeStore(_upgrade_store()), today=date(2026, 10, 1))
+    _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS))
+    paid_sept = _paid_bill_row(2026, 9, 90.0, amount=250000)
+    assert _bill_update(history, _unpaid_meter(_PAID_HISTORY + [paid_sept], unpaid_fresh=False)) == []
+
+
+def test_a_failed_save_leaves_the_unpaid_flag_off_so_the_next_poll_retries(modules) -> None:
+    store = _FailingStore(_upgrade_store())
+    history, _ = _history(modules, store=store, today=date(2026, 10, 1))
+    store.fail = True
+    assert _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS)) == []
+    assert history._data["unpaid_seeded"] == {} and set(history._data["bills"]["PB000001"]) == {"2026-04-1", "2026-05-1", "2026-06-1"}
+    store.fail = False
+    assert [e["period"] for e in _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS))] == ["09/2026"]
+
+
+def test_the_unpaid_events_and_state_never_hold_the_code(modules) -> None:
+    history, seen = _history(modules, store=_FakeStore(_upgrade_store()), today=date(2026, 10, 1))
+    events = _bill_update(history, _unpaid_meter(_PAID_HISTORY + _ARREARS), aliases={"PB000001": "Nhà PB000001"})
+    assert "PB000001" not in repr(events) and "PB000001" not in repr(seen.store.saved[-1]["bills"]["PB000001"])

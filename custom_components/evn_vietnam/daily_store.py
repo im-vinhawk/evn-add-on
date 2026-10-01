@@ -6,7 +6,12 @@ The dict handled here is what Home Assistant's ``Store`` writes to disk::
      "meta": {code: {"cursor": "YYYY-MM" | None, "empty": int, "done": bool, "prev_refresh": "YYYY-MM-DD",
                      "failures": int, "tail_try": ISO datetime with offset | ""}},
      "series": {statistic_id: {"start": "YYYY-MM-DD", "count": int, "scope": str}},
-     "bills": {code: {"YYYY-MM-K": {"bill_id": 12 hex, "first_seen": "YYYY-MM-DD", "status": str, "amount": int}}}}
+     "bills": {code: {"YYYY-MM-K": {"bill_id": 12 hex, "first_seen": "YYYY-MM-DD", "status": str, "amount": int}}},
+     "unpaid_seeded": {code: True}}
+
+``unpaid_seeded`` marks a code whose unpaid list was read once, so its old arrears were recorded without a notice.
+It is additive: a store without it loads as "not seeded", and an older release ignores it, so STORE_VERSION stays 1
+(Home Assistant's Store refuses a version it has no migration for).
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ _BILL_STATUSES = frozenset({"match", "boundary", "incomplete", "mismatch", "no_k
 
 
 def empty_store() -> dict[str, Any]:
-    return {"daily": {}, "meta": {}, "series": {}, "bills": {}}
+    return {"daily": {}, "meta": {}, "series": {}, "bills": {}, "unpaid_seeded": {}}
 
 
 def _valid_day(value: Any) -> bool:
@@ -76,6 +81,10 @@ def normalize_store(raw: Any) -> dict[str, Any]:
                 for key, entry in periods.items()
                 if isinstance(key, str) and _BILL_KEY.match(key) and _valid_bill_entry(entry)
             }
+    seeded = raw.get("unpaid_seeded")
+    for code, flag in (seeded.items() if isinstance(seeded, Mapping) else ()):
+        if flag is True:
+            store["unpaid_seeded"][str(code)] = True
     return store
 
 

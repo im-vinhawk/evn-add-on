@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -34,7 +35,11 @@ _METRICS: tuple[tuple[str, str, SensorDeviceClass | None, str | None, SensorStat
     ("current_month_consumption", "Current month consumption", SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.TOTAL_INCREASING),
     ("current_month_amount", "Estimated current month cost", SensorDeviceClass.MONETARY, "VND", SensorStateClass.TOTAL),
     ("latest_index", "Latest meter index", None, None, None),
+    ("unpaid_amount", "Unpaid bills amount", SensorDeviceClass.MONETARY, "VND", None),
+    ("next_due_date", "Next bill due date", SensorDeviceClass.DATE, None, None),
 )
+# Metrics a code has but the local total does not.
+_PER_CODE_ONLY = frozenset({"latest_index"})
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -43,8 +48,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     codes = configured_customer_codes(entry)
     entities = [EvnSensor(coordinator, entry, code, metric) for code in codes for metric in _METRICS]
     if len(aggregate_customer_codes(entry)) > 1:
-        entities.extend(EvnSensor(coordinator, entry, "__aggregate__", metric) for metric in _METRICS if metric[0] != "latest_index")
+        entities.extend(EvnSensor(coordinator, entry, "__aggregate__", metric) for metric in _METRICS if metric[0] not in _PER_CODE_ONLY)
     async_add_entities(entities)
+
+
+def _as_date(value: Any) -> date | None:
+    """A date sensor needs a date object; an unusable value is unknown."""
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
@@ -58,7 +71,7 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
     def __init__(self, coordinator: EvnDataUpdateCoordinator, entry: ConfigEntry, customer_code: str, metric: tuple[str, str, SensorDeviceClass | None, str | None, SensorStateClass | None]) -> None:
         super().__init__(coordinator)
         key, label, device_class, native_unit, state_class = metric
-        self._customer_code, self._metric = customer_code, key
+        self._customer_code, self._metric, self._entry_id = customer_code, key, entry.entry_id
         identifier = "aggregate" if customer_code == "__aggregate__" else customer_code.lower()
         self._attr_unique_id = f"{entry.entry_id}_{identifier}_{key}"
         self._attr_name = label
@@ -75,14 +88,19 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
     @property
     def native_value(self) -> Any:
         item = self._source
-        return item.get(self._metric) if item else None
+        value = item.get(self._metric) if item else None
+        return _as_date(value) if self._metric == "next_due_date" else value
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         item = self._source
+        # Neither identifies a person: they let an automation pick exactly one sensor per meter.
+        role = {
+            "evn_role": "aggregate" if self._customer_code == "__aggregate__" else "meter", "evn_entry": self._entry_id,
+        }
         if not item:
-            return {"attribution": ATTRIBUTION}
-        attrs: dict[str, Any] = {"attribution": ATTRIBUTION, "customer_code": self._customer_code}
+            return {"attribution": ATTRIBUTION, **role}
+        attrs: dict[str, Any] = {"attribution": ATTRIBUTION, "customer_code": self._customer_code, **role}
         if self._customer_code != "__aggregate__":
             aliases = normalize_aliases(
                 self.coordinator.config_entry.options.get(CONF_CUSTOMER_ALIASES), [self._customer_code]
@@ -99,6 +117,9 @@ class EvnSensor(CoordinatorEntity[EvnDataUpdateCoordinator], SensorEntity):
             attrs["bills"] = item.get("bills", [])
             attrs["tariff_verified"] = item.get("tariff_verified")
             attrs["estimate_method"] = item.get("estimate_method", ESTIMATE_TIERED)
+        if self._metric == "unpaid_amount":
+            attrs["unpaid_count"] = item.get("unpaid_count")
+            attrs["unpaid_fresh"] = item.get("unpaid_fresh", False)
         if self._customer_code == "__aggregate__":
             attrs["selected_customer_codes"] = item.get("selected_customer_codes", [])
             attrs["successful_customer_codes"] = item.get("successful_customer_codes", [])

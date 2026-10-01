@@ -206,10 +206,13 @@ def test_without_a_history_the_rows_get_the_canonical_period_and_no_reconciliati
     assert results == {}
 
 
-def test_a_row_without_a_period_key_is_left_alone(rec) -> None:
+def test_a_row_without_a_period_key_is_listed_as_no_period_and_never_reconciled(rec) -> None:
     broken = {**_bill(2026, 8, 93.0), "KY": None}
     rows, periods, results = rec.annotate_bills([broken], {}, 1.0)
-    assert rows[0]["ky"] is None and rows[0]["reconcile_status"] is None and periods == []
+    assert rows[0]["ky"] is None and rows[0]["reconcile_status"] == "no_period" and periods == []
+    assert rows[0]["collected_kwh"] is None and results == {}
+    rows, _, _ = rec.annotate_bills([broken], None, 1.0)
+    assert rows[0]["reconcile_status"] == "no_period"
 
 
 # ------------------------------------------------------------------ identity and label
@@ -287,6 +290,7 @@ def test_a_new_period_fires_one_event_with_the_whole_payload(rec) -> None:
         "bill_id", "entry_id", "label", "period", "ky", "period_start", "period_end", "window_start", "window_end",
         "bill_kwh", "collected_kwh", "diff_kwh", "missing_days", "status", "previous_status", "reason",
         "compensates_previous", "total_amount", "calculated_amount", "threshold_kwh",
+        "payment_status", "due_date", "amount_owed",
     }
     assert (event["period"], event["ky"], event["reason"], event["previous_status"]) == ("09/2026", 1, "new", None)
     assert (event["window_start"], event["window_end"]) == ("2026-08-31", "2026-09-29")
@@ -417,3 +421,105 @@ def test_two_codes_with_the_same_nickname_get_different_ids_and_a_rename_keeps_t
     renamed, _ = rec.plan_events("entry-1", CODE, "Căn hộ", periods, results, {}, date(2026, 10, 2), 1.0)
     assert first[0]["bill_id"] != second[0]["bill_id"]
     assert first[0]["bill_id"] == renamed[0]["bill_id"] and renamed[0]["label"] == "Căn hộ"
+
+
+# ------------------------------------------------------------------ unpaid periods and payment state
+
+def _unpaid(year, month, kwh, *, owed=1000, due="2026-10-15", **kwargs):
+    return {
+        **_bill(year, month, kwh, **kwargs), "payment_status": "unpaid", "is_paid": False, "due_date": due,
+        "amount_owed": owed, "bill_source": "unpaid", "payment_checked": True,
+    }
+
+
+def _paid(year, month, kwh, **kwargs):
+    return {**_bill(year, month, kwh, **kwargs), "payment_status": "paid", "bill_source": "history", "payment_checked": True}
+
+
+def _seen(key, *, first_seen="2026-09-30", status="match", amount=1000):
+    return {key: {"bill_id": "0123456789ab", "first_seen": first_seen, "status": status, "amount": amount}}
+
+
+_SEPT_DAYS = _span(date(2026, 7, 31), date(2026, 9, 29), 3.0)
+
+
+def test_the_periods_carry_their_payment_state_due_date_and_owed_amount(rec) -> None:
+    unpaid = rec.group_periods([_unpaid(2026, 9, 90.0, owed=777, due="2026-10-05")])[0]
+    assert (unpaid["payment_status"], unpaid["due_date"], unpaid["amount_owed"], unpaid["from_unpaid"]) == ("unpaid", "2026-10-05", 777, True)
+    paid = rec.group_periods([_paid(2026, 8, 93.0)])[0]
+    assert (paid["payment_status"], paid["due_date"], paid["amount_owed"], paid["from_unpaid"]) == ("paid", "", None, False)
+    legacy = rec.group_periods([_bill(2026, 8, 93.0)])[0]
+    assert legacy["payment_status"] == "paid", "a row from before payment states keeps its is_paid meaning"
+
+
+def test_two_invoices_of_a_period_are_unpaid_if_either_is(rec) -> None:
+    period = rec.group_periods([_paid(2026, 9, 90.0, amount=500), _unpaid(2026, 9, 90.0, amount=300, owed=300, due="2026-10-09")])[0]
+    assert (period["payment_status"], period["total_amount"], period["amount_owed"], period["due_date"]) == ("unpaid", 800, 300, "2026-10-09")
+
+
+def test_a_period_is_announced_when_it_is_issued_unpaid_with_its_payment_fields(rec) -> None:
+    bills = [_paid(2026, 8, 93.0), _unpaid(2026, 9, 90.0, owed=1000, due="2026-10-15")]
+    events, state = _plan(rec, bills, _SEPT_DAYS, _seen("2026-08-1"), date(2026, 10, 1))
+    assert [(e["period"], e["reason"]) for e in events] == [("09/2026", "new")]
+    event = events[0]
+    assert (event["payment_status"], event["due_date"], event["amount_owed"]) == ("unpaid", "2026-10-15", 1000)
+    assert CODE not in repr(events) and CODE not in repr(state)
+
+
+def test_paying_the_bill_is_not_news(rec) -> None:
+    state = _seen("2026-09-1", first_seen="2026-10-01", status="match", amount=1000)
+    events, new_state = _plan(rec, [_paid(2026, 9, 90.0, amount=1000)], _SEPT_DAYS, state, date(2026, 10, 3))
+    assert events == [] and set(new_state) == {"2026-09-1"}
+
+
+def test_a_change_of_amount_is_still_one_update_whatever_the_payment_state(rec) -> None:
+    state = _seen("2026-09-1", first_seen="2026-10-01", status="match", amount=1000)
+    events, _ = _plan(rec, [_paid(2026, 9, 90.0, amount=1200)], _SEPT_DAYS, state, date(2026, 10, 3))
+    assert [(e["reason"], e["payment_status"]) for e in events] == [("update", "paid")]
+
+
+def _arrears():
+    return [_unpaid(2026, 7, 90.0), _unpaid(2026, 8, 93.0), _unpaid(2026, 9, 90.0)]
+
+
+def test_the_first_fresh_unpaid_list_records_old_arrears_silently_and_announces_the_previous_month(rec) -> None:
+    state = {**_seen("2026-05-1"), **_seen("2026-06-1")}
+    events, new_state = _plan_unpaid(rec, _arrears(), state, date(2026, 10, 1), unpaid_seeding=True)
+    assert [e["period"] for e in events] == ["09/2026"]
+    assert {"2026-07-1", "2026-08-1", "2026-09-1"} <= set(new_state)
+    assert new_state["2026-07-1"]["first_seen"] == "2026-07-31" and new_state["2026-09-1"]["first_seen"] == "2026-10-01"
+    again, _ = _plan_unpaid(rec, _arrears(), new_state, date(2026, 10, 1), unpaid_seeding=False)
+    assert again == []
+
+
+def _plan_unpaid(rec, bills, state, today, **kwargs):
+    periods, results = _results(rec, bills, _SEPT_DAYS)
+    return rec.plan_events("entry-1", CODE, "Nhà", periods, results, state, today, 1.0, **kwargs)
+
+
+def test_once_the_unpaid_source_is_seeded_an_unseen_unpaid_period_is_news(rec) -> None:
+    events, _ = _plan_unpaid(rec, _arrears(), _seen("2026-06-1"), date(2026, 10, 1), unpaid_seeding=False)
+    assert [e["period"] for e in events] == ["07/2026", "08/2026", "09/2026"]
+
+
+def test_the_unpaid_seeding_does_not_silence_a_paid_history_period(rec) -> None:
+    bills = [_paid(2026, 7, 90.0), _unpaid(2026, 9, 90.0)]
+    events, _ = _plan_unpaid(rec, bills, _seen("2026-06-1"), date(2026, 10, 1), unpaid_seeding=True)
+    assert [e["period"] for e in events] == ["07/2026", "09/2026"]
+
+
+def test_only_periods_with_a_fresh_source_can_be_announced_or_updated(rec) -> None:
+    bills = [_paid(2026, 8, 93.0), _unpaid(2026, 9, 90.0)]
+    events, state = _plan_unpaid(rec, bills, _seen("2026-08-1", status="mismatch", first_seen="2026-09-30"), date(2026, 10, 1), fresh_keys={"2026-08-1"})
+    assert [(e["period"], e["reason"]) for e in events] == [("08/2026", "update")]
+    assert "2026-09-1" not in state, "a cached copy never creates a period"
+    events, state = _plan_unpaid(rec, bills, state, date(2026, 10, 1), fresh_keys={"2026-08-1", "2026-09-1"})
+    assert [(e["period"], e["reason"]) for e in events] == [("09/2026", "new")]
+
+
+def test_a_period_without_a_fresh_source_is_not_forgotten_when_the_state_is_full(rec) -> None:
+    keys = {f"{2020 + i // 12}-{i % 12 + 1:02d}-1": _seen("2026-01-1")["2026-01-1"] for i in range(40)}
+    bills = [_unpaid(2020, 1, 90.0)]
+    periods, results = _results(rec, bills, {})
+    _, state = rec.plan_events("entry-1", CODE, "Nhà", periods, results, keys, date(2026, 10, 1), 1.0, fresh_keys=set())
+    assert "2020-01-1" in state

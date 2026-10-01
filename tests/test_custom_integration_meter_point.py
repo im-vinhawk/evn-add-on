@@ -192,7 +192,8 @@ def test_bills_accept_legacy_bill_envelopes(api_module, payload) -> None:
 
     assert asyncio.run(client.async_bills("PB000001")) == [
         {"period": "Tháng 8/2026", "total_kwh": 42.5, "total_amount": 123456,
-         "is_paid": True, "issue_date": "",
+         "payment_status": "unknown", "is_paid": None, "payment_checked": True, "due_date": "",
+         "amount_owed": None, "paid_on": "", "bill_source": "history", "issue_date": "",
          "KY": None, "THANG": 8, "NAM": 2026, "period_start": "", "period_end": "",
          "calculated_amount": None},
     ]

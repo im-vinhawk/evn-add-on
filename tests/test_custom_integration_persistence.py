@@ -217,8 +217,12 @@ def _bill_client(api, readings):
     async def bills_with_source(code):
         return await bills(code), True
 
+    async def unpaid_with_source(_code):
+        return [], True
+
     return types.SimpleNamespace(
         async_overview=overview, async_bills=bills, async_bills_with_source=bills_with_source,
+        async_unpaid_bills_with_source=unpaid_with_source,
         async_monthly_readings=monthly_readings, last_shapes={}, linked_customer_meter_points={},
         history_fetched_at=lambda _code: "", cached_history=lambda _code: None,
     )
@@ -247,9 +251,13 @@ def test_update_keeps_bills_when_readings_fail(modules) -> None:
 class _TwoCodeClient:
     """Stub client for two codes; a code in `failing_overview` fails its live call only."""
 
-    def __init__(self, bills_by_code, stamps, failing_overview=(), readings_by_code=None, cached_bills=()):
+    def __init__(
+        self, bills_by_code, stamps, failing_overview=(), readings_by_code=None, cached_bills=(),
+        unpaid_by_code=None, cached_unpaid=(), failing_unpaid=(),
+    ):
         self.bills_by_code, self.stamps, self.failing_overview = bills_by_code, stamps, set(failing_overview)
         self.cached_bills = set(cached_bills)
+        self.unpaid_by_code, self.cached_unpaid, self.failing_unpaid = unpaid_by_code or {}, set(cached_unpaid), set(failing_unpaid)
         self.readings_by_code = readings_by_code or {}
         self.last_shapes, self.linked_customer_meter_points = {}, {}
         self.bills_calls: list[str] = []
@@ -265,6 +273,11 @@ class _TwoCodeClient:
 
     async def async_bills_with_source(self, code):
         return await self.async_bills(code), code not in self.cached_bills
+
+    async def async_unpaid_bills_with_source(self, code):
+        if code in self.failing_unpaid:
+            raise self.api.EvnApiError("HTTP 400", status=400)
+        return [dict(bill) for bill in self.unpaid_by_code.get(code, [])], code not in self.cached_unpaid
 
     async def async_monthly_readings(self, code):
         return list(self.readings_by_code.get(code, []))
@@ -384,8 +397,12 @@ def test_update_prices_the_current_month_from_the_code_own_bills(modules) -> Non
     async def bills_with_source(code):
         return await bills(code), True
 
+    async def unpaid_with_source(_code):
+        return [], True
+
     client = types.SimpleNamespace(
         async_overview=overview, async_bills=bills, async_bills_with_source=bills_with_source,
+        async_unpaid_bills_with_source=unpaid_with_source,
         async_monthly_readings=readings, last_shapes={}, linked_customer_meter_points={},
         history_fetched_at=lambda _code: "", cached_history=lambda _code: None,
     )
@@ -642,3 +659,98 @@ def test_the_options_flow_offers_the_threshold_with_a_default_and_a_range(module
     assert result["step_id"] == "aliases" and flow._pending["reconcile_threshold_kwh"] == 1.5
     saved = asyncio.run(flow.async_step_aliases({}))
     assert saved["data"]["reconcile_threshold_kwh"] == 1.5
+
+
+# ------------------------------------------------------------------ unpaid bills in the update
+
+def _bill_row(month, amount, *, status="paid", source="history", owed=None, due="", kwh=None):
+    return {
+        "period": f"Tháng {month}/2026", "total_kwh": kwh, "total_amount": amount, "payment_status": status,
+        "is_paid": {"paid": True, "unpaid": False}.get(status), "payment_checked": True, "due_date": due,
+        "amount_owed": owed, "paid_on": "", "bill_source": source, "issue_date": "", "KY": 1, "THANG": month, "NAM": 2026,
+        "period_start": "", "period_end": "", "calculated_amount": None,
+    }
+
+
+def _unpaid_data(modules, client):
+    instance = _two_code_coordinator(modules, client)
+    instance._history = _BillHistory()
+    instance.data = None
+    return asyncio.run(instance._async_update_data()), instance
+
+
+def test_the_unpaid_list_is_merged_into_the_bills_and_summarised_per_code_and_in_total(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_bill_row(8, 240000)], "PB000002": [_bill_row(8, 100)]}, {},
+        unpaid_by_code={
+            "PB000001": [_bill_row(9, 250000, status="unpaid", source="unpaid", owed=250000, due="2026-10-15", kwh=100.0)],
+            "PB000002": [_bill_row(9, 90, status="unpaid", source="unpaid", owed=60, due="2026-10-09", kwh=30.0)],
+        },
+    )
+    data, _ = _unpaid_data(modules, client)
+    first = data["meters"]["PB000001"]
+    assert [(b["THANG"], b["payment_status"]) for b in first["bills"]] == [(9, "unpaid"), (8, "paid")]
+    assert (first["unpaid_count"], first["unpaid_amount"], first["next_due_date"], first["unpaid_fresh"]) == (1, 250000, "2026-10-15", True)
+    aggregate = data["aggregate"]
+    assert (aggregate["unpaid_count"], aggregate["unpaid_amount"], aggregate["next_due_date"]) == (2, 250060, "2026-10-09")
+    assert aggregate["bills"][0]["payment_status"] == "unpaid" and aggregate["bills"][0]["amount_owed"] == 250060
+    assert data["partial_errors"] == {}
+
+
+def test_the_history_hears_whether_the_unpaid_list_is_fresh(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_bill_row(8, 240000)], "PB000002": [_bill_row(8, 100)]}, {}, cached_unpaid=["PB000002"],
+        unpaid_by_code={"PB000002": [_bill_row(9, 90, status="unpaid", source="unpaid", owed=60, due="2026-10-09")]},
+    )
+    _, instance = _unpaid_data(modules, client)
+    sent = instance._history.calls[0]["meters"]
+    assert (sent["PB000001"]["unpaid_fresh"], sent["PB000002"]["unpaid_fresh"]) == (True, False)
+
+
+def test_an_unpaid_failure_keeps_the_code_and_marks_the_payment_state_unknown(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_bill_row(8, 240000)], "PB000002": [_bill_row(8, 100)]}, {}, failing_unpaid=["PB000002"],
+    )
+    data, _ = _unpaid_data(modules, client)
+    assert data["partial_errors"] == {"PB000002": "unpaid_bills"}
+    second = data["meters"]["PB000002"]
+    assert second["bills"][0]["total_amount"] == 100 and second["current_month_consumption"] == 1.0
+    assert (second["unpaid_count"], second["unpaid_amount"], second["unpaid_fresh"]) == (None, None, False)
+    assert data["aggregate"]["unpaid_amount"] is None, "a partial total would look complete"
+    assert data["aggregate"]["is_partial"] is True and data["aggregate"]["successful_customer_codes"] == ["PB000001", "PB000002"]
+
+
+def test_a_payment_between_polls_wins_over_a_cached_unpaid_list(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_bill_row(9, 250000, kwh=100.0)], "PB000002": [_bill_row(8, 100)]}, {}, cached_unpaid=["PB000001"],
+        unpaid_by_code={"PB000001": [_bill_row(9, 250000, status="unpaid", source="unpaid", owed=250000, due="2026-10-15")]},
+    )
+    data, _ = _unpaid_data(modules, client)
+    bill = data["meters"]["PB000001"]["bills"][0]
+    assert (bill["payment_status"], bill["bill_source"]) == ("paid", "history")
+    assert data["meters"]["PB000001"]["unpaid_count"] == 0
+
+
+def test_a_cached_unpaid_list_nothing_contradicts_stays_unpaid_but_unchecked(modules) -> None:
+    client = _TwoCodeClient(
+        {"PB000001": [_bill_row(8, 240000)], "PB000002": [_bill_row(8, 100)]}, {}, cached_unpaid=["PB000001"],
+        unpaid_by_code={"PB000001": [_bill_row(9, 250000, status="unpaid", source="unpaid", owed=250000, due="2026-10-15")]},
+    )
+    data, _ = _unpaid_data(modules, client)
+    bill = data["meters"]["PB000001"]["bills"][0]
+    assert (bill["payment_status"], bill["payment_checked"]) == ("unpaid", False)
+
+
+def test_an_expired_session_during_the_unpaid_read_asks_for_reauthentication(modules) -> None:
+    _, api, _, _ = modules
+    client = _TwoCodeClient({"PB000001": [_bill_row(8, 240000)], "PB000002": [_bill_row(8, 100)]}, {})
+
+    async def boom(_code):
+        raise api.EvnAuthenticationError("expired")
+
+    client.async_unpaid_bills_with_source = boom
+    instance = _two_code_coordinator(modules, client)
+    instance._history = _BillHistory()
+    instance.data = None
+    with pytest.raises(RuntimeError):
+        asyncio.run(instance._async_update_data())

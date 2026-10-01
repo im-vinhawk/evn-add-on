@@ -10,12 +10,14 @@ from __future__ import annotations
 import calendar
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
+import logging
 import re
 from typing import Any, Iterable, Mapping, Sequence
 
 from .tariff import TARIFF_ROWS, TIER_WIDTHS, TariffRow
 
 _PERIOD_RE = re.compile(r"(?:Tháng\s*)?(\d{1,2})\s*/\s*(\d{4})", re.IGNORECASE)
+_LOGGER = logging.getLogger(__name__)
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
@@ -144,6 +146,13 @@ def _sum_known_yesterday(values: list[Mapping[str, Any]]) -> float | None:
     return round(sum(as_float(item.get("yesterday_consumption")) for item in values), 2)
 
 
+def _sum_known(values: list[Mapping[str, Any]], field: str) -> int | None:
+    """A total is unknown as soon as one code's figure is: a partial sum would look complete."""
+    if not values or any(item.get(field) is None for item in values):
+        return None
+    return sum(int(item[field]) for item in values)
+
+
 def aggregate_overviews(overviews: Iterable[Mapping[str, Any]], codes: list[str]) -> dict[str, Any]:
     """Sum overview fields after each code's tariff has been calculated."""
     values = list(overviews)
@@ -162,6 +171,10 @@ def aggregate_overviews(overviews: Iterable[Mapping[str, Any]], codes: list[str]
         "estimate_method": (
             "effective_price" if any(item.get("estimate_method") == "effective_price" for item in values) else "tiered"
         ),
+        "unpaid_count": _sum_known(values, "unpaid_count"),
+        "unpaid_amount": _sum_known(values, "unpaid_amount"),
+        "unpaid_fresh": bool(values) and all(item.get("unpaid_fresh") is True for item in values),
+        "next_due_date": min((str(item["next_due_date"]) for item in values if item.get("next_due_date")), default=None),
     }
 
 
@@ -233,11 +246,37 @@ def _parse_iso_date(value: str) -> date | None:
         return None
 
 
-def normalize_bills(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+_PAYMENT_STATUS = {"DATT": "paid", "CHUATT": "unpaid"}
+_IS_PAID = {"paid": True, "unpaid": False}
+
+
+def _payment_status(row: Mapping[str, Any]) -> str:
+    """paid / unpaid / unknown from EVN's status code; a payment date proves paid, nothing else is guessed."""
+    code = _PAYMENT_STATUS.get(str(row.get("TTRANG_TTOAN") or "").strip().upper())
+    if code:
+        return code
+    if row.get("NGAY_TTOAN"):
+        return "paid"
+    legacy = row.get("isPaid")
+    if isinstance(legacy, bool):
+        return "paid" if legacy else "unpaid"
+    return "unknown"
+
+
+def _iso_or_empty(value: Any) -> str:
+    """An ISO date from EVN's date text, or "" when it is missing or unusable."""
+    iso = to_iso_date(value)
+    return iso if _DATE_ISO.match(iso) and _parse_iso_date(iso) is not None else ""
+
+
+def normalize_bills(rows: Iterable[Mapping[str, Any]], source: str = "history") -> list[dict[str, Any]]:
     """Normalize official bills; their amount is never re-priced.
 
-    EVN's bill rows carry no real kWh (DIEN_TTHU is always 0 there), so kWh stays
-    unknown (None) until attach_readings joins the monthly meter readings.
+    The paid history carries no real kWh (DIEN_TTHU is 0 there), so kWh stays
+    unknown (None) until attach_readings joins the monthly meter readings; a
+    bill that still awaits payment carries its own.  `source` says which EVN list
+    the rows came from ("history" or "unpaid").  Names, addresses and invoice ids
+    are never copied.
     """
     result = []
     for row in rows:
@@ -247,20 +286,84 @@ def normalize_bills(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             period = str(row.get("period") or "")
         kwh = as_float(row.get("DIEN_TTHU", row.get("totalKwh", 0)))
+        status = _payment_status(row)
         result.append({
             "period": period,
             "total_kwh": kwh if kwh > 0 else None,
             "total_amount": round(as_float(row.get("TONG_TIEN", row.get("totalAmount", 0)))),
-            "is_paid": bool(row.get("isPaid", True)),
+            "payment_status": status,
+            "is_paid": _IS_PAID.get(status),
+            "payment_checked": True,
+            "due_date": _iso_or_empty(row.get("HAN_TTOAN")),
+            "amount_owed": _as_int(row.get("TONG_NO")),
+            "paid_on": _iso_or_empty(row.get("NGAY_TTOAN")),
+            "bill_source": source,
             "issue_date": row.get("NGAY_TTOAN", row.get("issueDate", "")),
             "KY": _as_int(row.get("KY", row.get("ky"))),
             "THANG": _as_int(month),
             "NAM": _as_int(year),
-            "period_start": "",
-            "period_end": "",
+            "period_start": _iso_or_empty(row.get("NGAY_DKY")),
+            "period_end": _iso_or_empty(row.get("NGAY_CKY")),
             "calculated_amount": None,
         })
     return result
+
+
+def bill_period_parts(bill: Mapping[str, Any]) -> tuple[int, int, int] | None:
+    """(year, month, ky) of a bill row, or None when it lacks a usable billing period."""
+    parts = tuple(bill.get(name) for name in ("NAM", "THANG", "KY"))
+    if any(not isinstance(part, int) or isinstance(part, bool) for part in parts) or not 1 <= parts[1] <= 12:
+        return None
+    return parts  # type: ignore[return-value]
+
+
+def merge_bill_sources(
+    history: Iterable[Mapping[str, Any]], unpaid: Iterable[Mapping[str, Any]], *, unpaid_fresh: bool,
+) -> list[dict[str, Any]]:
+    """One list from the paid history and the unpaid list, keyed by (year, month, period number).
+
+    A period of a fresh unpaid list stands for itself.  Paying cannot be undone, so a
+    paid history row beats a cached unpaid row; a cached unpaid row nothing contradicts
+    stays unpaid but is marked `payment_checked: False`.  Rows without a usable period
+    are listed last, tagged by the reconciliation, and never merged.
+    """
+    by_key: dict[tuple[int, int, int], dict[str, list[dict[str, Any]]]] = {}
+    unkeyed: list[dict[str, Any]] = []
+    for label, rows in (("history", history), ("unpaid", unpaid)):
+        for row in rows:
+            copy = dict(row)
+            key = bill_period_parts(copy)
+            if key is None:
+                unkeyed.append(copy)
+            else:
+                by_key.setdefault(key, {"history": [], "unpaid": []})[label].append(copy)
+    merged: list[dict[str, Any]] = []
+    for key in sorted(by_key, reverse=True):
+        paid_rows, unpaid_rows = by_key[key]["history"], by_key[key]["unpaid"]
+        checked = True
+        if unpaid_rows and (unpaid_fresh or not any(row.get("payment_status") == "paid" for row in paid_rows)):
+            chosen, checked = unpaid_rows, unpaid_fresh
+        else:
+            chosen = paid_rows or unpaid_rows
+        merged.extend({**row, "payment_checked": checked} for row in chosen)
+    if unkeyed:
+        _LOGGER.debug("EVN listed %d bill(s) without a billing period; they are shown but not matched", len(unkeyed))
+    return merged + unkeyed
+
+
+def unpaid_summary(bills: Iterable[Mapping[str, Any]], *, loaded: bool) -> dict[str, Any]:
+    """Count, amount still owed and earliest due date of the unpaid bills; unknown until the unpaid list loaded."""
+    if not loaded:
+        return {"unpaid_count": None, "unpaid_amount": None, "next_due_date": None}
+    unpaid = [bill for bill in bills if bill.get("payment_status") == "unpaid"]
+    owed = sum(
+        bill["amount_owed"] if bill.get("amount_owed") is not None else int(as_float(bill.get("total_amount")))
+        for bill in unpaid
+    )
+    return {
+        "unpaid_count": len(unpaid), "unpaid_amount": owed,
+        "next_due_date": min((str(bill["due_date"]) for bill in unpaid if bill.get("due_date")), default=None),
+    }
 
 
 def normalize_readings(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -316,6 +419,29 @@ def attach_readings(
     return result
 
 
+_PAYMENT_WORST_FIRST = ("unpaid", "unknown", "paid")
+
+
+def bill_payment_status(bill: Mapping[str, Any]) -> str:
+    """A bill's payment state; a row from before payment states exist is read from its is_paid flag."""
+    status = bill.get("payment_status")
+    if status in _PAYMENT_WORST_FIRST:
+        return str(status)
+    return {True: "paid", False: "unpaid"}.get(bill.get("is_paid"), "unknown")
+
+
+def _add_payment(bucket: dict[str, Any], bill: Mapping[str, Any]) -> None:
+    """Fold one code's payment state into the period's: the worst state wins, what is owed adds up."""
+    status = bill_payment_status(bill)
+    if _PAYMENT_WORST_FIRST.index(status) < _PAYMENT_WORST_FIRST.index(bucket["payment_status"]):
+        bucket["payment_status"] = status
+    if bill.get("amount_owed") is not None:
+        bucket["amount_owed"] = (bucket["amount_owed"] or 0) + int(bill["amount_owed"])
+    if bill.get("due_date"):
+        bucket["due_date"] = min(bucket["due_date"] or str(bill["due_date"]), str(bill["due_date"]))
+    bucket["payment_checked"] = bucket["payment_checked"] and bill.get("payment_checked", True) is not False
+
+
 def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[dict[str, Any]]:
     """Join official bills by billing period and add kWh and VND independently.
 
@@ -332,7 +458,8 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
         for bill in rows:
             period = str(bill.get("period") or "")
             bucket = buckets.setdefault(period, {
-                "period": period, "total_kwh": 0.0, "total_amount": 0, "is_paid": True,
+                "period": period, "total_kwh": 0.0, "total_amount": 0, "payment_status": "paid",
+                "payment_checked": True, "due_date": "", "amount_owed": None,
                 "period_start": "", "period_end": "", "calculated_amount": 0,
             })
             takers.setdefault(period, set()).add(index)
@@ -347,7 +474,7 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
                 kwh_known.setdefault(period, True)
                 bucket["total_kwh"] = round(bucket["total_kwh"] + as_float(bill.get("total_kwh")), 2)
             bucket["total_amount"] += int(as_float(bill.get("total_amount")))
-            bucket["is_paid"] = bucket["is_paid"] and bool(bill.get("is_paid"))
+            _add_payment(bucket, bill)
             calculated = bill.get("calculated_amount")
             bucket["calculated_amount"] = (
                 None if calculated is None or bucket["calculated_amount"] is None
@@ -358,6 +485,7 @@ def aggregate_bills(bill_series: Iterable[Iterable[Mapping[str, Any]]]) -> list[
             if bill.get("period_end"):
                 bucket["period_end"] = max(bucket["period_end"], bill["period_end"])
     for period, bucket in buckets.items():
+        bucket["is_paid"] = _IS_PAID.get(bucket["payment_status"])
         if not kwh_known[period]:
             bucket["total_kwh"] = None
         match = _PERIOD_RE.search(period)

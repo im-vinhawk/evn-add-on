@@ -44,6 +44,8 @@ PREVIOUS_MONTH_TAIL_DAYS = 10
 PREVIOUS_MONTH_TAIL_RETRY = timedelta(hours=3)
 # Monthly readings change at most daily; one fetch per code serves several refreshes.
 MONTHLY_READINGS_CACHE_SECONDS = 6 * 3600
+# The list of bills awaiting payment is asked for at most this often per code (and once after start).
+UNPAID_REFRESH = timedelta(hours=2)
 # Historical daily backfill: how far back, how many months one refresh may fetch (for one code only),
 # and the pause before each EVN request so the backfill never hammers the service.
 MAX_BACKFILL_MONTHS = 36

@@ -9,9 +9,9 @@ from __future__ import annotations
 import calendar
 from datetime import date, timedelta
 import hashlib
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Collection, Iterable, Mapping, Sequence
 
-from .calculation import as_float
+from .calculation import bill_payment_status, as_float, bill_period_parts
 from .const import BILL_DAY_OFFSET, BILL_UPDATE_DAYS, MAX_BILL_KEYS
 from .models import contains_customer_code
 
@@ -51,18 +51,33 @@ def safe_label(code: str, nickname: str | None) -> str:
     return f"…{code[-4:]}"
 
 
-def _key_of(bill: Mapping[str, Any]) -> str | None:
-    year, month, ky = _int_or_none(bill.get("NAM")), _int_or_none(bill.get("THANG")), _int_or_none(bill.get("KY"))
-    if year is None or month is None or ky is None or not 1 <= month <= 12:
-        return None
-    return period_key(year, month, ky)
+def period_key_of(bill: Mapping[str, Any]) -> str | None:
+    parts = bill_period_parts(bill)
+    return None if parts is None else period_key(*parts)
+
+
+def _owed(bill: Mapping[str, Any]) -> int | None:
+    return _int_or_none(bill.get("amount_owed"))
+
+
+def _fold_payment(period: dict[str, Any], bill: Mapping[str, Any]) -> None:
+    """Add an invoice to a period's payment state: unpaid beats unknown beats paid, what is owed adds up."""
+    order = ("unpaid", "unknown", "paid")
+    status = bill_payment_status(bill)
+    if order.index(status) < order.index(period["payment_status"]):
+        period["payment_status"] = status
+    if _owed(bill) is not None:
+        period["amount_owed"] = (period["amount_owed"] or 0) + _owed(bill)
+    if bill.get("due_date"):
+        period["due_date"] = min(period["due_date"] or str(bill["due_date"]), str(bill["due_date"]))
+    period["from_unpaid"] = period["from_unpaid"] or bill.get("bill_source") == "unpaid"
 
 
 def group_periods(bills: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Billing periods, oldest first. Kwh, dates and calculated amount come from the first invoice; amounts add up."""
     periods: dict[str, dict[str, Any]] = {}
     for bill in bills:
-        key = _key_of(bill)
+        key = period_key_of(bill)
         if key is None:
             continue
         amount = int(as_float(bill.get("total_amount")))
@@ -75,9 +90,12 @@ def group_periods(bills: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "period_start": str(bill.get("period_start") or ""), "period_end": str(bill.get("period_end") or ""),
                 "bill_kwh": None if kwh is None else float(kwh),
                 "total_amount": amount, "calculated_amount": bill.get("calculated_amount"),
+                "payment_status": "paid", "due_date": "", "amount_owed": None, "from_unpaid": False,
             }
+            period = periods[key]
         else:
             period["total_amount"] += amount
+        _fold_payment(period, bill)
     return sorted(periods.values(), key=lambda item: _key_order(item["key"]))
 
 
@@ -172,8 +190,11 @@ def annotate_bills(
         row["year"], row["month"], row["ky"] = _int_or_none(row.get("NAM")), _int_or_none(row.get("THANG")), _int_or_none(row.get("KY"))
         for field in _ROW_FIELDS:
             row[field] = None
-        key = _key_of(row)
-        if key is None or key in announced:
+        key = period_key_of(row)
+        if key is None:
+            row["reconcile_status"] = "no_period"
+            continue
+        if key in announced:
             continue
         announced.add(key)
         result = results.get(key)
@@ -203,6 +224,8 @@ def _event(
         "reason": reason, "compensates_previous": result["compensates_previous"],
         "total_amount": period["total_amount"], "calculated_amount": period["calculated_amount"],
         "threshold_kwh": result["threshold_kwh"],
+        "payment_status": period["payment_status"], "due_date": period["due_date"] or None,
+        "amount_owed": period["amount_owed"],
     }
 
 
@@ -213,13 +236,17 @@ def _month_end(year: int, month: int) -> str:
 def plan_events(
     entry_id: str, code: str, label: str, periods: Sequence[Mapping[str, Any]],
     results: Mapping[str, Mapping[str, Any]], state: Mapping[str, Mapping[str, Any]] | None, today: date,
-    threshold_kwh: float,
+    threshold_kwh: float, *, fresh_keys: Collection[str] | None = None, unpaid_seeding: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Events to fire and the new seen-period state of one code.
 
     `state` None or empty means the code was never seen (an empty first fetch is not a sighting): every period
     is recorded, and only the previous calendar month or later is announced.  Later, an unseen period is `new`; within BILL_UPDATE_DAYS of being first
-    seen, a change of status or amount is one `update`.
+    seen, a change of status or amount is one `update`; paying a bill alone is not one.
+
+    `unpaid_seeding` is the first fresh read of the unpaid list for this code: its periods follow the same
+    quiet rule as a first sighting, while periods of the paid history keep announcing.  `fresh_keys` limits the
+    plan to periods read in this refresh (None: all); the others stay listed but are never announced.
     """
     seeding = not state
     new_state = {key: dict(entry) for key, entry in (state or {}).items()}
@@ -227,13 +254,16 @@ def plan_events(
     events: list[dict[str, Any]] = []
     for period in periods:
         key, result = period["key"], results[period["key"]]
+        if fresh_keys is not None and key not in fresh_keys:
+            continue
         status, amount = result["status"], period["total_amount"]
         # The earlier period of a boundary pair is explained by the later one; it never gets its own notice.
         earlier_of_pair = status == "boundary" and not result["compensates_previous"]
         entry = new_state.get(key)
         if entry is None:
             identity = bill_id(entry_id, code, key)
-            if earlier_of_pair or (seeding and _month_index(period["year"], period["month"]) <= last_quiet):
+            quiet = seeding or (unpaid_seeding and period["from_unpaid"])
+            if earlier_of_pair or (quiet and _month_index(period["year"], period["month"]) <= last_quiet):
                 new_state[key] = {
                     "bill_id": identity, "first_seen": _month_end(period["year"], period["month"]),
                     "status": status, "amount": amount,

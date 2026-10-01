@@ -25,7 +25,7 @@ from .daily_store import (
     record_backfill_month, record_failure,
 )
 from .pricing import PriceModel
-from .reconcile import annotate_bills, plan_events, safe_label
+from .reconcile import annotate_bills, period_key_of, plan_events, safe_label
 from .statistics_import import SeriesSpec, async_import_series, build_series, series_to_clear
 
 _LOGGER = logging.getLogger(__name__)
@@ -150,31 +150,36 @@ class DailyHistory:
     async def _plan_and_save_bill_events(
         self, meters: Mapping[str, Mapping[str, Any]], aliases: Mapping[str, str], threshold_kwh: float,
     ) -> list[dict[str, Any]]:
-        previous = self._data["bills"]
-        planned = copy.deepcopy(previous)
+        previous, previous_seeded = self._data["bills"], self._data["unpaid_seeded"]
+        planned, planned_seeded = copy.deepcopy(previous), dict(previous_seeded)
         today, events = self.today(), []
         for code, overview in meters.items():
-            if overview.get("bills_fresh") is not True:
-                continue
             try:
-                _, periods, results = annotate_bills(overview.get("bills", []), code_days(self._data, code), threshold_kwh)
+                bills = overview.get("bills", [])
+                fresh_keys, unpaid_seen = _fresh_periods(bills, overview)
+                if not fresh_keys:
+                    continue  # a cached copy never announces anything
+                _, periods, results = annotate_bills(bills, code_days(self._data, code), threshold_kwh)
                 if not periods:
                     continue  # nothing was seen: an empty list must not mark the code as seeded
+                unpaid_seeding = unpaid_seen and not planned_seeded.get(code)
                 fired, planned[code] = plan_events(
                     self._entry_id, code, safe_label(code, aliases.get(code)), periods, results, planned.get(code),
-                    today, threshold_kwh,
+                    today, threshold_kwh, fresh_keys=fresh_keys, unpaid_seeding=unpaid_seeding,
                 )
+                if unpaid_seen:
+                    planned_seeded[code] = True
             except Exception as err:  # noqa: BLE001 - one code's bad rows must not silence the others
                 _LOGGER.debug("EVN bill events of one code skipped (%s)", type(err).__name__)
                 continue
             events.extend(fired)
-        if planned == previous:
+        if planned == previous and planned_seeded == previous_seeded:
             return []
-        self._data["bills"] = planned
+        self._data["bills"], self._data["unpaid_seeded"] = planned, planned_seeded
         try:
             await self._store.async_save(self._data)
         except Exception as err:  # noqa: BLE001 - nothing is announced that could not be remembered
-            self._data["bills"] = previous
+            self._data["bills"], self._data["unpaid_seeded"] = previous, previous_seeded
             _LOGGER.debug("EVN seen bills could not be saved (%s)", type(err).__name__)
             return []
         self._dirty = False
@@ -276,6 +281,27 @@ class DailyHistory:
                 "start": spec.rows[0]["start"].date().isoformat(), "count": len(spec.rows), "scope": spec.scope,
             }
         self._dirty = True
+
+
+def _fresh_periods(bills: Sequence[Any], overview: Mapping[str, Any]) -> tuple[set[str], bool]:
+    """Period keys whose source was read in this refresh, and whether a fresh unpaid list brought any bill.
+
+    A row of the paid history is fresh with `bills_fresh`, a row of the unpaid list with `unpaid_fresh`;
+    a row that says nothing about its source is a history row.
+    """
+    history_fresh, unpaid_fresh = overview.get("bills_fresh") is True, overview.get("unpaid_fresh") is True
+    keys, unpaid_seen = set(), False
+    for bill in bills:
+        if not isinstance(bill, Mapping):
+            continue
+        from_unpaid = bill.get("bill_source") == "unpaid"
+        if not (unpaid_fresh if from_unpaid else history_fresh):
+            continue
+        key = period_key_of(bill)
+        if key is not None:
+            keys.add(key)
+            unpaid_seen = unpaid_seen or from_unpaid
+    return keys, unpaid_seen
 
 
 def _signature(spec: SeriesSpec) -> tuple:

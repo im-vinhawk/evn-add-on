@@ -21,6 +21,7 @@ from .calculation import (
 )
 from .const import (
     DAILY_HISTORY_DAYS, DEFAULT_TIMEOUT, MONTHLY_READINGS_CACHE_SECONDS, NATIONAL_BASE_URL, REGIONAL_GATEWAYS,
+    UNPAID_REFRESH,
 )
 from .models import (
     SessionState,
@@ -139,6 +140,8 @@ class EvnClient:
         self._readings_cache: dict[str, tuple[float, tuple[int, int], list[dict[str, Any]], datetime]] = {}
         # code -> (wall-clock fetched_at, rows) of the last successful bills fetch.
         self._bills_cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = {}
+        # code -> (monotonic fetched_at, rows) of the last successful unpaid-bills fetch.
+        self._unpaid_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
     @staticmethod
     def new_device_id() -> str:
@@ -517,6 +520,43 @@ class EvnClient:
         )
         self._record_shape("bills", rows)
         return normalize_bills(row for row in rows if isinstance(row, dict))
+
+    async def async_unpaid_bills(self, customer_code: str) -> list[dict[str, Any]]:
+        """Bills awaiting payment; see `async_unpaid_bills_with_source`."""
+        return (await self.async_unpaid_bills_with_source(customer_code))[0]
+
+    async def async_unpaid_bills_with_source(self, customer_code: str) -> tuple[list[dict[str, Any]], bool]:
+        """The unpaid bills and whether they were read within UNPAID_REFRESH (False: an older copy after a failure).
+
+        EVN is asked at most once per UNPAID_REFRESH per code; in between, and when a fetch fails,
+        the last good copy stands in.  It raises only for a code that was never read.
+        """
+        key = customer_code.strip().upper()
+        cached = self._unpaid_cache.get(key)
+        if cached is not None and self._clock() - cached[0] < UNPAID_REFRESH.total_seconds():
+            return [dict(row) for row in cached[1]], True
+        try:
+            bills = await self._async_fetch_unpaid_bills(key)
+        except EvnApiError:
+            if cached is None:
+                raise
+            _LOGGER.debug("EVN unpaid bills unavailable; showing the last successful fetch")
+            return [dict(row) for row in cached[1]], False
+        self._unpaid_cache[key] = (self._clock(), [dict(row) for row in bills])
+        return bills, True
+
+    async def _async_fetch_unpaid_bills(self, customer_code: str) -> list[dict[str, Any]]:
+        await self._async_switch_customer(customer_code)
+        payload = await self._async_request(
+            "POST", self._regional_url(customer_code, "tracuu/hoadon-thanhtoan"), {"MA_KHANG": customer_code}
+        )
+        rows = _extract_rows(
+            payload,
+            ("data", "danhSachHoaDon", "bills", "items"),
+            (("THANG", "thang"), ("NAM", "nam"), ("TONG_NO", "TONG_TIEN")),
+        )
+        self._record_shape("unpaid_bills", rows)
+        return normalize_bills((row for row in rows if isinstance(row, dict)), source="unpaid")
 
     async def async_monthly_readings(self, customer_code: str) -> list[dict[str, Any]]:
         """Monthly meter readings since January of last year; they carry each bill's real kWh.

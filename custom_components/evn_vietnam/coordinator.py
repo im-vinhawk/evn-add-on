@@ -15,7 +15,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import EvnApiError, EvnAuthenticationError, EvnClient, EvnCustomerSwitchError, EvnMeterPointError
-from .calculation import aggregate_selected_overviews, attach_readings
+from .calculation import aggregate_selected_overviews, attach_readings, merge_bill_sources, unpaid_summary
 from .const import (
     CONF_ACCESS_TOKEN, CONF_CURRENT_CUSTOMER_CODE, CONF_CUSTOMER_CODES, CONF_DEVICE_ID, CONF_LINKED_CUSTOMERS, CONF_PRIMARY_CUSTOMER_CODE,
     CONF_REFRESH_TOKEN, DEFAULT_RECONCILE_THRESHOLD_KWH, DEFAULT_SCAN_INTERVAL, DOMAIN, EVENT_BILL,
@@ -115,8 +115,11 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for code in codes:
                 try:
                     overview = await self._client.async_overview(code)
-                    bills, overview["bills_fresh"] = await self._client.async_bills_with_source(code)
+                    history_bills, overview["bills_fresh"] = await self._client.async_bills_with_source(code)
+                    unpaid, overview["unpaid_fresh"], unpaid_loaded = await self._async_unpaid_or_empty(code, partial_errors)
+                    bills = merge_bill_sources(history_bills, unpaid, unpaid_fresh=overview["unpaid_fresh"])
                     overview["bills"] = attach_readings(bills, await self._async_readings_or_empty(code))
+                    overview.update(unpaid_summary(overview["bills"], loaded=unpaid_loaded))
                     # The legacy monthly history is derived from official bills.
                     overview["monthly_history"] = overview["bills"]
                     overview["history_fetched_at"] = self._client.history_fetched_at(code)
@@ -223,6 +226,24 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "bills": self._reconciled(code, attach_readings(bills, readings)), "history_fetched_at": fetched_at,
                 }
         return history
+
+    async def _async_unpaid_or_empty(
+        self, code: str, partial_errors: dict[str, str]
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
+        """(unpaid bills, read within the cadence, ever loaded).
+
+        A failure leaves the code's other data alone and its payment state unknown: the bills are then
+        the paid history only, never "paid" by default.
+        """
+        try:
+            rows, fresh = await self._client.async_unpaid_bills_with_source(code)
+        except EvnAuthenticationError:
+            raise
+        except EvnApiError:
+            _LOGGER.debug("EVN unpaid bills unavailable; the payment state stays unknown")
+            partial_errors[code] = "unpaid_bills"
+            return [], False, False
+        return rows, fresh, True
 
     async def _async_readings_or_empty(self, code: str) -> list[dict[str, Any]]:
         """Bills stay useful without their kWh, so a readings failure only leaves kWh unknown."""
