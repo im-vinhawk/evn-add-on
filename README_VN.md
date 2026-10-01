@@ -12,10 +12,11 @@ Hướng dẫn HACS/GitHub bằng tiếng Anh: [README.md](README.md).
 - Sensor từng công tơ và sensor tổng hợp tùy chọn.
 - Lưu username và mật khẩu trong Config Entry của Home Assistant; refresh token, đăng nhập lại im lặng và keepalive phiên 8 phút.
 - Thẻ Lovelace tự đăng ký qua `extra_module_url` và dashboard panel EVN Energy.
-- Biểu đồ 7, 14, 30 ngày có một cột cho mỗi ngày lịch, kể cả ngày EVN chưa trả dữ liệu.
+- Biểu đồ 7, 14, 30 ngày kết thúc ở hôm nay, có một cột cho mỗi ngày lịch, kể cả ngày EVN chưa trả dữ liệu, và ô chọn tháng (tháng hiện tại cùng 12 tháng trước).
 - Biệt danh tùy chọn cho từng mã khách hàng, hiển thị trên thẻ.
 - Điện năng và chi phí ước tính theo ngày được lưu thành thống kê dài hạn cho bảng Năng lượng, cùng ô so sánh ngày với cùng ngày tháng trước trên thẻ.
 - Hóa đơn và chỉ số công tơ giữ bản tốt gần nhất khi một yêu cầu tới EVN thất bại.
+- kWh của mỗi hóa đơn được đối chiếu với kWh theo ngày đã thu thập, và mỗi kỳ hóa đơn mới phát sự kiện `evn_vietnam_bill`.
 
 ## Yêu cầu
 
@@ -65,7 +66,7 @@ Sensor `current_month_consumption` ghi các id này trong thuộc tính `statist
 
 Cách lịch sử được bổ sung:
 
-- Các ngày của tháng hiện tại được gộp vào mỗi lần làm mới. Trong năm ngày đầu của tháng, tháng trước được lấy lại mỗi ngày một lần vì EVN vẫn có thể hiệu chỉnh.
+- Các ngày của tháng hiện tại được gộp vào mỗi lần làm mới. Trong năm ngày đầu của tháng, tháng trước được lấy lại mỗi ngày một lần vì EVN vẫn có thể hiệu chỉnh. Khi ngày cuối của tháng trước còn thiếu hoặc vẫn là số 0 tạm thời, tháng trước còn được lấy lại ba giờ một lần cho tới ngày 10, để một ngày EVN báo muộn không bị mất.
 - Sau khi khởi động lại, các ngày cũ hơn được lấy trong các lần làm mới thường lệ, có thể làm lần đó chậm thêm tới khoảng một phút: mỗi lần làm mới chỉ một mã khách hàng, tối đa sáu tháng, nghỉ ít nhất hai giây trước mỗi yêu cầu. Lùi tối đa 36 tháng, dừng khi gặp hai tháng trống liên tiếp, tạm dừng khi EVN báo bất kỳ lỗi nào rồi tiếp tục ở lần làm mới sau; mã có yêu cầu bị lỗi được xếp sau các mã khác. Lần làm mới đầu tiên sau khi khởi động không bổ sung lịch sử và không xem lại tháng trước, nên quá trình khởi động không bị chậm.
 - Diagnostics liệt kê ngày cũ nhất đã lưu của từng mã (mã đã được che) và việc bổ sung đã xong hay chưa.
 
@@ -85,6 +86,10 @@ Sao chép [docs/evn-dashboard.example.yaml](docs/evn-dashboard.example.yaml) và
 Integration tự đăng ký `/evn_vietnam/evn-vietnam-energy-card.js` qua `extra_module_url`. Với dashboard storage mode mặc định, `lovelace.resources` trong `configuration.yaml` bị bỏ qua; không thêm YAML resource trùng lặp để xử lý lỗi tải card.
 
 Card đọc `daily_history` từ month sensor đang chọn. Nếu biểu đồ trống, hãy kiểm tra sensor đó trước.
+
+`daily_history`, `today_consumption` và `yesterday_consumption` lấy từ 31 ngày gần nhất trong kho kWh theo ngày cộng với các dòng của lần làm mới hiện tại, nên ngày mùng 1 vẫn thấy tháng trước. `yesterday_consumption` là không rõ (`unknown` trong Home Assistant, `—` trên thẻ) khi EVN chưa báo ngày đó; không bao giờ là số 0 bịa ra, và "hôm qua" của sensor tổng hợp không rõ khi bất kỳ mã nào được chọn không rõ.
+
+Biểu đồ mặc định là 30 ngày gần nhất kết thúc ở hôm nay theo lịch của Home Assistant; ngày EVN chưa báo được vẽ là khoảng trống. Ô chọn phía trên biểu đồ chuyển sang một tháng lịch (tháng hiện tại và 12 tháng trước): tháng được đọc một lần từ thống kê ở trên, hiển thị cùng tổng tháng và, với mỗi hóa đơn của tháng đó, một dòng `Hoá đơn … kWh · Thu thập … kWh · Lệch … kWh · <trạng thái>`. Lựa chọn chỉ được giữ khi thẻ còn mở.
 
 Bên dưới phần tóm tắt, một ô so sánh ngày đã chọn với cùng ngày của tháng trước và với mức trung bình ngày của tháng trước, theo kWh và, nếu có, theo chi phí. Ngày mặc định là ngày mới nhất có dữ liệu; bấm vào một cột của biểu đồ để chọn ngày khác. Ngày thiếu dữ liệu hiển thị `—`, không bao giờ là 0, và ngày 29 đến 31 không có ngày tương ứng trong tháng ngắn hơn. Ô này đọc các thống kê ở trên; khi chưa có thì hiển thị dòng mờ "Chưa có lịch sử".
 
@@ -123,12 +128,67 @@ Mô hình bậc thang chỉ được tin khi nó tái hiện đúng các hóa đ
 
 Vì vậy mã tính theo biểu giá khác, hoặc mọi mã sau một đợt đổi giá hay VAT mà `tariff.py` chưa có dòng tương ứng, tự chuyển sang `effective_price`. Thêm dòng còn thiếu vào `tariff.py` sẽ đưa mã về lại khi các hóa đơn gần nhất khớp trở lại. Tổng hợp hiển thị `tariff_verified: false` khi có mã được chọn là `false` và `estimate_method: effective_price` khi có mã được chọn dùng nó; ước tính của tổng vẫn là tổng ước tính từng mã. `calculated_amount` trong lịch sử hóa đơn luôn là phép tính bậc thang thuần, làm mốc so sánh.
 
+### Đối chiếu hóa đơn với số liệu đã thu thập
+
+Mỗi kỳ hóa đơn của một mã (tháng cùng số kỳ; nhiều hóa đơn của một kỳ được gộp) được so với kWh theo ngày đã lưu. EVN ghi ngày của mỗi dòng sau lượng điện năng nó chứa một ngày, nên hóa đơn của kỳ `[start, end]` được so với các dòng ngày từ `start − 1 ngày` tới `end − 1 ngày` (`BILL_DAY_OFFSET` trong `const.py`). Trên dữ liệu dùng để xây tính năng này, cửa sổ đó khớp hóa đơn trong vòng 1 kWh nhiều hơn hẳn so với kỳ như EVN ghi. Vùng EVN khác có thể ghi ngày khác; nếu phần lớn hóa đơn của một mã nằm ngoài ngưỡng, độ lệch ngày cần trở thành một tùy chọn.
+
+`collected_kwh` là tổng các ngày đã lưu của cửa sổ và `diff_kwh = collected_kwh − kWh hóa đơn`. `missing_days` đếm số ngày của cửa sổ chưa được lưu; luôn được báo kèm mọi trạng thái. Trạng thái là quy tắc đầu tiên phù hợp:
+
+| Trạng thái | Ý nghĩa |
+|---|---|
+| `no_kwh` | chưa biết kWh của hóa đơn hoặc ngày của kỳ |
+| `match` | chênh lệch nằm trong ngưỡng |
+| `boundary` | hai kỳ liền kề, đủ mọi ngày, lệch ngược chiều và triệt tiêu nhau trong ngưỡng: EVN chốt kỳ lệch một ngày và điện năng chuyển giữa hai hóa đơn. Hiển thị ở cả hai kỳ |
+| `incomplete` | thiếu ngày trong cửa sổ và chênh lệch vượt ngưỡng |
+| `mismatch` | đủ mọi ngày và chênh lệch vượt ngưỡng |
+
+Ngưỡng là tùy chọn **Bill check tolerance (kWh)** (Configure; 0 đến 100, mặc định 1.0). Mỗi dòng hóa đơn trong `monthly_history` và `bills` có `year`, `month`, `ky`, `collected_kwh`, `diff_kwh`, `missing_days`, `reconcile_status` và `paired_with`; chỉ hóa đơn đầu tiên của kỳ mang kết quả. Ở bản tổng hợp chúng là tổng, thành null ngay khi một mã có hóa đơn kỳ đó không có giá trị, kèm trạng thái xấu nhất của các mã. Thẻ hiển thị hai cột `Thu thập` và `Lệch` trong bảng hóa đơn.
+
+### Sự kiện hóa đơn mới
+
+Lần đầu một kỳ hóa đơn được thấy, integration phát một sự kiện Home Assistant `evn_vietnam_bill`. Trong mười ngày sau đó, trạng thái hoặc số tiền của kỳ thay đổi (ví dụ kỳ `incomplete` thành `match` khi một ngày báo muộn tới, hoặc có hóa đơn thứ hai) sẽ phát thêm một sự kiện với `reason: update`. Sau mười ngày kỳ được khóa lại.
+
+| Trường | Ý nghĩa |
+|---|---|
+| `bill_id` | id 12 ký tự không lộ thông tin của kỳ này của mã này; dùng làm id thông báo |
+| `entry_id` | config entry |
+| `label` | biệt danh, hoặc bốn ký tự cuối của mã khi biệt danh trống hoặc chứa thứ giống mã khách hàng |
+| `period`, `ky` | `MM/YYYY` và số kỳ |
+| `period_start`, `period_end` | kỳ như EVN ghi |
+| `window_start`, `window_end` | các dòng ngày đã so |
+| `bill_kwh`, `collected_kwh`, `diff_kwh`, `missing_days` | kết quả đối chiếu (số có thể là `null` khi `status` là `no_kwh`) |
+| `status`, `previous_status` | trạng thái hiện tại và ở thông báo trước (`null` với `new`) |
+| `reason` | `new` hoặc `update` |
+| `compensates_previous` | `true` khi kỳ là nửa sau của một cặp `boundary` |
+| `total_amount`, `calculated_amount` | VND của hóa đơn (cộng các hóa đơn của kỳ) và giá do add-on tự tính |
+| `threshold_kwh` | ngưỡng đã dùng |
+
+Sự kiện không bao giờ mang mã khách hàng. Việc phát là tối đa một lần: trạng thái đã thấy được lưu trước khi phát sự kiện, nên nếu sập giữa chừng thì mất đúng một thông báo thay vì lặp lại. Chỉ danh sách hóa đơn mới lấy được mới tính; bản lưu tạm (khi EVN lỗi) không bao giờ khởi tạo hay phát. Ở danh sách mới đầu tiên sau khi cài hoặc nâng cấp, các kỳ cũ được ghi nhận im lặng và chỉ tháng trước hoặc muộn hơn được thông báo.
+
+```yaml
+automation:
+  - alias: EVN bill notice
+    trigger:
+      - platform: event
+        event_type: evn_vietnam_bill
+    action:
+      - service: persistent_notification.create
+        data:
+          notification_id: "evn_bill_{{ trigger.event.data.bill_id }}"
+          title: "EVN bill {{ trigger.event.data.period }} – {{ trigger.event.data.label }}"
+          message: >-
+            Bill {{ trigger.event.data.bill_kwh }} kWh, collected {{ trigger.event.data.collected_kwh }} kWh,
+            difference {{ trigger.event.data.diff_kwh }} kWh ({{ trigger.event.data.status }}).
+```
+
 ## Giới hạn đã biết
 
 - EVN OTP và liên kết khách hàng mới chưa được hỗ trợ vì upstream hiện lỗi NPE.
 - Integration không thể tự liệt kê toàn bộ mã đã liên kết qua iOS vì EVN không có list API phù hợp.
 - Home Assistant Energy Dashboard vẫn có thể cảnh báo `state_class` (`measurement` so với `total`).
 - Cần thêm repository này dưới dạng HACS custom repository để cài đặt.
+- Đối chiếu hóa đơn giả định độ lệch một ngày nêu trên; nó được đo trên một tài khoản duy nhất.
+- Hóa đơn mà EVN chưa báo kWh được thông báo với `no_kwh`, sau đó cập nhật.
 
 ## Prompt cho agent
 

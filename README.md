@@ -12,10 +12,11 @@ For Vietnamese instructions, see [README_VN.md](README_VN.md).
 - Per-meter sensors and an optional local aggregate.
 - Username and password stored in the Home Assistant Config Entry; token refresh, silent re-login, and an 8-minute session keepalive.
 - Lovelace card registered automatically through `extra_module_url` and an EVN Energy panel dashboard.
-- Daily chart with one calendar column per day for 7, 14, and 30-day ranges, including unreported days.
+- Daily chart with one calendar column per day for 7, 14, and 30-day ranges ending today, including unreported days, and a month picker (the current month and the 12 before it).
 - Optional nickname per customer code, shown in the card.
 - Daily kWh and estimated cost kept as long-term statistics for the Energy dashboard, plus a day-versus-last-month tile in the card.
 - Bills and meter readings keep their last good copy when an EVN request fails.
+- Each bill's kWh is checked against the collected daily kWh, and every new billing period fires the `evn_vietnam_bill` event.
 
 ## Requirements
 
@@ -65,7 +66,7 @@ To use them in the Energy dashboard: **Settings → Dashboards → Energy → El
 
 How history is filled:
 
-- The days of the current month are merged on every refresh. During the first five days of a month the previous month is fetched again once a day, because EVN can still correct it.
+- The days of the current month are merged on every refresh. During the first five days of a month the previous month is fetched again once a day, because EVN can still correct it. While the previous month's last day is missing or still a provisional 0, the previous month is also fetched again every three hours until the 10th, so a day EVN publishes late is not lost.
 - After a restart, older days are fetched during the regular refreshes, which can take up to a minute longer while it runs: one customer code per refresh, at most six months per refresh, with a pause of at least two seconds before every request. It goes back at most 36 months, stops at the first two empty months in a row, and stops for the moment on any EVN error, then resumes on the next refresh; a code whose requests fail goes behind the others. The first refresh after a restart neither backfills nor looks at the previous month, so startup is not held up.
 - Diagnostics list the oldest stored day per code (with masked codes) and whether the backfill finished.
 
@@ -85,6 +86,10 @@ Copy [docs/evn-dashboard.example.yaml](docs/evn-dashboard.example.yaml) into a Y
 The integration registers `/evn_vietnam/evn-vietnam-energy-card.js` through Home Assistant's `extra_module_url`. In the default storage-mode dashboard, `lovelace.resources` in `configuration.yaml` is ignored, so do not add a duplicate YAML resource to repair a card-loading problem.
 
 The card uses the selected month sensor's `daily_history`. Check that sensor first if the chart is empty.
+
+`daily_history`, `today_consumption` and `yesterday_consumption` come from the last 31 days of the stored daily kWh plus the rows of the current refresh, so on the 1st of a month they still cover the month before. `yesterday_consumption` is unknown (`unknown` in Home Assistant, `—` in the card) while EVN has not published that day; it is never a made-up 0, and the aggregate's yesterday is unknown while any selected code's is.
+
+The default chart shows the last 30 days ending today in Home Assistant's calendar; a day EVN has not published yet is drawn as a gap. The drop-down above the chart switches to one calendar month (the current month and the 12 before it): the month is read once from the statistics above, shown with its total, and, for each bill of that month, one line `Hoá đơn … kWh · Thu thập … kWh · Lệch … kWh · <status>`. The choice is kept only while the card is open.
 
 Below the summary, a tile compares the selected day with the same day of the previous month and with the previous month's daily average, for kWh and, when available, cost. The day defaults to the latest day with data; click a chart bar to pick another. A missing day shows `—`, never 0, and the 29th to 31st have no counterpart in a shorter month. The tile reads the statistics above; without them it shows a muted "Chưa có lịch sử".
 
@@ -123,12 +128,67 @@ The tier model is trusted only where it reproduces that code's real bills. The a
 
 A code billed on another price schedule, or any code after a price or VAT change that `tariff.py` does not list yet, therefore switches to `effective_price` by itself. Adding the missing row to `tariff.py` switches it back once its latest bills match again. The aggregate shows `tariff_verified: false` when any selected code is `false` and `estimate_method: effective_price` when any selected code uses it; its estimate is still the sum of the per-code estimates. `calculated_amount` in the bill history always stays the pure tier calculation, as the comparison.
 
+### Bill check against the collected days
+
+Each billing period of a code (month plus period number; several invoices of one period are combined) is compared with the stored daily kWh. EVN dates every daily row one day after the consumption it holds, so a bill for the period `[start, end]` is compared with the daily rows from `start − 1 day` to `end − 1 day` (`BILL_DAY_OFFSET` in `const.py`). On the data this was built against that window agreed with the bill within 1 kWh far more often than the period as EVN states it. Another EVN region might date its rows differently; if most bills of a code fall outside the tolerance, the offset needs to become an option.
+
+`collected_kwh` is the sum of the stored days of the window and `diff_kwh = collected_kwh − bill kWh`. `missing_days` counts the window days that are not stored; it is reported with every status. The status is the first rule that applies:
+
+| Status | Meaning |
+|---|---|
+| `no_kwh` | the bill's kWh or its period dates are not known yet |
+| `match` | the difference is within the tolerance |
+| `boundary` | two adjacent periods, both with every day stored, differ in opposite directions and cancel within the tolerance: EVN cut the period one day off and the energy moved between two bills. Shown on both periods |
+| `incomplete` | days are missing from the window and the difference is above the tolerance |
+| `mismatch` | every day is stored and the difference is above the tolerance |
+
+The tolerance is the option **Bill check tolerance (kWh)** (Configure; 0 to 100, default 1.0). Every bill row in `monthly_history` and `bills` carries `year`, `month`, `ky`, `collected_kwh`, `diff_kwh`, `missing_days`, `reconcile_status` and `paired_with`; only the first invoice of a period carries the result. In the aggregate they are sums, null as soon as one code that billed the period has no value, with the worst status of the codes. The card shows `Thu thập` and `Lệch` columns in the bill table.
+
+### New-bill event
+
+The first time a billing period is seen, the integration fires one Home Assistant event, `evn_vietnam_bill`. Within ten days of that, a change of the period's status or amount (for example an `incomplete` period that becomes `match` once a late day arrives, or a second invoice) fires one more with `reason: update`. After ten days the period is frozen.
+
+| Field | Meaning |
+|---|---|
+| `bill_id` | opaque 12-character id of this period of this code; use it as the notification id |
+| `entry_id` | the config entry |
+| `label` | the nickname, or the last four characters of the code when the nickname is empty or holds something code-like |
+| `period`, `ky` | `MM/YYYY` and the period number |
+| `period_start`, `period_end` | the period as EVN states it |
+| `window_start`, `window_end` | the daily rows compared |
+| `bill_kwh`, `collected_kwh`, `diff_kwh`, `missing_days` | the check (numbers can be `null` while `status` is `no_kwh`) |
+| `status`, `previous_status` | the status now and at the previous notice (`null` for `new`) |
+| `reason` | `new` or `update` |
+| `compensates_previous` | `true` when the period is the later half of a `boundary` pair |
+| `total_amount`, `calculated_amount` | the bill's VND (summed over its invoices) and the add-on's own price |
+| `threshold_kwh` | the tolerance used |
+
+The event never carries the customer code. Delivery is at most once: the seen state is saved before the event is fired, so a crash in between loses that one notice rather than repeating it. Only a fresh bill list counts; a cached copy (EVN failing) never seeds or fires. On the first fresh list after installing or upgrading, older periods are recorded silently and only the previous calendar month or later is announced.
+
+```yaml
+automation:
+  - alias: EVN bill notice
+    trigger:
+      - platform: event
+        event_type: evn_vietnam_bill
+    action:
+      - service: persistent_notification.create
+        data:
+          notification_id: "evn_bill_{{ trigger.event.data.bill_id }}"
+          title: "EVN bill {{ trigger.event.data.period }} – {{ trigger.event.data.label }}"
+          message: >-
+            Bill {{ trigger.event.data.bill_kwh }} kWh, collected {{ trigger.event.data.collected_kwh }} kWh,
+            difference {{ trigger.event.data.diff_kwh }} kWh ({{ trigger.event.data.status }}).
+```
+
 ## Known limitations
 
 - EVN OTP and linking a new customer are not supported because the upstream flow currently fails with an NPE.
 - The integration cannot automatically list every customer code linked through iOS because EVN provides no suitable list API.
 - Home Assistant Energy Dashboard may still warn about `state_class` (`measurement` versus `total`).
 - Installation requires adding this repository as a HACS custom repository.
+- The bill check assumes the one-day offset above; it was measured on a single account.
+- A bill whose kWh EVN has not published yet is announced as `no_kwh`, then updated.
 
 ## Agent prompt
 
