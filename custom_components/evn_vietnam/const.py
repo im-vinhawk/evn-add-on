@@ -28,8 +28,8 @@ DIAGNOSTICS_TO_REDACT = frozenset(
 DEFAULT_SCAN_INTERVAL = timedelta(minutes=30)
 # A bill's kWh is compared with the stored daily kWh; they agree when they differ by at most this many kWh.
 DEFAULT_RECONCILE_THRESHOLD_KWH = 1.0
-# EVN dates each daily row one day after the consumption it holds, so a bill period [start, end] is
-# reconciled over the daily rows [start - 1 day, end - 1 day].
+# On the account this was measured on, a bill period [start, end] agrees with the daily rows dated
+# [start - 1 day, end - 1 day], as if EVN dated each daily row one day before the consumption it holds.
 BILL_DAY_OFFSET = -1
 # A period's notice can still be updated (status or amount changed) this many days after it was first seen.
 BILL_UPDATE_DAYS = 10

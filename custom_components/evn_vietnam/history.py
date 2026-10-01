@@ -156,11 +156,17 @@ class DailyHistory:
         for code, overview in meters.items():
             if overview.get("bills_fresh") is not True:
                 continue
-            _, periods, results = annotate_bills(overview.get("bills", []), code_days(self._data, code), threshold_kwh)
-            fired, planned[code] = plan_events(
-                self._entry_id, code, safe_label(code, aliases.get(code)), periods, results, planned.get(code), today,
-                threshold_kwh,
-            )
+            try:
+                _, periods, results = annotate_bills(overview.get("bills", []), code_days(self._data, code), threshold_kwh)
+                if not periods:
+                    continue  # nothing was seen: an empty list must not mark the code as seeded
+                fired, planned[code] = plan_events(
+                    self._entry_id, code, safe_label(code, aliases.get(code)), periods, results, planned.get(code),
+                    today, threshold_kwh,
+                )
+            except Exception as err:  # noqa: BLE001 - one code's bad rows must not silence the others
+                _LOGGER.debug("EVN bill events of one code skipped (%s)", type(err).__name__)
+                continue
             events.extend(fired)
         if planned == previous:
             return []

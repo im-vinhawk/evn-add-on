@@ -15,8 +15,6 @@ from .calculation import as_float
 from .const import BILL_DAY_OFFSET, BILL_UPDATE_DAYS, MAX_BILL_KEYS
 from .models import contains_customer_code
 
-# Worst first: the aggregate of several codes shows the most worrying status among them.
-STATUS_RANK = {"mismatch": 4, "incomplete": 3, "boundary": 2, "match": 1, "no_kwh": 0}
 _EPSILON = 1e-9
 
 
@@ -219,11 +217,11 @@ def plan_events(
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Events to fire and the new seen-period state of one code.
 
-    `state` None means the code was never seen: every period is recorded, and only the previous calendar
-    month or later is announced.  Later, an unseen period is `new`; within BILL_UPDATE_DAYS of being first
+    `state` None or empty means the code was never seen (an empty first fetch is not a sighting): every period
+    is recorded, and only the previous calendar month or later is announced.  Later, an unseen period is `new`; within BILL_UPDATE_DAYS of being first
     seen, a change of status or amount is one `update`.
     """
-    seeding = state is None
+    seeding = not state
     new_state = {key: dict(entry) for key, entry in (state or {}).items()}
     last_quiet = _month_index(today.year, today.month) - 2
     events: list[dict[str, Any]] = []
@@ -247,13 +245,18 @@ def plan_events(
         first_seen = _iso_day(entry.get("first_seen"))
         if earlier_of_pair or first_seen is None or (today - first_seen).days > BILL_UPDATE_DAYS:
             continue
+        if status == "no_kwh" and entry["status"] != "no_kwh":
+            continue  # the readings failing for a poll is not news; the bill comes back with its kWh
         if entry["status"] != status or entry["amount"] != amount:
             events.append(_event(
                 entry_id, label, period, result, identity=entry["bill_id"], reason="update",
                 previous_status=entry["status"],
             ))
             entry["status"], entry["amount"] = status, amount
-    if len(new_state) > MAX_BILL_KEYS:
-        keep = sorted(new_state, key=_key_order)[-MAX_BILL_KEYS:]
-        new_state = {key: new_state[key] for key in keep}
+    # Only periods that left the bill list are forgotten: one still in it would come back as new.
+    listed = {period["key"] for period in periods}
+    for key in sorted((key for key in new_state if key not in listed), key=_key_order):
+        if len(new_state) <= MAX_BILL_KEYS:
+            break
+        del new_state[key]
     return events, new_state

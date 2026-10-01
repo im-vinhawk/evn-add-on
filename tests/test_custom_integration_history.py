@@ -1148,3 +1148,21 @@ def test_annotate_bills_gives_only_the_canonical_period_while_the_store_is_unava
     history, _ = _history(modules)
     rows = history.annotate_bills("PB000001", [_SEPT], 1.0)
     assert (rows[0]["year"], rows[0]["month"], rows[0]["reconcile_status"]) == (2026, 9, None)
+
+
+def test_a_code_with_a_broken_bill_row_does_not_stop_the_events_of_the_others(modules) -> None:
+    data = _bill_store()
+    data["daily"]["PB000002"] = dict(data["daily"]["PB000001"])
+    history, _ = _history(modules, store=_FakeStore(data), today=date(2026, 10, 2))
+    meters = {"PB000001": _bill_meter([None, "x"]), "PB000002": _bill_meter([_AUG, _SEPT])}
+    events = asyncio.run(history.async_update(
+        meters=meters, codes=list(meters), selected=list(meters), aliases={}, allow_backfill=False,
+    ))
+    assert [e["period"] for e in events] == ["09/2026"]
+
+
+def test_an_empty_fresh_bill_list_leaves_the_store_untouched(modules) -> None:
+    history, seen = _history(modules, store=_FakeStore(_bill_store()), today=date(2026, 10, 2))
+    assert _bill_update(history, _bill_meter([])) == []
+    assert history._data["bills"] == {}
+    assert [e["period"] for e in _bill_update(history, _bill_meter([_AUG, _SEPT]))] == ["09/2026"]

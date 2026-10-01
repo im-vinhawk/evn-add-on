@@ -61,14 +61,14 @@ def _results(rec, bills, days, threshold=1.0):
 # ------------------------------------------------------------------ window and statuses
 
 def test_the_window_is_the_period_shifted_one_day_earlier(rec) -> None:
-    """Each daily row EVN dates d holds the consumption of d-1: only the shifted window matches the bill."""
+    """The rows dated start-1 .. end-1 hold a period's consumption: only the shifted window matches the bill."""
     days = _span(date(2026, 7, 31), date(2026, 8, 30), 3.0)
     period = rec.group_periods([_bill(2026, 8, 93.0)])[0]
     result = rec.reconcile_period(period, days, 1.0)
     assert (result["window_start"], result["window_end"]) == ("2026-07-31", "2026-08-30")
     assert (result["collected_kwh"], result["diff_kwh"], result["missing_days"], result["status"]) == (93.0, 0.0, 0, "match")
     unshifted = sum(days.get(d, 0.0) for d in _span(date(2026, 8, 1), date(2026, 8, 31), 0))
-    assert abs(unshifted - 93.0) > 1.0, "the unshifted window would have been reported as a mismatch"
+    assert abs(unshifted - 93.0) > 1.0, "the unshifted window would not have agreed with the bill"
 
 
 def test_no_kwh_when_the_bill_has_no_kwh_or_no_dates(rec) -> None:
@@ -268,11 +268,14 @@ def test_a_period_older_than_last_month_at_seeding_never_fires_even_when_it_is_t
     assert events == [] and set(state) == {"2026-07-1"}
 
 
-def test_an_empty_bill_list_still_marks_the_code_as_seeded(rec) -> None:
-    events, state = rec.plan_events("entry-1", CODE, "Nhà", [], {}, None, date(2026, 10, 3), 1.0)
+def test_an_empty_bill_list_does_not_mark_the_code_as_seeded(rec) -> None:
+    """A fetch that came back empty must not turn the next normal list into an announcement of every period."""
+    events, state = rec.plan_events("entry-1", CODE, "Nhà", [], {}, {}, date(2026, 10, 3), 1.0)
     assert events == [] and state == {}
-    events, state = _plan(rec, [_bill(2026, 9, 90.0)], _span(date(2026, 8, 31), date(2026, 9, 29), 3.0), state, date(2026, 10, 3))
-    assert [e["reason"] for e in events] == ["new"], "once seeded, any unseen period is new"
+    bills = [_bill(y, m, 93.0) for y, m in _old_months(20)] + [_bill(2026, 9, 90.0)]
+    days = _span(date(2024, 1, 1), date(2026, 9, 29), 3.0)
+    events, state = _plan(rec, bills, days, state, date(2026, 10, 3))
+    assert [e["period"] for e in events] == ["09/2026"], "still seeding: only last month is announced"
 
 
 def test_a_new_period_fires_one_event_with_the_whole_payload(rec) -> None:
@@ -329,11 +332,73 @@ def test_a_boundary_pair_fires_for_the_later_period_only_and_says_it_compensates
     assert state["2025-12-1"]["status"] == "mismatch", "the earlier period's record is left as it was"
 
 
-def test_the_state_keeps_at_most_36_periods_dropping_the_oldest(rec) -> None:
-    bills = [_bill(y, m, 90.0) for y, m in _old_months(40)]
-    days = _span(date(2023, 1, 1), date(2026, 9, 29), 3.0)
-    events, state = _plan(rec, bills, days, {}, date(2026, 9, 5))
-    assert len(state) == 36 and "2026-08-1" in state and "2023-05-1" not in state
+def test_the_state_drops_stale_periods_beyond_36_but_never_one_still_in_the_list(rec) -> None:
+    stale = {
+        f"2020-{month:02d}-1": {"bill_id": rec.bill_id("entry-1", CODE, f"2020-{month:02d}-1"), "first_seen": "2020-12-31",
+                                "status": "match", "amount": 1}
+        for month in range(1, 13)
+    }
+    stale.update({f"2021-{month:02d}-1": dict(stale["2020-01-1"]) for month in range(1, 13)})
+    stale.update({f"2022-{month:02d}-1": dict(stale["2020-01-1"]) for month in range(1, 13)})
+    bills = [_bill(2026, 9, 90.0)]
+    events, state = _plan(rec, bills, _span(date(2026, 8, 31), date(2026, 9, 29), 3.0), stale, date(2026, 10, 3))
+    assert len(state) == 36 and "2026-09-1" in state and "2022-12-1" in state and "2020-01-1" not in state
+
+
+def test_a_code_with_more_than_36_periods_in_one_list_does_not_re_announce_the_old_ones(rec) -> None:
+    """Periods that are still in the fetched list stay remembered, or they would come back as new."""
+    old = [_bill(y, m, 93.0, ky=ky) for y, m in _old_months(24) for ky in (1, 2)]  # 48 periods
+    days = _span(date(2024, 1, 1), date(2026, 9, 29), 3.0)
+    events, state = _plan(rec, old, days, None, date(2026, 10, 3))
+    assert events == [] and len(state) == 48
+    events, state = _plan(rec, old + [_bill(2026, 9, 90.0)], days, state, date(2026, 10, 4))
+    assert [(e["period"], e["reason"]) for e in events] == [("09/2026", "new")]
+
+
+def test_a_status_that_falls_back_to_unknown_kwh_is_not_news(rec) -> None:
+    """kWh readings failing for a poll must not flip an announced bill to no_kwh and back."""
+    days = _span(date(2026, 8, 31), date(2026, 9, 29), 3.0)
+    bill = _bill(2026, 9, 90.0)
+    events, state = _plan(rec, [bill], days, {}, date(2026, 10, 2))
+    assert events[0]["status"] == "match"
+    blind = {**bill, "total_kwh": None}
+    quiet, same = _plan(rec, [blind], days, state, date(2026, 10, 3))
+    assert quiet == [] and same == state
+    back, _ = _plan(rec, [bill], days, same, date(2026, 10, 4))
+    assert back == []
+
+
+def test_a_new_period_without_kwh_is_announced_and_updated_once_the_kwh_arrives(rec) -> None:
+    days = _span(date(2026, 8, 31), date(2026, 9, 29), 3.0)
+    events, state = _plan(rec, [_bill(2026, 9, None)], days, {}, date(2026, 10, 2))
+    assert [(e["reason"], e["status"]) for e in events] == [("new", "no_kwh")]
+    events, state = _plan(rec, [_bill(2026, 9, 90.0)], days, state, date(2026, 10, 3))
+    assert [(e["reason"], e["status"], e["previous_status"]) for e in events] == [("update", "match", "no_kwh")]
+
+
+def test_the_evidence_pattern_only_the_shifted_window_agrees_with_the_bills(rec) -> None:
+    """Six months of varying daily kWh; each bill is the sum over the rows dated start-1 .. end-1."""
+    days, bills = {}, []
+    day = date(2026, 1, 31)
+    value = 2.0
+    while day <= date(2026, 6, 29):
+        value = 2.0 + (day.toordinal() * 7 % 13) / 4  # deterministic, uneven
+        last_of_month = (day + timedelta(days=1)).month != day.month
+        days[day.isoformat()] = round(2.0 + 2.0 * day.month if last_of_month else value, 2)  # month ends differ
+        day += timedelta(days=1)
+    for month in range(2, 7):
+        first = date(2026, month, 1)
+        last = date(2026, month + 1, 1) - timedelta(days=1)
+        shifted = sum(days[(first + timedelta(days=i - 1)).isoformat()] for i in range((last - first).days + 1))
+        bills.append(_bill(2026, month, round(shifted + (0.4 if month % 2 else -0.4), 2)))
+    periods, results = _results(rec, bills, days)
+    assert [results[p["key"]]["status"] for p in periods] == ["match"] * 5
+    assert all(abs(results[p["key"]]["diff_kwh"]) <= 0.4 + 1e-9 for p in periods)
+    for period in periods:  # the unshifted window [start, end] would not have agreed
+        start = date.fromisoformat(period["period_start"])
+        end = date.fromisoformat(period["period_end"])
+        plain = sum(days.get((start + timedelta(days=i)).isoformat(), 0.0) for i in range((end - start).days + 1))
+        assert abs(plain - period["bill_kwh"]) > 1.0
 
 
 def test_the_event_never_carries_the_customer_code(rec) -> None:
