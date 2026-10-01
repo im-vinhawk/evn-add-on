@@ -28,6 +28,9 @@ DEFAULT_SCAN_INTERVAL = timedelta(minutes=30)
 SESSION_KEEPALIVE_INTERVAL = timedelta(minutes=8)
 DEFAULT_TIMEOUT = 20
 DAILY_HISTORY_DAYS = 31
+# Last month's final day can reach EVN's daily data late: ask again every few hours until this day of the month.
+PREVIOUS_MONTH_TAIL_DAYS = 10
+PREVIOUS_MONTH_TAIL_RETRY = timedelta(hours=3)
 # Monthly readings change at most daily; one fetch per code serves several refreshes.
 MONTHLY_READINGS_CACHE_SECONDS = 6 * 3600
 # Historical daily backfill: how far back, how many months one refresh may fetch (for one code only),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import importlib.util
 import json
@@ -436,11 +436,12 @@ class _FakeClient:
         return list(self.months.get((code, start.year, start.month), []))
 
 
-def _history(modules, *, client=None, store=None, today=date(2026, 3, 15), importer=None, **kwargs):
+def _history(modules, *, client=None, store=None, today=date(2026, 3, 15), now=None, importer=None, **kwargs):
     client = client or _FakeClient(modules.api)
     store = store or _FakeStore()
     imported: list = []
     sleeps: list[float] = []
+    clock = {"now": now or datetime.combine(today, time(12, 0), tzinfo=ICT)}
 
     async def default_importer(specs, to_clear):
         imported.append(([spec.statistic_id for spec in specs], list(to_clear), {spec.statistic_id: spec for spec in specs}))
@@ -450,9 +451,9 @@ def _history(modules, *, client=None, store=None, today=date(2026, 3, 15), impor
 
     history = modules.history.DailyHistory(
         client=client, store=store, importer=importer or default_importer, tz_provider=lambda: ICT,
-        today_provider=lambda: today, sleep=sleep, **kwargs,
+        now_provider=lambda: clock["now"], sleep=sleep, **kwargs,
     )
-    return history, types.SimpleNamespace(client=client, store=store, imported=imported, sleeps=sleeps)
+    return history, types.SimpleNamespace(client=client, store=store, imported=imported, sleeps=sleeps, clock=clock)
 
 
 def _meter(*pairs, model=None):
@@ -699,7 +700,7 @@ def test_create_uses_a_per_entry_store_key_and_the_ha_time_zone(modules, monkeyp
     storage.Store = Store
     dt = types.ModuleType("homeassistant.util.dt")
     dt.DEFAULT_TIME_ZONE = ICT
-    dt.now = lambda: datetime(2026, 3, 15, 9, 0)
+    dt.now = lambda: datetime(2026, 3, 15, 9, 0, tzinfo=ICT)
     util = types.ModuleType("homeassistant.util")
     util.dt = dt
     monkeypatch.setitem(sys.modules, "homeassistant.helpers", types.ModuleType("homeassistant.helpers"))
@@ -708,7 +709,7 @@ def test_create_uses_a_per_entry_store_key_and_the_ha_time_zone(modules, monkeyp
     monkeypatch.setitem(sys.modules, "homeassistant.util.dt", dt)
     history = modules.history.create_daily_history(object(), "entry-1", object())
     assert created == [(1, "evn_vietnam.daily.entry-1")]
-    assert history._tz() is ICT and history._today() == date(2026, 3, 15)
+    assert history._tz() is ICT and history.today() == date(2026, 3, 15)
 
 
 def test_a_code_that_keeps_failing_does_not_starve_the_others(modules) -> None:
@@ -775,7 +776,201 @@ def test_a_total_losing_a_day_on_a_smaller_selection_is_cleared_before_the_impor
 def test_malformed_backfill_meta_is_repaired_on_load(modules) -> None:
     raw = {"meta": {"PB000001": {"cursor": "bad", "empty": "x", "done": "yes", "prev_refresh": "no", "failures": -3}}}
     meta = modules.store.normalize_store(raw)["meta"]["PB000001"]
-    assert meta == {"cursor": None, "empty": 0, "done": True, "prev_refresh": "", "failures": 0}
+    assert meta == {"cursor": None, "empty": 0, "done": True, "prev_refresh": "", "failures": 0, "tail_try": ""}
     assert modules.store.next_backfill_month(date(2026, 3, 15), {**meta, "done": False}, 36) == date(2026, 2, 1)
     good = {"meta": {"PB000001": {"cursor": "2025-12", "empty": 1, "done": False, "prev_refresh": "2026-03-02", "failures": 2}}}
-    assert modules.store.normalize_store(good)["meta"]["PB000001"] == good["meta"]["PB000001"]
+    assert modules.store.normalize_store(good)["meta"]["PB000001"] == {**good["meta"]["PB000001"], "tail_try": ""}
+
+
+# ------------------------------------------------- rolling window and month tail
+
+def _september_store(*, last_day=None, prev_refresh=""):
+    """A store holding 2026-09-01..29 (and optionally the 30th) for one placeholder code."""
+    days = {f"2026-09-{day:02d}": 5.0 for day in range(1, 30)}
+    if last_day is not None:
+        days["2026-09-30"] = last_day
+    meta = {"cursor": None, "empty": 0, "done": True, "prev_refresh": prev_refresh, "failures": 0}
+    return _FakeStore({"daily": {"PB000001": days}, "meta": {"PB000001": meta}, "series": {}})
+
+
+def test_tail_is_wanted_while_the_last_day_of_last_month_is_absent_or_zero(modules) -> None:
+    s = modules.store
+    meta = s.backfill_meta(s.empty_store(), "PB000001")
+    day1 = datetime(2026, 10, 1, 12, 0, tzinfo=ICT)
+    assert s.needs_previous_month_tail(day1, meta, {}) is True
+    assert s.needs_previous_month_tail(day1, meta, {"2026-09-30": 0.0}) is True, "a stored zero is provisional"
+    assert s.needs_previous_month_tail(day1, meta, {"2026-09-30": 4.0}) is False
+    assert s.needs_previous_month_tail(datetime(2026, 10, 10, 23, 59, tzinfo=ICT), meta, {}) is True
+    assert s.needs_previous_month_tail(datetime(2026, 10, 11, 0, 5, tzinfo=ICT), meta, {}) is False
+    assert s.needs_previous_month_tail(datetime(2026, 10, 11, 0, 5, tzinfo=ICT), meta, {"2026-09-30": 0.0}) is False
+
+
+def test_tail_waits_three_hours_between_attempts(modules) -> None:
+    s = modules.store
+    meta = s.backfill_meta(s.empty_store(), "PB000001")
+    now = datetime(2026, 10, 2, 12, 0, tzinfo=ICT)
+    s.mark_tail_tried(meta, now)
+    assert s.needs_previous_month_tail(now + timedelta(hours=1), meta, {}) is False
+    assert s.needs_previous_month_tail(now + timedelta(hours=2, minutes=59), meta, {}) is False
+    assert s.needs_previous_month_tail(now + timedelta(hours=3), meta, {}) is True
+
+
+def test_a_bad_tail_try_is_dropped_on_load(modules) -> None:
+    s = modules.store
+    for bad in ("yesterday", 5, "2026-10-01T12:00:00", None):
+        loaded = s.normalize_store({"meta": {"PB000001": {"tail_try": bad}}})
+        assert loaded["meta"]["PB000001"]["tail_try"] == ""
+    good = "2026-10-01T12:00:00+07:00"
+    assert s.normalize_store({"meta": {"PB000001": {"tail_try": good}}})["meta"]["PB000001"]["tail_try"] == good
+
+
+def test_window_rows_cover_the_last_days_in_ascending_order(modules) -> None:
+    rows = modules.store.window_rows({"2026-09-02": 1.5, "2026-09-30": 2.0, "2026-08-31": 9.0}, date(2026, 10, 1), 31)
+    assert [row["date"] for row in rows] == ["2026-09-02", "2026-09-30"], "2026-08-31 is 31 days back: outside"
+    assert rows[0] == {
+        "date": "2026-09-02", "day": "2026-09-02", "consumption": 1.5, "kwh": 1.5,
+        "start_index": "-", "end_index": "-", "meter_point": "", "meter_number": "",
+    }
+
+
+def test_day_one_window_crosses_the_month_and_yesterday_is_unknown_until_it_is_published(modules) -> None:
+    client = _FakeClient(modules.api, months={("PB000001", 2026, 9): _rows(("2026-09-29", 5.0), ("2026-09-30", 0.0))})
+    history, seen = _history(modules, client=client, store=_september_store(), today=date(2026, 10, 1), months_per_cycle=0)
+    live = _rows(("2026-10-01", 0.0))
+    _update(history, {"PB000001": _meter(*[(r["date"], r["consumption"]) for r in live])}, allow_backfill=True)
+    rows = history.compose("PB000001", live)
+    assert rows[0]["date"] == "2026-09-01" and rows[-1]["date"] == "2026-10-01" and len(rows) == 30
+    today_kwh, yesterday_kwh = modules.store.day_values(rows, date(2026, 10, 1))
+    assert (today_kwh, yesterday_kwh) == (0.0, None), "never a fake 0 for a day EVN has not published"
+    # EVN publishes 30/09 a few hours later; the tail retry fetches it.
+    client.months[("PB000001", 2026, 9)] = _rows(("2026-09-29", 5.0), ("2026-09-30", 4.25))
+    seen.clock["now"] += timedelta(hours=3)
+    _update(history, {"PB000001": _meter(("2026-10-01", 0.0))}, allow_backfill=True)
+    assert modules.store.day_values(history.compose("PB000001", live), date(2026, 10, 1))[1] == 4.25
+
+
+def test_tail_retry_cadence_and_stop(modules) -> None:
+    client = _FakeClient(modules.api, months={("PB000001", 2026, 9): _rows(("2026-09-29", 5.0))})
+    history, seen = _history(
+        modules, client=client, store=_september_store(prev_refresh="2026-10-04"), today=date(2026, 10, 4),
+        months_per_cycle=0,
+    )
+    meters = {"PB000001": _meter(("2026-10-01", 1.0))}
+    _update(history, meters, allow_backfill=True)
+    assert len(client.calls) == 1, "absent last day on day 4: fetch"
+    seen.clock["now"] += timedelta(hours=1)
+    _update(history, meters, allow_backfill=True)
+    assert len(client.calls) == 1, "+1 h: no fetch"
+    seen.clock["now"] += timedelta(hours=2)
+    _update(history, meters, allow_backfill=True)
+    assert len(client.calls) == 2, "+3 h: fetch"
+    assert [(c[1], c[2]) for c in client.calls] == [(date(2026, 9, 1), date(2026, 9, 30))] * 2
+
+
+def test_a_stored_zero_is_retried_until_a_non_zero_arrives_and_a_genuine_zero_stops_on_day_eleven(modules) -> None:
+    client = _FakeClient(modules.api, months={("PB000001", 2026, 9): _rows(("2026-09-30", 0.0))})
+    history, seen = _history(
+        modules, client=client, store=_september_store(last_day=0.0, prev_refresh="2026-10-04"),
+        today=date(2026, 10, 4), months_per_cycle=0,
+    )
+    meters = {"PB000001": _meter(("2026-10-01", 1.0))}
+    _update(history, meters, allow_backfill=True)
+    assert len(client.calls) == 1, "stored 0 on day 4: fetch"
+    client.months[("PB000001", 2026, 9)] = _rows(("2026-09-30", 3.5))
+    seen.clock["now"] += timedelta(hours=3)
+    _update(history, meters, allow_backfill=True)
+    assert history.days("PB000001")["2026-09-30"] == 3.5, "a later non-zero overwrites the provisional zero"
+    seen.clock["now"] += timedelta(hours=3)
+    _update(history, meters, allow_backfill=True)
+    assert len(client.calls) == 2, "non-zero present: no fetch"
+
+    quiet_client = _FakeClient(modules.api)
+    history, seen = _history(
+        modules, client=quiet_client, store=_september_store(last_day=0.0, prev_refresh="2026-10-11"),
+        today=date(2026, 10, 11), months_per_cycle=0,
+    )
+    _update(history, meters, allow_backfill=True)
+    assert quiet_client.calls == [], "genuine zero still 0 on day 11: no fetch"
+
+
+def test_tail_retry_is_not_made_on_the_first_refresh_after_a_restart(modules) -> None:
+    history, seen = _history(modules, store=_september_store(), today=date(2026, 10, 1), months_per_cycle=0)
+    _update(history, {"PB000001": _meter(("2026-10-01", 0.0))})
+    assert seen.client.calls == []
+
+
+def test_the_once_a_day_pass_on_days_one_to_five_is_unchanged(modules) -> None:
+    client = _FakeClient(modules.api, months={("PB000001", 2026, 9): _rows(("2026-09-30", 4.0))})
+    history, seen = _history(modules, client=client, store=_september_store(), today=date(2026, 10, 2), months_per_cycle=0)
+    meters = {"PB000001": _meter(("2026-10-01", 1.0))}
+    _update(history, meters, allow_backfill=True)
+    _update(history, meters, allow_backfill=True)
+    assert len(client.calls) == 1
+    seen.clock["now"] += timedelta(days=1)
+    _update(history, meters, allow_backfill=True)
+    assert len(client.calls) == 2, "a new day: one more pass even though 30/09 is already stored"
+
+
+@pytest.mark.parametrize("now, month_start, month_end, absent_day", [
+    (datetime(2027, 1, 1, 0, 30, tzinfo=ICT), date(2026, 12, 1), date(2026, 12, 31), "2026-12-31"),
+    (datetime(2028, 3, 1, 9, 0, tzinfo=ICT), date(2028, 2, 1), date(2028, 2, 29), "2028-02-29"),
+    (datetime(2026, 10, 1, 0, 30, tzinfo=ICT), date(2026, 9, 1), date(2026, 9, 30), "2026-09-30"),
+])
+def test_the_ha_local_clock_picks_the_month_across_year_end_leap_day_and_a_utc_host(
+    modules, now, month_start, month_end, absent_day,
+) -> None:
+    """00:30 in Ho Chi Minh is still the previous day in UTC; the window follows the HA-local date."""
+    client = _FakeClient(modules.api)
+    history, _ = _history(modules, client=client, now=now, months_per_cycle=0)
+    _update(history, {"PB000001": _meter((absent_day[:8] + "01", 1.0))}, allow_backfill=True)
+    assert [(c[1], c[2]) for c in client.calls] == [(month_start, month_end)]
+
+
+def test_year_change_between_two_polls(modules) -> None:
+    client = _FakeClient(modules.api)
+    history, seen = _history(modules, client=client, now=datetime(2026, 12, 31, 23, 30, tzinfo=ICT), months_per_cycle=0)
+    meters = {"PB000001": _meter(("2026-12-31", 1.0))}
+    _update(history, meters, allow_backfill=True)
+    assert client.calls == [], "31/12 is not early in a month"
+    seen.clock["now"] = datetime(2027, 1, 1, 0, 30, tzinfo=ICT)
+    _update(history, meters, allow_backfill=True)
+    assert [(c[1], c[2]) for c in client.calls] == [(date(2026, 12, 1), date(2026, 12, 31))]
+
+
+def test_live_rows_override_the_store_for_the_same_date(modules) -> None:
+    history, _ = _history(modules, store=_september_store(last_day=2.0), today=date(2026, 10, 1))
+    _update(history, {"PB000001": _meter(("2026-10-01", 0.0))})
+    rows = history.compose("PB000001", _rows(("2026-09-30", 7.5), ("2026-10-01", 1.0)))
+    by_date = {row["date"]: row["consumption"] for row in rows}
+    assert by_date["2026-09-30"] == 7.5 and by_date["2026-10-01"] == 1.0 and by_date["2026-09-29"] == 5.0
+    assert [row["date"] for row in rows] == sorted(by_date)
+
+
+def test_compose_is_unavailable_until_the_store_is_loaded(modules) -> None:
+    history, _ = _history(modules)
+    assert history.available is False
+    _update(history, {"PB000001": _meter(("2026-03-01", 1.0))})
+    assert history.available is True
+
+
+def test_aggregate_daily_history_across_the_boundary_is_the_per_date_sum(modules) -> None:
+    first, second = "PB000001", "PB000002"
+    meters = {}
+    for code, offset in ((first, 0.0), (second, 1.0)):
+        days = {"2026-09-29": 5.0 + offset, "2026-09-30": 4.0 + offset}
+        rows = modules.store.window_rows(days, date(2026, 10, 1), 31)
+        meters[code] = {"daily_history": rows, "bills": [], "today_consumption": 0.0}
+    aggregate = modules.calculation.aggregate_selected_overviews(meters, [first, second, "PB000003"], {})
+    assert [(r["date"], r["consumption"]) for r in aggregate["daily_history"]] == [
+        ("2026-09-29", 11.0), ("2026-09-30", 9.0),
+    ]
+    assert aggregate["successful_customer_codes"] == [first, second], "a code missing from meters follows the partial rule"
+
+
+def test_aggregate_yesterday_is_unknown_when_a_contributing_code_has_none(modules) -> None:
+    calc = modules.calculation
+    known = {"yesterday_consumption": 4.0, "today_consumption": 1.0}
+    unknown = {"yesterday_consumption": None, "today_consumption": 2.0}
+    assert calc.aggregate_overviews([known, unknown], ["a", "b"])["yesterday_consumption"] is None
+    assert calc.aggregate_overviews([known, known], ["a", "b"])["yesterday_consumption"] == 8.0
+    assert calc.aggregate_overviews([{"today_consumption": 1}], ["a"])["yesterday_consumption"] == 0.0

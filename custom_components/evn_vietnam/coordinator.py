@@ -21,6 +21,7 @@ from .const import (
     CONF_REFRESH_TOKEN, DEFAULT_SCAN_INTERVAL, DOMAIN, SESSION_KEEPALIVE_INTERVAL,
     CONF_SELECTED_CUSTOMER_CODES, CONF_CUSTOMER_ALIASES,
 )
+from .daily_store import day_values
 from .history import DailyHistory, create_daily_history
 from .pricing import price_overview
 from .models import (
@@ -136,10 +137,11 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not meters:
                 raise UpdateFailed("EVN could not return data for any configured customer")
             aggregate_codes = aggregate_customer_codes(self.config_entry)
+            await self._async_update_history(meters, codes, aggregate_codes)
+            self._compose_windows(meters)
             aggregate = aggregate_selected_overviews(
                 meters, aggregate_codes, partial_errors, self._last_good_history(partial_errors, meters)
             )
-            await self._async_update_history(meters, codes, aggregate_codes)
             # The backfill can switch customer or refresh the session, so persist those tokens now.
             self._persist_changed_tokens()
             return {"meters": meters, "aggregate": aggregate, "partial_errors": partial_errors}
@@ -157,6 +159,22 @@ class EvnDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except Exception as err:  # noqa: BLE001 - a history problem must never fail the sensor update
             _LOGGER.debug("EVN daily history update skipped (%s)", type(err).__name__)
+
+    def _compose_windows(self, meters: dict[str, dict[str, Any]]) -> None:
+        """Give each code the last 31 days across the month boundary, and today/yesterday read from them."""
+        history = self._history
+        if history is None:
+            return
+        try:
+            if not history.available:
+                return
+            today = history.today()
+            for code, overview in meters.items():
+                rows = history.compose(code, overview.get("daily_history", []))
+                overview["daily_history"] = rows
+                overview["today_consumption"], overview["yesterday_consumption"] = day_values(rows, today)
+        except Exception as err:  # noqa: BLE001 - a history problem must never fail the sensor update
+            _LOGGER.debug("EVN rolling window skipped (%s)", type(err).__name__)
 
     def _last_good_history(
         self, partial_errors: dict[str, str], meters: dict[str, dict[str, Any]]

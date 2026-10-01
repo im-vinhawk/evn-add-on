@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import calendar
-from datetime import date, timedelta, tzinfo
+from datetime import date, datetime, timedelta, tzinfo
 import logging
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .api import EvnApiError
-from .const import BACKFILL_MONTHS_PER_CYCLE, BACKFILL_PAUSE_SECONDS, DOMAIN, MAX_BACKFILL_MONTHS
+from .const import BACKFILL_MONTHS_PER_CYCLE, BACKFILL_PAUSE_SECONDS, DAILY_HISTORY_DAYS, DOMAIN, MAX_BACKFILL_MONTHS
 from .daily_store import (
-    STORE_VERSION, backfill_meta, code_days, earliest_day, mark_previous_month_refreshed, merge_daily,
-    needs_previous_month_refresh, next_backfill_month, normalize_store, record_backfill_month, record_failure,
+    STORE_VERSION, backfill_meta, code_days, compose_window, earliest_day, mark_previous_month_refreshed, mark_tail_tried,
+    merge_daily, needs_previous_month_refresh, needs_previous_month_tail, next_backfill_month, normalize_store,
+    record_backfill_month, record_failure,
 )
 from .pricing import PriceModel
 from .statistics_import import SeriesSpec, async_import_series, build_series, series_to_clear
@@ -38,21 +39,34 @@ class DailyHistory:
         store: Any,
         importer: Callable[[Sequence[SeriesSpec], Sequence[str]], Awaitable[None]],
         tz_provider: Callable[[], tzinfo],
-        today_provider: Callable[[], date],
+        now_provider: Callable[[], datetime],
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         backfill_cap: int = MAX_BACKFILL_MONTHS,
         months_per_cycle: int = BACKFILL_MONTHS_PER_CYCLE,
     ) -> None:
         self._client, self._store, self._importer = client, store, importer
-        self._tz, self._today, self._sleep = tz_provider, today_provider, sleep
+        self._tz, self._now, self._sleep = tz_provider, now_provider, sleep
         self._cap, self._months_per_cycle = backfill_cap, months_per_cycle
         self._data: dict[str, Any] | None = None
         self._models: dict[str, PriceModel] = {}
         self._imported: dict[str, tuple] = {}
         self._dirty = False
 
+    @property
+    def available(self) -> bool:
+        """True once the store has loaded; before that (or when loading failed) only live rows exist."""
+        return self._data is not None
+
+    def today(self) -> date:
+        """The HA-local calendar date: the one clock every window and retry derives from."""
+        return self._now().date()
+
     def days(self, code: str) -> dict[str, float]:
         return code_days(self._data, code) if self._data else {}
+
+    def compose(self, code: str, live_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """The last DAILY_HISTORY_DAYS days up to today: stored days with this poll's live rows over them."""
+        return compose_window(self.days(code), live_rows, self.today(), DAILY_HISTORY_DAYS)
 
     def backfill_status(self) -> dict[str, dict[str, Any]]:
         """Per code: the oldest stored day (how deep EVN's history goes) and whether the backfill finished."""
@@ -111,7 +125,7 @@ class DailyHistory:
 
     def _unreported_from(self) -> str:
         """Zero rows from yesterday on are EVN not having reported those days yet."""
-        return (self._today() - timedelta(days=1)).isoformat()
+        return (self.today() - timedelta(days=1)).isoformat()
 
     async def _async_merge(self, meters: Mapping[str, Mapping[str, Any]]) -> None:
         for code, item in meters.items():
@@ -131,27 +145,31 @@ class DailyHistory:
         return sorted(live, key=lambda code: backfill_meta(self._data, code)["failures"])
 
     async def _async_refresh_previous_month(self, live: Sequence[str]) -> None:
-        """EVN can still correct last month during its first days; look again once a day."""
-        today = self._today()
+        """EVN can still correct last month during its first days (once a day) and may publish its last day late (tail)."""
+        now = self._now()
+        today = now.date()
         for code in self._by_failures(live):
             meta = backfill_meta(self._data, code)
-            if not needs_previous_month_refresh(today, meta):
+            daily_due = needs_previous_month_refresh(today, meta)
+            tail_due = needs_previous_month_tail(now, meta, code_days(self._data, code))
+            if not daily_due and not tail_due:
                 continue
             previous = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+            mark_tail_tried(meta, now)
+            self._dirty = True
             try:
                 rows = await self._async_fetch_month(code, previous)
             except EvnApiError:
                 _LOGGER.debug("EVN previous-month refresh skipped because EVN is unavailable")
                 record_failure(meta)
-                self._dirty = True
                 return
             merge_daily(self._data, code, rows, self._unreported_from())
-            mark_previous_month_refreshed(meta, today)
-            self._dirty = True
+            if daily_due:
+                mark_previous_month_refreshed(meta, today)
 
     async def _async_backfill(self, live: Sequence[str]) -> None:
         """Walk one code back month by month; at most one code with requests per cycle."""
-        today = self._today()
+        today = self.today()
         for code in self._by_failures(live):
             meta = backfill_meta(self._data, code)
             if meta["done"]:
@@ -216,5 +234,5 @@ def create_daily_history(hass: Any, entry_id: str, client: Any) -> DailyHistory:
         store=Store(hass, STORE_VERSION, f"{DOMAIN}.daily.{entry_id}"),
         importer=importer,
         tz_provider=lambda: dt_util.DEFAULT_TIME_ZONE,
-        today_provider=lambda: dt_util.now().date(),
+        now_provider=dt_util.now,
     )

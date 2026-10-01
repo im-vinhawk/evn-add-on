@@ -137,6 +137,13 @@ def _combined_tariff_verified(flags: Iterable[bool | None]) -> bool | None:
     return None if not values or any(flag is None for flag in values) else True
 
 
+def _sum_known_yesterday(values: list[Mapping[str, Any]]) -> float | None:
+    """A total of yesterday is unknown as soon as one code's yesterday is: a partial sum would look complete."""
+    if any("yesterday_consumption" in item and item["yesterday_consumption"] is None for item in values):
+        return None
+    return round(sum(as_float(item.get("yesterday_consumption")) for item in values), 2)
+
+
 def aggregate_overviews(overviews: Iterable[Mapping[str, Any]], codes: list[str]) -> dict[str, Any]:
     """Sum overview fields after each code's tariff has been calculated."""
     values = list(overviews)
@@ -148,7 +155,7 @@ def aggregate_overviews(overviews: Iterable[Mapping[str, Any]], codes: list[str]
         "latest_index": "---",
         "latest_date": str(latest.get("latest_date") or ""),
         "today_consumption": round(sum(as_float(item.get("today_consumption")) for item in values), 2),
-        "yesterday_consumption": round(sum(as_float(item.get("yesterday_consumption")) for item in values), 2),
+        "yesterday_consumption": _sum_known_yesterday(values),
         "current_month_consumption": round(sum(as_float(item.get("current_month_consumption")) for item in values), 2),
         "current_month_amount": sum(int(as_float(item.get("current_month_amount"))) for item in values),
         "tariff_verified": _combined_tariff_verified(item.get("tariff_verified") for item in values),

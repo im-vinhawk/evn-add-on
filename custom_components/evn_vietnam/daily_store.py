@@ -4,16 +4,18 @@ The dict handled here is what Home Assistant's ``Store`` writes to disk::
 
     {"daily": {code: {"YYYY-MM-DD": kwh}},
      "meta": {code: {"cursor": "YYYY-MM" | None, "empty": int, "done": bool, "prev_refresh": "YYYY-MM-DD",
-                     "failures": int}},
+                     "failures": int, "tail_try": ISO datetime with offset | ""}},
      "series": {statistic_id: {"start": "YYYY-MM-DD", "count": int, "scope": str}}}
 """
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 import math
 import re
 from typing import Any, Iterable, Mapping
+
+from .const import PREVIOUS_MONTH_TAIL_DAYS, PREVIOUS_MONTH_TAIL_RETRY
 
 STORE_VERSION = 1
 # A backfill that meets this many months in a row without any row has reached the start of the data.
@@ -81,7 +83,20 @@ def _clean_meta(item: Mapping[str, Any]) -> dict[str, Any]:
     meta["done"] = bool(item.get("done"))
     if _valid_day(item.get("prev_refresh")):
         meta["prev_refresh"] = item["prev_refresh"]
+    if _parse_aware(item.get("tail_try")) is not None:
+        meta["tail_try"] = item["tail_try"]
     return meta
+
+
+def _parse_aware(value: Any) -> datetime | None:
+    """A timezone-aware ISO datetime, else None (a naive stamp cannot be compared with HA-local now)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def merge_daily(
@@ -124,7 +139,7 @@ def earliest_day(store: Mapping[str, Any], code: str) -> str | None:
 
 
 def _new_meta() -> dict[str, Any]:
-    return {"cursor": None, "empty": 0, "done": False, "prev_refresh": "", "failures": 0}
+    return {"cursor": None, "empty": 0, "done": False, "prev_refresh": "", "failures": 0, "tail_try": ""}
 
 
 def backfill_meta(store: dict[str, Any], code: str) -> dict[str, Any]:
@@ -161,6 +176,55 @@ def record_backfill_month(meta: dict[str, Any], month_start: date, row_count: in
 
 def needs_previous_month_refresh(today: date, meta: Mapping[str, Any]) -> bool:
     return today.day <= PREVIOUS_MONTH_REFRESH_DAYS and meta.get("prev_refresh") != today.isoformat()
+
+
+def needs_previous_month_tail(now: datetime, meta: Mapping[str, Any], days: Mapping[str, float]) -> bool:
+    """Last month's final day is absent or a provisional 0 early in the month, and the last try is old enough."""
+    if now.day > PREVIOUS_MONTH_TAIL_DAYS:
+        return False
+    tail_day = (now.date().replace(day=1) - timedelta(days=1)).isoformat()
+    if days.get(tail_day):
+        return False
+    tried = _parse_aware(meta.get("tail_try"))
+    return tried is None or now - tried >= PREVIOUS_MONTH_TAIL_RETRY
+
+
+def mark_tail_tried(meta: dict[str, Any], now: datetime) -> None:
+    meta["tail_try"] = now.isoformat(timespec="seconds")
+
+
+def window_rows(days: Mapping[str, float], end: date, count: int) -> list[dict[str, Any]]:
+    """Stored days of the `count` days ending at `end`, ascending, in the shape the live rows have."""
+    first = (end - timedelta(days=count - 1)).isoformat()
+    return [
+        {
+            "date": day, "day": day, "consumption": kwh, "kwh": kwh,
+            "start_index": "-", "end_index": "-", "meter_point": "", "meter_number": "",
+        }
+        for day, kwh in sorted(days.items()) if first <= day <= end.isoformat()
+    ]
+
+
+def compose_window(days: Mapping[str, float], live_rows: Iterable[Mapping[str, Any]], end: date, count: int) -> list[dict[str, Any]]:
+    """Stored days with this poll's live rows laid over the same dates."""
+    rows = {row["date"]: row for row in window_rows(days, end, count)}
+    first, last = (end - timedelta(days=count - 1)).isoformat(), end.isoformat()
+    for row in live_rows:
+        day = row.get("date")
+        if _valid_day(day) and first <= day <= last:
+            rows[day] = dict(row)
+    return [rows[day] for day in sorted(rows)]
+
+
+def day_values(rows: Iterable[Mapping[str, Any]], today: date) -> tuple[float, float | None]:
+    """Today's kWh (0 until the first reading) and yesterday's, None while it is not in the rows."""
+    by_date = {row.get("date"): row.get("consumption") for row in rows}
+    yesterday = by_date.get((today - timedelta(days=1)).isoformat())
+    today_kwh = by_date.get(today.isoformat())
+    return (
+        round(float(today_kwh), 2) if today_kwh is not None else 0.0,
+        round(float(yesterday), 2) if yesterday is not None else None,
+    )
 
 
 def mark_previous_month_refreshed(meta: dict[str, Any], today: date) -> None:

@@ -460,3 +460,60 @@ def test_tokens_are_persisted_again_after_the_daily_history_step(modules) -> Non
     instance.data = None
     asyncio.run(instance._async_update_data())
     assert events == ["persist", "history", "persist"]
+
+
+class _WindowHistory:
+    """The real window rules over a fixed store, so the coordinator wiring is what is under test."""
+
+    def __init__(self, store_days, today):
+        self.store_days, self._today = store_days, today
+        self.available, self.events = True, []
+
+    def today(self):
+        return self._today
+
+    def compose(self, code, live_rows):
+        daily_store = sys.modules[f"{PACKAGE}.daily_store"]
+        return daily_store.compose_window(self.store_days[code], live_rows, self._today, 31)
+
+    async def async_update(self, **_kwargs):
+        return []
+
+
+def test_update_composes_the_rolling_window_before_the_aggregate_is_built(modules) -> None:
+    from datetime import date
+
+    client = _TwoCodeClient(
+        {"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {},
+    )
+    instance = _two_code_coordinator(modules, client)
+    instance._history = _WindowHistory({
+        "PB000001": {"2026-09-29": 5.0, "2026-09-30": 4.0},
+        "PB000002": {"2026-09-29": 1.0},
+    }, date(2026, 10, 1))
+    instance.data = None
+    data = asyncio.run(instance._async_update_data())
+    first, second = data["meters"]["PB000001"], data["meters"]["PB000002"]
+    assert [row["date"] for row in first["daily_history"]] == ["2026-09-29", "2026-09-30"]
+    assert (first["today_consumption"], first["yesterday_consumption"]) == (0.0, 4.0)
+    assert second["yesterday_consumption"] is None, "30/09 is not published for this code: unknown, not 0"
+    assert [(row["date"], row["consumption"]) for row in data["aggregate"]["daily_history"]] == [
+        ("2026-09-29", 6.0), ("2026-09-30", 4.0),
+    ]
+    assert data["aggregate"]["yesterday_consumption"] is None
+
+
+def test_a_failing_window_composition_leaves_the_live_rows_in_place(modules) -> None:
+    client = _TwoCodeClient({"PB000001": [_march_bill(None, 200)], "PB000002": [_march_bill(None, 100)]}, {})
+    instance = _two_code_coordinator(modules, client)
+
+    class History(_WindowHistory):
+        def compose(self, code, live_rows):
+            raise RuntimeError("boom")
+
+    from datetime import date
+
+    instance._history = History({}, date(2026, 10, 1))
+    instance.data = None
+    data = asyncio.run(instance._async_update_data())
+    assert set(data["meters"]) == {"PB000001", "PB000002"}
