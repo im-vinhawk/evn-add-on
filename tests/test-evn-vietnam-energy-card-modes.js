@@ -252,7 +252,7 @@ function mount(config, states, extra = {}) {
   {
     const paid = bill({ payment_status: 'paid', paid_on: '2026-10-01' });
     const states = {
-      'sensor.total': aggregateState({ partial_errors: { [CODE_B]: 'unpaid_bills' }, is_partial: true }),
+      'sensor.total': aggregateState({ partial_errors: { [CODE_B]: 'api_error' }, is_partial: true }),
       'sensor.a': codeState(CODE_A, { monthly_history: [paid] }),
       'sensor.b': codeState(CODE_B, { monthly_history: [bill({ total_kwh: 80, collected_kwh: 70, diff_kwh: -10, reconcile_status: 'mismatch', payment_status: 'unpaid', is_paid: false, due_date: '2026-10-15', total_amount: 180000 })] }),
       'sensor.c': codeState(CODE_C, { monthly_history: [bill({ payment_status: 'unpaid', is_paid: false, due_date: '2026-10-16', payment_checked: false, total_amount: 100000, total_kwh: 40, collected_kwh: 40, diff_kwh: 0 })] }),
@@ -356,6 +356,10 @@ function mount(config, states, extra = {}) {
     // no link unless the path is an in-app path; no banners when nothing is unpaid or near
     const unsafe = mount({ mode: 'overview', bills_path: 'javascript:alert(1)', customer_views: views }, states);
     assert.equal(findNode(unsafe.shadowRoot, (n) => n.tagName === 'a'), null, 'a scheme is never linked');
+    for (const external of ['//example.invalid/x', '/\\example.invalid', '/a b']) {
+      const card2 = mount({ mode: 'overview', bills_path: external, customer_views: views }, states);
+      assert.equal(findNode(card2.shadowRoot, (n) => n.tagName === 'a'), null, `${external} is not a path inside Home Assistant`);
+    }
     const quiet = mount({ mode: 'overview', customer_views: views }, {
       ...states,
       'sensor.a': codeState(CODE_A, { next_planned_outage: '2026-10-20T08:00:00+07:00', outage_end: '2026-10-20T09:00:00+07:00' }),

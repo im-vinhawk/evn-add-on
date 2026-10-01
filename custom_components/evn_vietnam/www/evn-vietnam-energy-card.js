@@ -1549,7 +1549,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
     banner.appendChild(span);
     const path = this._config && typeof this._config.bills_path === 'string' ? this._config.bills_path.trim() : '';
     // Only an in-app path is linked: never a scheme such as javascript:.
-    if (link && /^\/[A-Za-z0-9_\-./]*$/.test(path)) {
+    if (link && /^\/(?!\/)[A-Za-z0-9_\-./]*$/.test(path)) {
       const anchor = document.createElement('a');
       anchor.className = 'banner-link';
       anchor.setAttribute('href', path);
@@ -2527,6 +2527,7 @@ class EvnVietnamEnergyCard extends HTMLElement {
         .stack-table, .stack-table tbody, .stack-table tr {
           display: block;
           width: 100%;
+          box-sizing: border-box;
         }
         .stack-table tr {
           border: 1px solid var(--divider-color, rgba(0, 0, 0, 0.12));

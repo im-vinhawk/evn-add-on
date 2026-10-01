@@ -53,6 +53,7 @@ def test_a_layout_fits_its_viewport_and_shows_every_tile(mode: str, viewport: st
     measured = _measure(mode, width, height, view)
     assert measured["viewWidth"] == view, measured
     assert measured["noHorizontalScroll"], f"{mode} scrolls sideways at {view}px: {measured}"
+    assert measured["overflowing"] == 0, f"{mode} has {measured['overflowing']} element(s) past the right edge at {view}px: {measured}"
     assert measured["emptyTiles"] == 0, f"{mode} has an empty tile at {view}px: {measured}"
     if mode == "default":
         assert measured["tileCount"] >= 4

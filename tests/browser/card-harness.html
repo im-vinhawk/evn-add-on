@@ -107,6 +107,15 @@
         stackedRows: rows.filter((tr) => getComputedStyle(tr).display === 'block').length,
         headerHidden: [...root.querySelectorAll('.stack-table thead')].every((th) => getComputedStyle(th).display === 'none'),
         cardWidth: Math.round(card.getBoundingClientRect().width),
+        // Anything that sticks out past the right edge of the view, or of the table box it sits in (padding and
+        // borders included): stacked rows once overflowed their box by their own padding.
+        overflowing: [...root.querySelectorAll('*')].filter((el) => {
+          if (el.tagName === 'STYLE') return false;
+          const right = el.getBoundingClientRect().right;
+          const box = el.closest('.table-container');
+          return right > document.getElementById('view').getBoundingClientRect().right + 0.5
+            || (box !== null && right > box.getBoundingClientRect().right + 0.5);
+        }).length,
       };
       document.getElementById('measure').textContent = JSON.stringify(measure);
     }, 400);
